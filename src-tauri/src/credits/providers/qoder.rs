@@ -1,0 +1,1282 @@
+// COSY signing/encoding adapted from cpa-multi-plugins (MIT), pinned in NOTICE.md.
+use super::*;
+use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
+use rsa::{pkcs8::DecodePublicKey, Pkcs1v15Encrypt, RsaPublicKey};
+pub(super) const API: &str = "https://openapi.qoder.com.cn";
+const GATEWAY: &str = "https://gateway.qoder.com.cn";
+pub(super) const CLIENT_ID: &str = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
+// Official qodercli 1.1.81 production endpoints. The international infer
+// endpoint defaults to Singapore; authentication never probes another region.
+pub(super) fn api_base(c: &Credentials) -> &'static str {
+    match c.region {
+        CreditRegion::Cn => API,
+        CreditRegion::Intl => "https://openapi.qoder.sh",
+    }
+}
+fn gateway_base(c: &Credentials) -> &'static str {
+    match c.region {
+        CreditRegion::Cn => GATEWAY,
+        CreditRegion::Intl => "https://api2.qoder.sh",
+    }
+}
+pub(super) fn client_id(region: CreditRegion) -> &'static str {
+    match region {
+        CreditRegion::Cn => CLIENT_ID,
+        CreditRegion::Intl => "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+    }
+}
+pub(super) fn auth_base(region: CreditRegion) -> &'static str {
+    match region {
+        CreditRegion::Cn => "https://qoder.cn",
+        CreditRegion::Intl => "https://qoder.com",
+    }
+}
+pub(super) fn token_credentials(v: &Value, previous: &Credentials) -> Result<Credentials, ProviderError> {
+    let mut c = credentials(v, previous, &["token", "device_token", "access_token"], &["refresh_token", "refreshToken"])?;
+    c.expires_at = ["expires_at", "expiresAt", "expire_time", "expireTime"]
+        .iter()
+        .find_map(|key| v.get(*key).and_then(epoch))
+        .or_else(|| num(v, &["expires_in", "expiresIn"])
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(|seconds| now_ms().saturating_add((seconds * 1000.0) as i64)))
+        .or(previous.expires_at);
+    Ok(c)
+}
+const PUBKEY:&str="-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc\n4k6Pz1EaDicBMpdpxKduSZu5OANqUq8er4GM95omAGIOPOh+Nx0spthYA2BqGz+l\n6HRkPJ7S236FZz73In/KVuLnwI8JJ2CbuJap8kvheCCZpmAWpb/cPx/3Vr/J6I17\nXcW+ML9FoCI6AOvOzwIDAQAB\n-----END PUBLIC KEY-----";
+pub(super) fn headers(r: RequestBuilder, c: &Credentials) -> RequestBuilder {
+    r.bearer_auth(&c.access_token)
+        .header("User-Agent", "Qoder/0.4.3")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+}
+fn campaign_headers(r: RequestBuilder, c: &Credentials) -> RequestBuilder {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        os => os,
+    };
+    let mut r = r
+        .bearer_auth(&c.access_token)
+        .header("Accept", "application/json")
+        .header("User-Agent", "Qoder")
+        .header("Cosy-ClientType", "10")
+        .header("Cosy-Version", "0.4.4")
+        .header("Cosy-MachineOS", format!("{}_{os}", std::env::consts::ARCH));
+    if let Some(machine) = &c.device_id {
+        r = r.header("Cosy-MachineId", machine);
+    }
+    r
+}
+
+async fn campaign_json(request: RequestBuilder) -> Result<Value, ProviderError> {
+    let response = request
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(ProviderError::transport)?;
+    if response.status().is_success() {
+        return json_response(response).await;
+    }
+    let status = response.status().as_u16();
+    let mut error = http_error(status);
+    error.retry_after_ms = response.headers().get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok()).and_then(retry_after);
+    let value: Value = response.json().await.map_err(|_| error.clone())?;
+    let Some(code) = text(&value, &["errorCode"]) else {
+        return Err(error);
+    };
+    let message = match code.as_str() {
+        "RISK_BLOCKED" => "Qoder 未通过设备校验，积分未发放",
+        "RISK_DEPENDENCY_UNAVAILABLE" => "Qoder 设备校验服务暂不可用，请稍后重试",
+        "CAMPAIGN_NOT_ACTIVE" => "Qoder 活动已结束或尚未开始",
+        "CAMPAIGN_NOT_FOUND" => "Qoder 活动不存在，请刷新领取资格",
+        "GRANT_RESULT_UNKNOWN" => "Qoder 积分发放结果待确认",
+        _ => "Qoder 活动请求被拒绝",
+    };
+    error.message = format!("{message}（{code}）");
+    // A device rejection is not an expired OAuth token.
+    if matches!(
+        code.as_str(),
+        "RISK_BLOCKED" | "RISK_DEPENDENCY_UNAVAILABLE"
+    ) {
+        error.rejected = false;
+    }
+    Err(error)
+}
+pub(super) async fn authenticate(
+    client: &ProviderClient,
+    c: &Credentials,
+) -> Result<(String, String, Credentials), ProviderError> {
+    authenticate_at(client, c, api_base(c)).await
+}
+async fn authenticate_at(
+    client: &ProviderClient,
+    c: &Credentials,
+    api: &str,
+) -> Result<(String, String, Credentials), ProviderError> {
+    let mut c = c.clone();
+    if c.access_token.starts_with("pt-") {
+        let v = client
+            .json(
+                client
+                    .http
+                    .post(format!("{api}/api/v1/jobToken/exchange"))
+                    .json(&json!({"personal_token":c.access_token})),
+            )
+            .await?;
+        c = token_credentials(data(&v), &c)?;
+    }
+    let v = client
+        .json(headers(
+            client.http.get(format!("{api}/api/v1/userinfo")),
+            &c,
+        ))
+        .await?;
+    let d = data(&v);
+    let uid = text(d, &["id", "user_id", "userId", "uid"])
+        .ok_or_else(|| ProviderError::new(502, "Qoder 未返回账号身份"))?;
+    let label = text(d, &["name", "username"]).unwrap_or_else(|| format!("Qoder {uid}"));
+    c.user_id = Some(uid.clone());
+    if c.device_id.is_none() {
+        c.device_id = Some(uuid::Uuid::new_v4().to_string());
+    }
+    if !c.extra.is_object() {
+        c.extra = json!({});
+    }
+    if let Some(info) = d.as_object() {
+        c.extra.as_object_mut().unwrap().extend(info.clone());
+    }
+    Ok((uid, label, c))
+}
+pub(super) async fn refresh(
+    client: &ProviderClient,
+    c: &Credentials,
+) -> Result<Credentials, ProviderError> {
+    refresh_at(client, c, api_base(c)).await
+}
+async fn refresh_at(client: &ProviderClient, c: &Credentials, api: &str) -> Result<Credentials, ProviderError> {
+    let rt = c
+        .refresh_token
+        .as_ref()
+        .ok_or_else(|| ProviderError::new(401, "Qoder 凭证没有刷新令牌，请重新登录"))?;
+    let path = if rt.starts_with("jrt-") {
+        "jobToken/refresh"
+    } else {
+        "deviceToken/refresh"
+    };
+    let mut body = json!({"refresh_token":rt});
+    if path == "deviceToken/refresh" {
+        if let Some(machine) = &c.device_id {
+            body["machine_id"] = json!(machine);
+        }
+    }
+    let v = client
+        .json(
+            client
+                .http
+                .post(format!("{api}/api/v1/{path}"))
+                .json(&body),
+        )
+        .await?;
+    token_credentials(data(&v), c)
+}
+fn encode(plain: &[u8]) -> String {
+    let s = STANDARD.encode(plain);
+    let n = s.len();
+    let a = n / 3;
+    let rearranged = format!("{}{}{}", &s[n - a..], &s[a..n - a], &s[..a]);
+    const STD: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const CUSTOM: &[u8] = b"_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+    rearranged
+        .bytes()
+        .map(|c| {
+            if c == b'=' {
+                '$'
+            } else {
+                CUSTOM[STD.iter().position(|x| *x == c).expect("base64 character")] as char
+            }
+        })
+        .collect()
+}
+fn signature(payload: &str, key: &str, date: &str, body: &str, path: &str) -> String {
+    format!(
+        "{:x}",
+        md5::compute(format!(
+            "{payload}\n{key}\n{date}\n{body}\n{}",
+            path.strip_prefix("/algo").unwrap_or(path)
+        ))
+    )
+}
+fn signed(
+    r: RequestBuilder,
+    c: &Credentials,
+    body: String,
+    url: &str,
+    model_id: Option<&str>,
+) -> Result<RequestBuilder, ProviderError> {
+    let key = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+    let pubkey = RsaPublicKey::from_public_key_pem(PUBKEY)
+        .map_err(|_| ProviderError::new(500, "Qoder 签名公钥配置错误"))?;
+    let wrapped = STANDARD.encode(
+        pubkey
+            .encrypt(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, key.as_bytes())
+            .map_err(|_| ProviderError::new(500, "Qoder 签名失败"))?,
+    );
+    let identity = json!({"name":text(&c.extra,&["name"]).unwrap_or_default(),"aid":c.user_id.as_deref().unwrap_or(""),"uid":c.user_id.as_deref().unwrap_or(""),"yx_uid":"","organization_id":text(&c.extra,&["organization_id", "organizationId"]).unwrap_or_default(),"organization_name":text(&c.extra,&["organization_name", "organizationName"]).unwrap_or_default(),"user_type":text(&c.extra,&["user_type", "userType"]).unwrap_or("personal_standard".into()),"security_oauth_token":c.access_token,"refresh_token":c.refresh_token.as_deref().unwrap_or("")});
+    let info = STANDARD.encode(
+        cbc::Encryptor::<aes::Aes128>::new_from_slices(key.as_bytes(), key.as_bytes())
+            .map_err(|_| ProviderError::new(500, "Qoder 加密失败"))?
+            .encrypt_padded_vec_mut::<Pkcs7>(identity.to_string().as_bytes()),
+    );
+    let payload=STANDARD.encode(json!({"cosyVersion":"0.1.43","ideVersion":"","info":info,"requestId":uuid::Uuid::new_v4().to_string(),"version":"v1"}).to_string());
+    let date = (now_ms() / 1000).to_string();
+    let path =
+        reqwest::Url::parse(url).map_err(|_| ProviderError::new(500, "Qoder 请求地址配置错误"))?;
+    let sig = signature(&payload, &wrapped, &date, &body, path.path());
+    let machine = c
+        .device_id
+        .as_deref()
+        .ok_or_else(|| ProviderError::new(400, "Qoder 凭证缺少已保存的设备身份，请重新添加账号"))?;
+    let mut r = r
+        .header("Authorization", format!("Bearer COSY.{payload}.{sig}"))
+        .header("cosy-data-policy", "AGREE")
+        .header("cosy-machinetype", "desktop")
+        .header("cosy-clienttype", "5")
+        .header("cosy-date", date)
+        .header("cosy-user", c.user_id.as_deref().unwrap_or(""))
+        .header("cosy-key", wrapped)
+        .header("cosy-clientip", "169.254.198.161")
+        .header("cosy-version", "0.1.43")
+        .header("cosy-machineid", machine)
+        .header("cosy-machinetoken", URL_SAFE_NO_PAD.encode(machine))
+        .header("login-version", "v2")
+        .header("User-Agent", "Qoder/0.4.3")
+        .header("Content-Type", "application/json")
+        .header("Accept-Encoding", "identity")
+        .body(body);
+    if let Some(id) = model_id {
+        r = r
+            .header("x-model-key", id)
+            .header("x-model-source", "system");
+    }
+    Ok(r)
+}
+fn context_windows(m: &Value) -> Vec<u64> {
+    // Qoder's context_config tiers can exceed max_input_tokens, which is
+    // the legacy input budget rather than the largest selectable window.
+    let mut windows: Vec<u64> = m["context_config"]
+        .as_object()
+        .into_iter()
+        .flat_map(|tiers| tiers.values())
+        .filter_map(|tier| token_limit(tier, &["token_count"]))
+        .collect();
+    if windows.is_empty() {
+        windows = m["available_context_windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .filter(|window| *window > 0)
+            .collect();
+    }
+    windows.sort_unstable();
+    windows.dedup();
+    windows
+}
+fn parse_models(v: &Value) -> Vec<ModelInfo> {
+    data(v)["chat"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            if flag(m, &["enable"]) != Some(true) {
+                return None;
+            }
+            let key = text(m, &["key"])?;
+            let name = text(m, &["display_name"]).unwrap_or(key.clone());
+            // Public id follows the display name (workbuddy-style); the
+            // platform key travels as upstream_id for the actual call.
+            let id = display_slug(&name).unwrap_or_else(|| key.clone());
+            let windows = context_windows(m);
+            let context = windows.last().copied().or_else(|| token_limit(m, &["max_input_tokens"]));
+            let upstream_model_ids = underlying_model_id(&m["model"], &key).into_iter().collect();
+            let efforts = m["thinking_config"]["enabled"]["efforts"].as_object();
+            Some(ModelInfo {
+                upstream_id: (id != key).then_some(key),
+                upstream_model_ids,
+                context_window_options: windows,
+                max_output_tokens: token_limit(m, &["max_output_tokens"]),
+                supports_images: flag(m, &["is_vl"]),
+                supports_reasoning: flag(m, &["is_reasoning"]),
+                reasoning_effort_options: efforts.map(|options| options.keys().cloned().collect()).unwrap_or_default(),
+                default_reasoning_effort: efforts.and_then(|options| {
+                    options.iter().find(|(_, config)| config["is_default"] == true).map(|(level, _)| level.clone())
+                }),
+                ..model(
+                    id,
+                    name,
+                    context,
+                )
+            })
+        })
+        .collect()
+}
+/// Display-name slug for public model ids: `GLM-5.3-Flash` -> `glm-5.3-flash`.
+fn display_slug(name: &str) -> Option<String> {
+    let slug = name
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+    (!slug.is_empty()).then_some(slug)
+}
+pub(super) async fn models(client: &ProviderClient, c: &Credentials) -> Result<Vec<ModelInfo>, ProviderError> {
+    let url = format!("{}/algo/api/v2/model/list?Encode=1", gateway_base(c));
+    let r = signed(client.http.get(&url), c, encode(b"{}"), &url, None)?;
+    let v = client.json(r.header("Accept", "application/json")).await?;
+    let ms = parse_models(&v);
+    if ms.is_empty() {
+        return Err(ProviderError::new(
+            502,
+            "Qoder 当前账号没有可选择的聊天模型",
+        ));
+    }
+    Ok(ms)
+}
+fn parse_packs(v: &Value) -> Vec<CreditPack> {
+    let d = data(v);
+    let mut out = vec![];
+    for (name, key, aliases) in [
+        ("套餐积分", "userQuota", &["userQuota", "user_quota"][..]),
+        ("附加积分", "addOnQuota", &["addOnQuota", "add_on_quota"][..]),
+        ("组织积分", "orgResourcePackage", &["orgResourcePackage", "org_resource_package", "sharedQuota", "shared_quota"][..]),
+    ] {
+        if let Some(p) = aliases.iter().find_map(|key| d.get(*key).filter(|p| p.is_object())) {
+            out.push(CreditPack {
+                unit: text(p, &["unit"]).or_else(|| text(d, &["unit"])).unwrap_or("credits".into()),
+                id: key.into(),
+                name: name.into(),
+                remaining: num(p, &["remaining"]),
+                expires_at: p.get("expiresAt").or_else(|| p.get("expires_at")).and_then(epoch)
+                    .or_else(|| (key == "userQuota").then(|| d.get("expiresAt").or_else(|| d.get("expires_at")).and_then(epoch)).flatten()),
+            });
+        }
+    }
+    if let Some(ps) = d.get("dedicatedResourcePackages").or_else(|| d.get("dedicated_resource_packages")).and_then(Value::as_array) {
+        for (i, p) in ps.iter().enumerate() {
+            out.push(CreditPack {
+                unit: text(p, &["unit"]).or_else(|| text(d, &["unit"])).unwrap_or("credits".into()),
+                id: text(p, &["id"]).unwrap_or_else(|| format!("dedicated-{i}")),
+                name: text(p, &["name"]).unwrap_or("赠送积分包".into()),
+                remaining: num(p, &["remaining"]),
+                expires_at: p.get("expiresAt").or_else(|| p.get("expires_at")).and_then(epoch),
+            });
+        }
+    }
+    out
+}
+fn campaign_name(c: &Value) -> String {
+    text(c, &["title", "name", "displayName"])
+        .or_else(|| {
+            c["placements"].as_array()?.iter().find_map(|placement| {
+                text(&placement["content"]["zh"], &["title"])
+                    .or_else(|| text(&placement["content"]["en"], &["title"]))
+            })
+        })
+        .unwrap_or("平台活动权益".into())
+}
+fn parse_web_campaign(c: &Value) -> Option<Reward> {
+    let url = text(c, &["campaignUrl", "campaign_url", "activityUrl"])?;
+    let claimable = flag(c, &["claimable"]);
+    if flag(c, &["showCampaign"]) == Some(false) && claimable != Some(true) {
+        return None;
+    }
+    Some(Reward {
+        id: text(c, &["campaignId", "id"]).unwrap_or_else(|| url.clone()),
+        name: campaign_name(c),
+        kind: "activity".into(),
+        status: match claimable {
+            Some(true) => "claimable",
+            Some(false) => "unavailable",
+            None => "unknown",
+        }
+        .into(),
+        amount: None,
+        next_available_at: c.get("startsAt").and_then(epoch),
+        action_url: Some(url),
+    })
+}
+
+fn parse_rewards(v: &Value) -> Vec<Reward> {
+    let d = data(v);
+    if flag(d, &["showCampaign"]) == Some(false) {
+        return vec![];
+    }
+    let mut out: Vec<Reward> = d["campaigns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let action = text(c, &["actionType"]).unwrap_or_default();
+            // Only CLAIM_BENEFIT + CREDITS can participate in one-click claims.
+            if action != "CLAIM_BENEFIT"
+                && text(c, &["campaignUrl", "campaign_url", "activityUrl"]).is_some()
+            {
+                return parse_web_campaign(c);
+            }
+            let kind = text(&c["benefit"], &["kind"])
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let id = text(c, &["campaignId", "id"])?;
+            let status = text(c, &["claimStatus", "status"]).unwrap_or_default();
+            Some(Reward {
+                id,
+                name: campaign_name(c),
+                kind: if kind == "CREDITS" {
+                    "credits"
+                } else {
+                    "coupon"
+                }
+                .into(),
+                status: if kind != "CREDITS" || action != "CLAIM_BENEFIT" {
+                    "unavailable"
+                } else if status == "CLAIMED" {
+                    "claimed"
+                } else if status == "CLAIMABLE" {
+                    "claimable"
+                } else {
+                    "unavailable"
+                }
+                .into(),
+                amount: if kind == "CREDITS" {
+                    num(&c["benefit"], &["amount"])
+                } else {
+                    None
+                },
+                next_available_at: c
+                    .get("startAt")
+                    .or_else(|| c.get("startsAt"))
+                    .and_then(epoch),
+                action_url: None,
+            })
+        })
+        .collect();
+    // The top-level URL is the container for the detailed list, not an extra reward.
+    if !d["campaigns"].is_array() {
+        if let Some(campaign) = parse_web_campaign(d) {
+            if !out
+                .iter()
+                .any(|reward| reward.action_url == campaign.action_url)
+            {
+                out.push(campaign);
+            }
+        }
+    }
+    out
+}
+pub(super) async fn rewards(client: &ProviderClient, c: &Credentials) -> Result<Vec<Reward>, ProviderError> {
+    rewards_at(client, c, api_base(c)).await
+}
+async fn rewards_at(
+    client: &ProviderClient,
+    c: &Credentials,
+    api: &str,
+) -> Result<Vec<Reward>, ProviderError> {
+    let v = campaign_json(campaign_headers(
+        client.http.get(format!("{api}/sash/api/v1/me/campaigns")),
+        c,
+    ))
+    .await?;
+    if !data(&v)["campaigns"].is_array() && !data(&v)["showCampaign"].is_boolean() {
+        return Err(ProviderError::new(502, "Qoder 未返回有效的活动领取资格"));
+    }
+    Ok(parse_rewards(&v))
+}
+pub(super) async fn balance(client: &ProviderClient, c: &Credentials) -> Result<ProviderSnapshot, ProviderError> {
+    let usage = client.json(headers(client.http.get(format!("{}/api/v2/quota/usage", api_base(c))), c)).await?;
+    Ok(snapshot(parse_packs(&usage), vec![], vec![], None))
+}
+pub(super) async fn inspect(
+    client: &ProviderClient,
+    c: &Credentials,
+) -> Result<ProviderSnapshot, ProviderError> {
+    let (p, r, m) = tokio::join!(
+        client.json(headers(
+            client.http.get(format!("{}/api/v2/quota/usage", api_base(c))),
+            c
+        )),
+        rewards(client, c),
+        models(client, c)
+    );
+    let p = p?;
+    let mut diagnostics = vec![];
+    let r = r.unwrap_or_else(|e| {
+        diagnostics.push(e.message);
+        vec![]
+    });
+    let m = m.unwrap_or_else(|e| {
+        diagnostics.push(e.message);
+        vec![]
+    });
+    Ok(snapshot(
+        parse_packs(&p),
+        r,
+        m,
+        (!diagnostics.is_empty()).then(|| diagnostics.join("；")),
+    ))
+}
+pub(super) async fn claim(
+    client: &ProviderClient,
+    a: &Account,
+    c: &Credentials,
+) -> Result<Vec<RewardOutcome>, ProviderError> {
+    claim_at(client, a, c, api_base(c), super::qoder_identity::helper_path(c.region)).await
+}
+async fn claim_at(
+    client: &ProviderClient,
+    a: &Account,
+    c: &Credentials,
+    api: &str,
+    helper: Option<std::path::PathBuf>,
+) -> Result<Vec<RewardOutcome>, ProviderError> {
+    let rs = rewards_at(client, c, api).await?;
+    let mut out = vec![];
+    let proof = if rs
+        .iter()
+        .any(|r| r.status == "claimable" && r.kind == "credits")
+    {
+        match helper {
+            Some(path) => super::qoder_identity::proof(path, &a.user_id, c.region).await?,
+            None => reqwest::header::HeaderMap::new(),
+        }
+    } else {
+        reqwest::header::HeaderMap::new()
+    };
+    for r in rs {
+        if r.status == "claimed" && r.kind == "credits" {
+            out.push(outcome(
+                a,
+                &r,
+                "already_claimed",
+                "本轮积分已领取，无需重复领取",
+                None,
+            ));
+            continue;
+        }
+        if r.status != "claimable" || r.kind != "credits" {
+            continue;
+        }
+        // IDs come only from this account's live eligible list. No guessed campaign IDs.
+        let url = format!(
+            "{api}/sash/api/v1/me/campaigns/{}/claim",
+            urlencoding::encode(&r.id)
+        );
+        let submitted =
+            campaign_json(campaign_headers(client.http.post(url), c).headers(proof.clone())).await;
+        match &submitted {
+            Ok(v) if credits_confirmed(data(v)) => {
+                let d = data(v);
+                out.push(outcome(
+                    a,
+                    &r,
+                    "claimed",
+                    "Qoder 确认积分已领取，余额可能延迟更新",
+                    num(&d["benefit"], &["amount"]).or(r.amount),
+                ));
+            }
+            _ => {
+                // A timeout/pending grant must be read back, never blindly resubmitted.
+                let reward_url = format!(
+                    "{api}/sash/api/v1/me/campaigns/{}/reward",
+                    urlencoding::encode(&r.id)
+                );
+                let confirmed = campaign_json(
+                    campaign_headers(client.http.get(reward_url), c).headers(proof.clone()).header("Cache-Control", "no-cache"),
+                )
+                .await
+                .ok()
+                .filter(|v| credits_confirmed(data(v)));
+                if let Some(v) = confirmed {
+                    out.push(outcome(
+                        a,
+                        &r,
+                        "claimed",
+                        "回查 Qoder 确认积分已领取",
+                        num(&data(&v)["benefit"], &["amount"]).or(r.amount),
+                    ));
+                } else {
+                    let mut result =
+                        reconcile_claim(a, &r, &submitted, rewards_at(client, c, api).await);
+                    if result.status != "claimed" {
+                        if let Err(error) = &submitted {
+                            result.message = format!("{}；{}", error.message, result.message);
+                            if matches!(error.status, 400 | 403 | 404 | 410) {
+                                result.status = "failed".into();
+                            }
+                        }
+                    }
+                    out.push(result);
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(RewardOutcome {
+            account_id: a.id.clone(),
+            reward_id: "campaigns".into(),
+            name: "活动积分".into(),
+            status: "unavailable".into(),
+            amount: None,
+            kind: "credits".into(),
+            message: "当前账号暂无已明确可领取的积分活动".into(),
+            created_at: now_ms(),
+        });
+    }
+    Ok(out)
+}
+fn credits_confirmed(v: &Value) -> bool {
+    text(v, &["status"]).as_deref() == Some("CLAIMED")
+        // The submitted ID already comes from a CREDITS campaign. Official
+        // responses may only return the grant status, without repeating benefit.
+        && text(&v["benefit"], &["kind"]).is_none_or(|kind| kind == "CREDITS")
+}
+fn body(mut b: Value, id: &str) -> Result<Value, ProviderError> {
+    let messages = b["messages"]
+        .as_array_mut()
+        .ok_or_else(|| ProviderError::new(400, "messages 必须是数组"))?;
+    for message in messages.iter_mut() {
+        if message["role"] == "developer" {
+            message["role"] = json!("system");
+        }
+    }
+    let has_images = messages.iter().any(|m| {
+        m["content"]
+            .as_array()
+            .is_some_and(|ps| ps.iter().any(|p| p["type"] == "image_url"))
+    });
+    let prompt = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .map(|m| {
+            m["content"].as_str().map(str::to_owned).unwrap_or_else(|| {
+                m["content"]
+                    .as_array()
+                    .map(|ps| {
+                        ps.iter()
+                            .filter_map(|p| p["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default()
+            })
+        })
+        .filter(|s| !s.is_empty() || has_images)
+        .ok_or_else(|| ProviderError::new(400, "缺少 user 消息"))?;
+    let mut system = vec![];
+    if let Some(ms) = b["messages"].as_array() {
+        for m in ms {
+            if m["role"] == "system" {
+                system.push(m["content"].clone())
+            }
+        }
+    }
+    let mut id_config = json!({"key":id,"source":"system","is_reasoning":true,"format":"openai"});
+    if has_images {
+        // Qoder CN's official RequestConverter sends multimodal parts in both
+        // content and contents, and model_config.is_vl selects its vision route.
+        id_config["is_vl"] = json!(true);
+        for message in b["messages"].as_array_mut().unwrap() {
+            if let Some(parts) = message
+                .get("content")
+                .filter(|content| content.is_array())
+                .cloned()
+            {
+                message["contents"] = parts;
+            }
+        }
+    }
+    let mut out = json!({"request_id":uuid::Uuid::new_v4().to_string(),"request_set_id":uuid::Uuid::new_v4().to_string(),"chat_record_id":uuid::Uuid::new_v4().to_string(),"session_id":uuid::Uuid::new_v4().to_string(),"stream":true,"chat_task":"FREE_INPUT","chat_context":{"chatPrompt":"","extra":{"context":[],"modelConfig":id_config,"originalContent":{"type":"text","text":prompt}},"features":[],"text":{"type":"text","text":prompt}},"is_reply":true,"is_retry":false,"source":1,"version":"3","session_type":"qodercli","agent_id":"agent_common","task_id":"common","model_config":id_config,"messages":b["messages"],"system":system,"parameters":{"max_tokens":b["max_tokens"].as_u64().unwrap_or(8192)}});
+    for key in ["tools", "tool_choice"] {
+        if let Some(v) = b.as_object_mut().and_then(|o| o.remove(key)) {
+            out[key] = v;
+        }
+    }
+    Ok(out)
+}
+fn prepare_chat_body(m: &ModelInfo, b: Value) -> Result<Value, ProviderError> {
+    let upstream = m.upstream_id.as_deref().unwrap_or(&m.id);
+    let mut b = body(b, upstream)?;
+    if let Some(window) = m.context_window_options.iter().max() {
+        // Qoder CLI 1.1.71 selects context tiers with parameters.context_length.
+        // This is independent of max_tokens, which controls generated output.
+        b["parameters"]["context_length"] = json!(window);
+    }
+    Ok(b)
+}
+pub(super) async fn chat(
+    client: &ProviderClient,
+    c: &Credentials,
+    m: &ModelInfo,
+    b: Value,
+) -> Result<ProviderChat, ProviderError> {
+    let upstream = m.upstream_id.as_deref().unwrap_or(&m.id);
+    let mut b = prepare_chat_body(m, b)?;
+    b["aliyun_user_type"] =
+        json!(text(&c.extra, &["user_type", "userType"]).unwrap_or("personal_standard".into()));
+    let url=format!("{}/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1", gateway_base(c));
+    let r = signed(
+        client.http.post(&url),
+        c,
+        encode(b.to_string().as_bytes()),
+        &url,
+        Some(upstream),
+    )?
+    .header("Accept", "text/event-stream")
+    .header("Cache-Control", "no-cache");
+    stream::response(r, Platform::Qoder).await
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn account_region_selects_all_official_qoder_origins() {
+        let mut c = empty_credentials();
+        assert_eq!(api_base(&c), "https://openapi.qoder.com.cn");
+        assert_eq!(gateway_base(&c), "https://gateway.qoder.com.cn");
+        assert_eq!(client_id(c.region), CLIENT_ID);
+        assert_eq!(auth_base(c.region), "https://qoder.cn");
+        c.region = CreditRegion::Intl;
+        assert_eq!(api_base(&c), "https://openapi.qoder.sh");
+        assert_eq!(gateway_base(&c), "https://api2.qoder.sh");
+        assert_eq!(client_id(c.region), "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb");
+        assert_eq!(auth_base(c.region), "https://qoder.com");
+        c.access_token = "synthetic-access-token".into();
+        c.device_id = Some("synthetic-device".into());
+        for region in [CreditRegion::Cn, CreditRegion::Intl] {
+            c.region = region;
+            let url = format!("{}/algo/api/v2/model/list?Encode=1", gateway_base(&c));
+            let r = signed(Client::new().get(&url), &c, encode(b"{}"), &url, None).unwrap().build().unwrap();
+            assert_eq!(r.url().as_str(), url);
+            assert!(r.headers()["authorization"].to_str().unwrap().starts_with("Bearer COSY."));
+        }
+    }
+    #[test]
+    fn oauth_and_refresh_token_shapes_keep_region_and_use_seconds_for_duration() {
+        let mut previous = empty_credentials();
+        previous.region = CreditRegion::Intl;
+        previous.extra = json!({"savedMetadata": "keep"});
+        let now = now_ms();
+        let fixture: Value = serde_json::from_str(include_str!("fixtures/qoder_intl.json")).unwrap();
+        let relative = token_credentials(&fixture["token"], &previous).unwrap();
+        assert_eq!(relative.region, CreditRegion::Intl);
+        assert_eq!(relative.extra, previous.extra);
+        assert_eq!(relative.refresh_token.as_deref(), Some("next"));
+        assert!(relative.expires_at.unwrap() >= now + 3_600_000);
+        assert!(relative.expires_at.unwrap() <= now_ms() + 3_600_000);
+        for (key, value) in [
+            ("expires_at", json!(1_900_000_000)),
+            ("expiresAt", json!(1_900_000_000_000i64)),
+            ("expire_time", json!("1900000000")),
+            ("expireTime", json!("2030-03-17T17:46:40Z")),
+        ] {
+            let mut v = json!({"device_token":"synthetic"});
+            v[key] = value;
+            assert_eq!(token_credentials(&v, &previous).unwrap().expires_at, Some(1_900_000_000_000));
+        }
+        assert!(token_credentials(&json!({"expires_at":1_900_000_000}), &previous).is_err());
+    }
+    #[tokio::test]
+    async fn international_pat_authentication_and_device_refresh_preserve_identity() {
+        use axum::{extract::State, http::Request, Json, Router};
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new().fallback(|State(calls): State<Arc<std::sync::Mutex<Vec<String>>>>, request: Request<axum::body::Body>| async move {
+            let path = request.uri().path().to_owned();
+            calls.lock().unwrap().push(path.clone());
+            let v = match path.as_str() {
+                "/api/v1/jobToken/exchange" => {
+                    let body = axum::body::to_bytes(request.into_body(), 4096).await.unwrap();
+                    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["personal_token"], "pt-synthetic");
+                    json!({"token":"synthetic-job", "refresh_token":"jrt-synthetic", "expires_at":1_900_000_000})
+                }
+                "/api/v1/userinfo" => {
+                    assert_eq!(request.headers()["authorization"], "Bearer synthetic-job");
+                    json!({"id":"synthetic-user", "name":"Fixture", "user_type":"personal_standard"})
+                }
+                "/api/v1/deviceToken/refresh" => {
+                    let body = axum::body::to_bytes(request.into_body(), 4096).await.unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["refresh_token"], "synthetic-device-refresh");
+                    assert_eq!(body["machine_id"], "saved-device");
+                    json!({"device_token":"new-device-token", "expiresAt":1_900_000_000_000i64})
+                }
+                _ => panic!("unexpected request: {path}"),
+            };
+            Json(v)
+        }).with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap(); });
+        let mut client = ProviderClient::new();
+        client.http = Client::builder().no_proxy().build().unwrap();
+        let mut c = empty_credentials();
+        c.region = CreditRegion::Intl;
+        c.access_token = "pt-synthetic".into();
+        c.device_id = Some("saved-device".into());
+        c.extra = json!({"savedMetadata":"keep"});
+        let (uid, _, mut c) = authenticate_at(&client, &c, &api).await.unwrap();
+        assert_eq!(uid, "synthetic-user");
+        assert_eq!(c.region, CreditRegion::Intl);
+        assert_eq!(c.extra["savedMetadata"], "keep");
+        assert_eq!(c.extra["name"], "Fixture");
+        assert_eq!(c.expires_at, Some(1_900_000_000_000));
+        c.refresh_token = Some("synthetic-device-refresh".into());
+        let c = refresh_at(&client, &c, &api).await.unwrap();
+        assert_eq!(c.region, CreditRegion::Intl);
+        assert_eq!(c.access_token, "new-device-token");
+        assert_eq!(c.device_id.as_deref(), Some("saved-device"));
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        server.abort();
+    }
+    #[test]
+    fn international_quota_aliases_preserve_each_pack_unit_and_expiry() {
+        let fixture: Value = serde_json::from_str(include_str!("fixtures/qoder_intl.json")).unwrap();
+        let ps = parse_packs(&fixture["quota"]);
+        assert_eq!(ps.len(), 4);
+        assert_eq!(ps[0].expires_at, Some(1_900_000_000_000));
+        assert_eq!(ps[1].expires_at, Some(1_950_000_000_000));
+        assert_eq!(ps[2].expires_at, None);
+        assert_eq!(ps[3].unit, "USD");
+        assert_eq!(ps[3].id, "pack");
+        assert_eq!(ps[3].remaining, Some(11.0));
+        assert_eq!(parse_packs(&json!({"user_quota":{"percentage":42}}))[0].remaining, None);
+    }
+    #[test]
+    fn reasoning_levels_use_thinking_configuration_instead_of_the_reasoning_badge() {
+        let models = parse_models(&json!({"chat":[
+            {"key":"dfmodel","enable":true,"is_reasoning":false,"thinking_config":{"disabled":{},"enabled":{"is_default":true,"efforts":{"low":{},"high":{},"max":{"is_default":true}}}}},
+            {"key":"toggle-only","enable":true,"thinking_config":{"enabled":{"is_default":true},"disabled":{}}},
+            {"key":"unknown","enable":true,"is_reasoning":true}
+        ]}));
+        assert_eq!(models[0].reasoning_effort_options, vec!["high", "low", "max"]);
+        assert_eq!(models[0].default_reasoning_effort.as_deref(), Some("max"));
+        for model in &models[1..] {
+            assert!(model.reasoning_effort_options.is_empty());
+            assert_eq!(model.default_reasoning_effort, None);
+        }
+    }
+
+    #[test]
+    fn developer_messages_become_system_messages_without_changing_the_conversation() {
+        for content in [json!("project instructions"), json!([{"type":"text","text":"project instructions"}])] {
+            let input = json!({"messages":[
+                {"role":"system","content":"base instructions"},
+                {"role":"developer","content":content},
+                {"role":"user","content":"hello"},
+                {"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"result"}
+            ],"tools":[{"type":"function","function":{"name":"Read","parameters":{"type":"object"}}}],"tool_choice":"auto"});
+            let mut expected_messages = input["messages"].clone();
+            expected_messages[1]["role"] = json!("system");
+            let converted = body(input.clone(), "dfmodel").unwrap();
+            assert_eq!(converted["messages"], expected_messages);
+            assert_eq!(converted["system"], json!(["base instructions", content]));
+            assert_eq!(converted["tools"], input["tools"]);
+            assert_eq!(converted["tool_choice"], input["tool_choice"]);
+        }
+    }
+
+    #[test]
+    fn catalog_model_id_is_separate_from_the_routing_key() {
+        let models = parse_models(&json!({"chat":[{"key":"dfmodel","display_name":"DeepSeek-Flash","enable":true,"model":" deepseek-v4-1-flash-260910 "}]}));
+        assert_eq!(models[0].upstream_id.as_deref(), Some("dfmodel"));
+        assert_eq!(models[0].upstream_model_ids, vec!["deepseek-v4-1-flash-260910"]);
+        let b = prepare_chat_body(&models[0], json!({"messages":[{"role":"user","content":"hello"}]})).unwrap();
+        assert_eq!(b["model_config"]["key"], "dfmodel");
+        let declared = parse_models(&json!({"chat":[{"key":"dfmodel","enable":true,"model":"deepseek-flash__dev"}]}));
+        assert!(identity_matches(&declared[0], "deepseek-flash__dev"));
+        assert!(!identity_matches(&declared[0], "deepseek-flash__undeclared"));
+        for hidden in [json!(""), json!("dfmodel"), json!("ep-deployment"), json!(123), Value::Null] {
+            let models = parse_models(&json!({"chat":[{"key":"dfmodel","enable":true,"model":hidden}]}));
+            assert!(models[0].upstream_model_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn models_choose_largest_context_tier_instead_of_legacy_input_budget() {
+        let models = parse_models(&json!({"chat":[
+            {"key":"dfmodel","display_name":"DeepSeek-Flash","enable":true,"max_input_tokens":180000,"context_config":{"200K":{"token_count":200000,"is_default":true},"400K":{"token_count":400000},"1M":{"token_count":1000000},"duplicate":{"token_count":400000},"invalid":{"token_count":-1}}},
+            {"key":"future-model","enable":true,"max_input_tokens":200000,"available_context_windows":[400000,2000000,0,400000,-1,2.5,null],"default_context_window":400000},
+            {"key":"fixed-model","enable":true,"max_input_tokens":256000},
+            {"key":"unknown-model","enable":true,"max_input_tokens":0,"context_config":{"bad":{"token_count":0}}}
+        ]}));
+        assert_eq!(models[0].context_window, Some(1000000));
+        assert_eq!(models[0].context_window_options, vec![200000, 400000, 1000000]);
+        assert_eq!(models[1].context_window, Some(2000000));
+        assert_eq!(models[1].context_window_options, vec![400000, 2000000]);
+        assert_eq!(models[2].context_window, Some(256000));
+        assert!(models[2].context_window_options.is_empty());
+        assert_eq!(models[3].context_window, None);
+        assert!(models[3].context_window_options.is_empty());
+    }
+
+    #[test]
+    fn chat_selects_largest_context_for_text_and_images_without_changing_output_budget() {
+        let models = parse_models(&json!({"chat":[{"key":"dfmodel","display_name":"DeepSeek-Flash","enable":true,"max_input_tokens":180000,"context_config":{"200K":{"token_count":200000,"is_default":true},"1M":{"token_count":1000000}}}]}));
+        for content in [json!("hello"), json!([{"type":"image_url","image_url":{"url":"data:image/png;base64,aW1hZ2U="}}])] {
+            let b = prepare_chat_body(&models[0], json!({"messages":[{"role":"user","content":content}],"max_tokens":384000})).unwrap();
+            assert_eq!(b["parameters"]["context_length"], 1000000);
+            assert_eq!(b["parameters"]["max_tokens"], 384000);
+            assert_eq!(b["model_config"]["key"], "dfmodel");
+            assert_eq!(b["messages"][0]["content"], content);
+        }
+        let legacy = model("legacy-model".into(), "Legacy".into(), Some(180000));
+        let b = prepare_chat_body(&legacy, json!({"messages":[{"role":"user","content":"hello"}]})).unwrap();
+        assert!(b["parameters"].get("context_length").is_none());
+    }
+
+    #[test]
+    fn model_info_keeps_catalog_limits_without_inventing_missing_values() {
+        for (output, expected) in [
+            (json!(128000), Some(128000)),
+            (json!("128000"), Some(128000)),
+            (json!(0), None),
+            (json!(-1), None),
+            (json!(64.5), None),
+            (json!("128K"), None),
+            (Value::Null, None),
+        ] {
+            let models = parse_models(&json!({"chat":[{"key":"gfmodel","display_name":"GLM-5.3-Flash","enable":true,"max_input_tokens":1000000,"max_output_tokens":output,"is_vl":true,"is_reasoning":false}]}));
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, "glm-5.3-flash");
+            assert_eq!(models[0].upstream_id.as_deref(), Some("gfmodel"));
+            assert_eq!(models[0].context_window, Some(1000000));
+            assert_eq!(models[0].max_output_tokens, expected);
+            assert_eq!(models[0].supports_images, Some(true));
+            assert_eq!(models[0].supports_reasoning, Some(false));
+        }
+        let models = parse_models(&json!({"chat":[{"key":"unknown","enable":true}]}));
+        assert_eq!(models[0].max_output_tokens, None);
+        assert_eq!(models[0].supports_images, None);
+        assert_eq!(models[0].supports_reasoning, None);
+    }
+
+    #[test]
+    fn image_requests_keep_multimodal_contents_and_enable_the_vision_route() {
+        let parts = json!([{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aW1hZ2U="}}]);
+        let input = json!({"messages":[{"role":"system","content":"instructions"},{"role":"user","content":parts}],"max_tokens":128});
+        let converted = body(input.clone(), "gfmodel").unwrap();
+        assert_eq!(converted["model_config"]["is_vl"], true);
+        assert_eq!(
+            converted["chat_context"]["extra"]["modelConfig"]["is_vl"],
+            true
+        );
+        assert_eq!(converted["messages"][1]["content"], parts);
+        assert_eq!(converted["messages"][1]["contents"], parts);
+
+        let mut image_only = input;
+        image_only["messages"][1]["content"] = json!([parts[1].clone()]);
+        let converted = body(image_only, "gfmodel").unwrap();
+        assert_eq!(converted["messages"][1]["contents"][0], parts[1]);
+        assert_eq!(converted["chat_context"]["text"]["text"], "");
+
+        let converted = body(json!({"messages":[{"role":"user","content":"read image"},{"role":"assistant","content":"","reasoning_content":"inspect the screenshot","tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":parts}]}), "gfmodel").unwrap();
+        assert_eq!(
+            converted["messages"][1]["reasoning_content"],
+            "inspect the screenshot"
+        );
+        assert_eq!(converted["messages"][2]["contents"], parts);
+        assert_eq!(converted["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(converted["model_config"]["is_vl"], true);
+        let text = body(
+            json!({"messages":[{"role":"user","content":"hello"}]}),
+            "gfmodel",
+        )
+        .unwrap();
+        assert_ne!(text["model_config"]["is_vl"], true);
+        assert!(text["messages"][0].get("contents").is_none());
+    }
+
+    #[test]
+    fn qoder_encoding_matches_reference_vectors() {
+        assert_eq!(encode(b"{}"), "$kwm");
+        assert_eq!(encode(b""), "");
+    }
+    #[test]
+    fn signing_excludes_query_and_algo_prefix() {
+        assert_eq!(
+            signature("p", "k", "1", "b", "/algo/path"),
+            format!("{:x}", md5::compute("p\nk\n1\nb\n/path"))
+        );
+    }
+    #[test]
+    fn coupon_and_unknown_benefit_are_never_claimed() {
+        let rs = parse_rewards(
+            &json!({"campaigns":[{"id":"a","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"kind":"REDEMPTION_CODE"}},{"id":"b","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"kind":"CREDITS","amount":100}},{"id":"c","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE"}]}),
+        );
+        assert_eq!(rs[0].status, "unavailable");
+        assert_eq!(rs[1].status, "claimable");
+        assert_eq!(rs[2].status, "unavailable");
+    }
+    #[test]
+    fn campaign_status_reads_wrapped_data_without_guessing_an_id() {
+        let url = "https://qoder.com.cn/activities";
+        let rs = parse_rewards(&json!({"data": {
+            "showCampaign": true,
+            "claimable": true,
+            "campaignUrl": url
+        }}));
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].id, url);
+        assert_eq!(rs[0].kind, "activity");
+        assert_eq!(rs[0].status, "claimable");
+        assert_eq!(rs[0].action_url.as_deref(), Some(url));
+    }
+    #[test]
+    fn campaign_status_preserves_the_upstream_id_and_title() {
+        let rs = parse_rewards(&json!({
+            "campaignId": "daily-credits",
+            "title": "每日领取积分",
+            "showCampaign": true,
+            "claimable": false,
+            "campaignUrl": "https://qoder.com.cn/activities"
+        }));
+        assert_eq!(rs[0].id, "daily-credits");
+        assert_eq!(rs[0].name, "每日领取积分");
+        assert_eq!(rs[0].status, "unavailable");
+    }
+    #[test]
+    fn missing_claim_eligibility_is_not_treated_as_claimed() {
+        let rs = parse_rewards(&json!({"campaigns": [{
+            "id": "daily-credits",
+            "campaignUrl": "https://qoder.com.cn/activities"
+        }]}));
+        assert_eq!(rs[0].status, "unknown");
+    }
+    #[test]
+    fn disabled_web_campaigns_are_not_shown_as_claimed_rewards() {
+        let rs = parse_rewards(&json!({"campaigns": [{
+            "showCampaign": false,
+            "claimable": false,
+            "campaignUrl": "https://qoder.com.cn/activities"
+        }]}));
+        assert!(rs.is_empty());
+    }
+    #[test]
+    fn credit_campaign_with_an_information_url_still_uses_its_claim_status() {
+        let rs = parse_rewards(&json!({"campaigns": [{
+            "id": "credit-benefit",
+            "actionType": "CLAIM_BENEFIT",
+            "claimStatus": "CLAIMABLE",
+            "benefit": {"kind": "CREDITS", "amount": 100},
+            "campaignUrl": "https://qoder.com.cn/activities"
+        }]}));
+        assert_eq!(rs[0].kind, "credits");
+        assert_eq!(rs[0].status, "claimable");
+        assert_eq!(rs[0].amount, Some(100.0));
+    }
+    fn daily_campaign(status: &str) -> Value {
+        json!({
+            "showCampaign": true, "claimable": status == "CLAIMABLE",
+            "campaignUrl": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+            "campaigns": [{
+                "campaignId": "daily-from-live-list", "campaignKey": "daily-key",
+                "actionType": "CLAIM_BENEFIT", "claimStatus": status,
+                "startAt": 1791943200i64, "endAt": 1792029540i64,
+                "benefit": {"kind": "CREDITS", "amount": 100},
+                "placements": [{"type": "USAGE", "content": {"zh": {"title": "每日 100 积分"}}}]
+            }, {
+                "campaignId": "coupon", "actionType": "CLAIM_BENEFIT", "claimStatus": "CLAIMABLE",
+                "benefit": {"kind": "REDEMPTION_CODE", "amount": 1}
+            }]
+        })
+    }
+    #[test]
+    fn official_daily_list_uses_placement_title_and_does_not_duplicate_container() {
+        let rs = parse_rewards(&daily_campaign("CLAIMABLE"));
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].id, "daily-from-live-list");
+        assert_eq!(rs[0].name, "每日 100 积分");
+        assert_eq!(rs[0].kind, "credits");
+        assert_eq!(rs[0].next_available_at, Some(1791943200000));
+        assert_eq!(rs[1].kind, "coupon");
+    }
+    #[test]
+    fn server_disabled_campaigns_cannot_be_claimed() {
+        let mut list = daily_campaign("CLAIMABLE");
+        list["showCampaign"] = json!(false);
+        assert!(parse_rewards(&list).is_empty());
+    }
+
+    type Reply = (&'static str, &'static str, u16, Value);
+    const LIST: &str = "/sash/api/v1/me/campaigns";
+    const CLAIM: &str = "/sash/api/v1/me/campaigns/daily-from-live-list/claim";
+    const REWARD: &str = "/sash/api/v1/me/campaigns/daily-from-live-list/reward";
+
+    async fn claim_fixture(replies: Vec<Reply>) -> Vec<RewardOutcome> {
+        claim_fixture_region(replies, CreditRegion::Cn).await
+    }
+    async fn claim_fixture_region(replies: Vec<Reply>, region: CreditRegion) -> Vec<RewardOutcome> {
+        use axum::{extract::State, http::Request, response::IntoResponse, Json, Router};
+        let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            replies,
+        )));
+        let state = queue.clone();
+        let app = Router::new()
+            .fallback(
+                |State(queue): State<Arc<std::sync::Mutex<std::collections::VecDeque<Reply>>>>,
+                 request: Request<axum::body::Body>| async move {
+                    let (method, path, status, value) = queue
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("unexpected extra request");
+                    assert_eq!(request.method().as_str(), method);
+                    assert_eq!(request.uri().path(), path);
+                    assert_eq!(request.headers()["authorization"], "Bearer test-token");
+                    assert_eq!(request.headers()["cosy-clienttype"], "10");
+                    assert_eq!(request.headers()["cosy-machineid"], "saved-device");
+                    assert_eq!(request.headers()["cosy-version"], "0.4.4");
+                    assert_eq!(request.headers()["user-agent"], "Qoder");
+                    assert_eq!(request.headers().get_all("user-agent").iter().count(), 1);
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        Json(value),
+                    )
+                        .into_response()
+                },
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut client = ProviderClient::new();
+        client.http = Client::builder().no_proxy().build().unwrap();
+        let mut credentials = empty_credentials();
+        credentials.region = region;
+        credentials.access_token = "test-token".into();
+        credentials.device_id = Some("saved-device".into());
+        let account = Account {
+            region,
+            id: "test-qoder".into(),
+            platform: Platform::Qoder,
+            user_id: "test-user".into(),
+            label: "test".into(),
+            enabled: true,
+            status: "ready".into(),
+            last_error: None,
+            snapshot: None,
+        };
+        let result = claim_at(&client, &account, &credentials, &api, None).await;
+        server.abort();
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "expected requests were not sent"
+        );
+        result.unwrap()
+    }
+
+    #[tokio::test]
+    async fn one_click_claims_only_live_credit_ids_with_official_headers() {
+        let results = claim_fixture(vec![
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+            ("POST", CLAIM, 200, json!({"status": "CLAIMED"})),
+        ])
+        .await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "claimed");
+        assert_eq!(results[0].amount, Some(100.0));
+        assert_eq!(results[0].name, "每日 100 积分");
+    }
+
+    #[tokio::test]
+    async fn international_campaign_uses_live_id_and_confirms_pending_grant_without_reposting() {
+        let results = claim_fixture_region(vec![
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+            ("POST", CLAIM, 504, json!({"errorCode":"GRANT_RESULT_UNKNOWN"})),
+            ("GET", REWARD, 200, json!({"status":"CLAIMED","benefit":{"kind":"CREDITS","amount":100}})),
+        ], CreditRegion::Intl).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "claimed");
+        assert_eq!(results[0].amount, Some(100.0));
+    }
+    #[tokio::test]
+    async fn already_claimed_daily_credits_are_not_posted_again() {
+        let results = claim_fixture(vec![("GET", LIST, 200, daily_campaign("CLAIMED"))]).await;
+        assert_eq!(results[0].status, "already_claimed");
+        assert_eq!(results[0].amount, None);
+    }
+    #[tokio::test]
+    async fn ambiguous_grant_reads_reward_without_reposting() {
+        let results = claim_fixture(vec![
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+            (
+                "POST",
+                CLAIM,
+                504,
+                json!({"errorCode": "GRANT_RESULT_UNKNOWN"}),
+            ),
+            ("GET", REWARD, 200, json!({"status": "CLAIMED"})),
+        ])
+        .await;
+        assert_eq!(results[0].status, "claimed");
+        assert_eq!(results[0].amount, Some(100.0));
+        assert!(results[0].message.contains("回查"));
+    }
+    #[tokio::test]
+    async fn pending_grant_never_reports_unconfirmed_points() {
+        let results = claim_fixture(vec![
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+            ("POST", CLAIM, 200, json!({"status": "PENDING"})),
+            ("GET", REWARD, 200, json!({"status": "PENDING"})),
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+        ])
+        .await;
+        assert_eq!(results[0].status, "pending");
+        assert_eq!(results[0].amount, None);
+    }
+    #[tokio::test]
+    async fn risk_rejection_is_reported_without_token_refresh_or_extra_claim() {
+        let results = claim_fixture(vec![
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+            ("POST", CLAIM, 403, json!({"errorCode": "RISK_BLOCKED"})),
+            (
+                "GET",
+                REWARD,
+                404,
+                json!({"errorCode": "CAMPAIGN_NOT_FOUND"}),
+            ),
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+        ])
+        .await;
+        assert_eq!(results[0].status, "failed");
+        assert_eq!(results[0].amount, None);
+        assert!(results[0].message.contains("RISK_BLOCKED"));
+    }
+    #[tokio::test]
+    async fn an_unavailable_campaign_is_not_submitted() {
+        let results = claim_fixture(vec![("GET", LIST, 200, daily_campaign("INELIGIBLE"))]).await;
+        assert_eq!(results[0].status, "unavailable");
+    }
+    #[test]
+    fn explicit_non_credit_grant_is_not_counted_as_credits() {
+        assert!(!credits_confirmed(
+            &json!({"status": "CLAIMED", "benefit": {"kind": "REDEMPTION_CODE"}})
+        ));
+        assert!(!credits_confirmed(&json!({"success": true})));
+    }
+    #[test]
+    fn quota_includes_dedicated_packs() {
+        let ps = parse_packs(
+            &json!({"userQuota":{"remaining":5},"addOnQuota":{"remaining":7},"dedicatedResourcePackages":[{"remaining":11}]}),
+        );
+        assert_eq!(snapshot(ps, vec![], vec![], None).balance, Some(23.0));
+    }
+}

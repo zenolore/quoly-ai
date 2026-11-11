@@ -1,0 +1,14 @@
+{
+  "identifier": "float-window",
+  "description": "悬浮窗：允许拖动、隐藏自身，以及调用界面偏好命令",
+  "windows": ["float"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-outer-position",
+    "core:window:allow-scale-factor"
+  ]
+}

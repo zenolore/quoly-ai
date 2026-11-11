@@ -1,0 +1,505 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version (e.g., 2.2.2)'
+        required: true
+        default: '2.2.2'
+      publish:
+        description: 'Publish the release after building both platforms'
+        type: boolean
+        default: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  release-macos:
+    name: Build and Release (macOS)
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "VERSION is $VERSION"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run quality checks
+        run: |
+          pnpm check
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Build Tauri App (macOS)
+        shell: bash
+        timeout-minutes: 60
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          for attempt in $(seq 1 "$max_attempts"); do
+            echo "=== macOS build attempt ${attempt}/${max_attempts} ==="
+            if pnpm tauri build; then
+              echo "✅ macOS build succeeded"
+              exit 0
+            fi
+
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "❌ macOS build failed after ${max_attempts} attempts" >&2
+              exit 1
+            fi
+
+            sleep_seconds=$((attempt * 60))
+            echo "⚠️ macOS build failed, retrying in ${sleep_seconds}s..."
+            sleep "$sleep_seconds"
+          done
+
+      - name: Prepare macOS Assets
+        shell: bash
+        env:
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          set -euxo pipefail
+          mkdir -p release-assets
+          ARCH="aarch64"
+
+          # Recursively search for artifacts
+          BUNDLE_DIR=$(find src-tauri/target -name "bundle" -type d | head -1 || true)
+
+          if [ -z "$BUNDLE_DIR" ]; then
+            echo "❌ No bundle directory found" >&2
+            exit 1
+          fi
+
+          echo "📦 Found bundle dir: $BUNDLE_DIR"
+
+          APP_PATH=$(find "$BUNDLE_DIR" -name "*.app" -type d 2>/dev/null | head -1 || true)
+          DMG_PATH=$(find "$BUNDLE_DIR" -name "*.dmg" -type f 2>/dev/null | head -1 || true)
+          SIG_FILE=$(find "$BUNDLE_DIR" -name "*.dmg.sig" -type f 2>/dev/null | head -1 || true)
+
+          if [ -z "$APP_PATH" ] && [ -z "$DMG_PATH" ]; then
+            echo "❌ No macOS artifacts found in $BUNDLE_DIR" >&2
+            exit 1
+          fi
+
+          # Copy .dmg if available (for manual installation)
+          if [ -n "$DMG_PATH" ]; then
+            NEW_DMG="AI_Toolkit-${VERSION}-macOS-${ARCH}.dmg"
+            cp "$DMG_PATH" "release-assets/$NEW_DMG"
+            echo "✅ macOS dmg ready: $NEW_DMG"
+          fi
+
+          # Copy .app.tar.gz (updater bundle) and signature
+          APP_TAR=$(find "$BUNDLE_DIR" -name "*.app.tar.gz" -type f 2>/dev/null | head -1)
+          if [ -n "$APP_TAR" ]; then
+            NEW_APP_TAR="AI_Toolkit-${VERSION}-macOS-${ARCH}.app.tar.gz"
+            cp "$APP_TAR" "release-assets/$NEW_APP_TAR"
+            echo "✅ macOS updater bundle ready: $NEW_APP_TAR"
+          fi
+
+          # Copy signature file if available
+          # Tauri v2 generates .app.tar.gz.sig for macOS
+          SIG_FILE=$(find src-tauri/target -name "*.app.tar.gz.sig" -type f 2>/dev/null | head -1)
+          if [ -n "$SIG_FILE" ]; then
+            cp "$SIG_FILE" "release-assets/AI_Toolkit-${VERSION}-macOS-${ARCH}.app.tar.gz.sig"
+            echo "✅ signature file ready: $(basename "$SIG_FILE")"
+            echo "   from: $SIG_FILE"
+          else
+            echo "⚠️ No .app.tar.gz.sig file found"
+            echo "   Searching for any .sig files..."
+            find src-tauri/target -name "*.sig" -type f 2>/dev/null | while read -r f; do echo "   Found: $f"; done || echo "   None found"
+            exit 1
+          fi
+
+          # Debug: list all files in bundle directory
+          echo "📦 Bundle directory contents:"
+          find "$BUNDLE_DIR" -type f 2>/dev/null | head -20 || true
+
+      - name: Upload release artifacts to workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-macos-aarch64
+          path: release-assets/*
+          if-no-files-found: warn
+
+  release-windows:
+    name: Build and Release (Windows)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Version
+        id: get_version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "VERSION is $VERSION"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install WiX
+        run: |
+          curl -L -o wix.msi https://github.com/wixtoolset/wix/releases/latest/download/wix-cli-x64.msi
+          msiexec /i wix.msi /quiet /qn /norestart
+
+      - name: Add WiX to PATH
+        run: |
+          echo "C:\Program Files\WiX Toolset\bin" >> $env:GITHUB_PATH
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run quality checks
+        run: |
+          pnpm check
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Build Tauri App (Windows)
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "=== Windows build attempt ${attempt}/${maxAttempts} ==="
+            pnpm tauri build --bundles msi
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ Windows build succeeded"
+              exit 0
+            }
+            
+            if ($attempt -eq $maxAttempts) {
+              Write-Host "❌ Windows build failed after ${maxAttempts} attempts" -ForegroundColor Red
+              exit 1
+            }
+            
+            $sleepSeconds = $attempt * 60
+            Write-Host "⚠️ Windows build failed, retrying in ${sleepSeconds}s..." -ForegroundColor Yellow
+            Start-Sleep -Seconds $sleepSeconds
+          }
+
+      - name: Prepare Windows Assets
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets
+          $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle/msi' -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -ne $msi) {
+            $dest = "AI_Toolkit-$env:VERSION-Windows-x64.msi"
+            Copy-Item $msi.FullName (Join-Path release-assets $dest)
+            Write-Host "Windows msi ready: $dest"
+          } else {
+            Write-Warning 'No Windows MSI installer found'
+          }
+
+          # Tauri updater artifacts: latest.json and signature file
+          # Tauri v2 generates .msi.zip for Windows
+          $bundleDir = (Get-ChildItem -Path 'src-tauri/target' -Recurse -Directory -Filter 'bundle' | Select-Object -First 1).FullName
+          if ($bundleDir) {
+            $fullBundleDir = $bundleDir
+            Write-Host "Bundle directory: $fullBundleDir"
+            
+            # Debug: List all files in bundle directory
+            Write-Host "📦 Bundle directory contents:"
+            Get-ChildItem -Path $fullBundleDir -Recurse -File | Select-Object -First 30 | ForEach-Object { Write-Host "  $($_.FullName)" }
+            
+            # Copy .msi.zip (updater bundle)
+            $msiZip = Get-ChildItem -Path $fullBundleDir -Name '*.msi.zip' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($msiZip) {
+              $dest = "AI_Toolkit-$env:VERSION-Windows-x64.msi.zip"
+              Copy-Item (Join-Path $fullBundleDir $msiZip) (Join-Path release-assets $dest)
+              Write-Host "✅ Windows updater bundle ready: $dest"
+            } else {
+              Write-Warning "No .msi.zip file found"
+            }
+            
+          # 查找签名文件
+          # Tauri v2 MSI 打包器生成 .msi.sig（对应 .msi 安装包）
+          $sigFile = Get-ChildItem -Path $fullBundleDir -Name '*.msi.sig' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($sigFile) {
+            $dest = "AI_Toolkit-$env:VERSION-Windows-x64.msi.sig"
+            Copy-Item (Join-Path $fullBundleDir $sigFile) (Join-Path release-assets $dest)
+            Write-Host "✅ Windows signature file ready: $dest"
+          } else {
+            Write-Host "⚠️ No .msi.sig file found, searching for any .sig files..."
+            $allSigFiles = Get-ChildItem -Path $fullBundleDir -Name '*.sig' -Recurse -ErrorAction SilentlyContinue
+            if ($allSigFiles) {
+              $allSigFiles | ForEach-Object { Write-Host "  Found: $_" }
+            } else {
+              Write-Host "  No .sig files found at all"
+            }
+            Write-Error "No .msi.sig file found"
+            exit 1
+          }
+          } else {
+            Write-Error "No bundle directory found"
+            exit 1
+          }
+
+          # Note: latest.json will be handled by macOS job to avoid conflicts
+
+      - name: Upload release artifacts to workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows-x64
+          path: release-assets/*
+          if-no-files-found: warn
+
+  publish-release:
+    name: Publish GitHub Release
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    runs-on: ubuntu-22.04
+    needs: [release-macos, release-windows]
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-macos-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-windows-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: List downloaded release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la release-assets || echo "No artifacts found"
+
+      - name: Get Version
+        id: get_version_release
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate latest.json
+        shell: bash
+        env:
+          VERSION: ${{ steps.get_version_release.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          # Get release date
+          RELEASE_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          # Get file sizes
+          # For updater bundles (not installers)
+          APP_TAR_AARCH64_FILE=$(find release-assets -name "*-aarch64.app.tar.gz" -type f | head -1)
+          MSI_FILE=$(find release-assets -name "*.msi" -type f | head -1)
+          APP_TAR_AARCH64_SIG=$(find release-assets -name "*-aarch64.app.tar.gz.sig" -type f | head -1)
+          MSI_SIG=$(find release-assets -name "*.msi.sig" -type f | head -1)
+
+          APP_TAR_AARCH64_SIG_CONTENT=""
+          MSI_SIG_CONTENT=""
+
+          if [ -n "$APP_TAR_AARCH64_SIG" ]; then
+            APP_TAR_AARCH64_SIG_CONTENT=$(cat "$APP_TAR_AARCH64_SIG")
+          fi
+          if [ -n "$MSI_SIG" ]; then
+            MSI_SIG_CONTENT=$(cat "$MSI_SIG")
+          fi
+
+          DOWNLOAD_BASE="https://github.com/zenolore/quoly-ai/releases/download/v${VERSION}"
+
+          # Build latest.json using jq to avoid YAML/shell conflicts
+          # Note: URLs point to updater bundles (.app.tar.gz) and installers (.msi)
+          jq -n \
+            --arg ver "${VERSION}" \
+            --arg date "${RELEASE_DATE}" \
+            --arg app_tar_aarch64_sig "${APP_TAR_AARCH64_SIG_CONTENT}" \
+            --arg msi_sig "${MSI_SIG_CONTENT}" \
+            --arg app_tar_aarch64_url "${DOWNLOAD_BASE}/AI_Toolkit-${VERSION}-macOS-aarch64.app.tar.gz" \
+            --arg msi_url "${DOWNLOAD_BASE}/AI_Toolkit-${VERSION}-Windows-x64.msi" \
+            --arg notes "See changelog at https://github.com/zenolore/quoly-ai/releases/tag/v${VERSION}" \
+            '{
+              version: $ver,
+              notes: $notes,
+              pub_date: $date,
+              platforms: {
+                "darwin-aarch64": {
+                  signature: $app_tar_aarch64_sig,
+                  url: $app_tar_aarch64_url
+                },
+                "windows-x86_64": {
+                  signature: $msi_sig,
+                  url: $msi_url
+                }
+              }
+            }' > release-assets/latest.json
+
+          echo "✅ latest.json generated:"
+          cat release-assets/latest.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version_release.outputs.VERSION }}
+          name: AiToolkit v${{ steps.get_version_release.outputs.VERSION }}
+          body: |
+            ## AiToolkit v${{ steps.get_version_release.outputs.VERSION }}
+
+            MCP, Skills, platform credits, and a local model proxy for AI programming tools.
+
+            ### 🖥️ System Support
+
+            | System | Status |
+            |--------|--------|
+            | **macOS 12+ (Apple Silicon)** | ✅ Supported |
+            | **Windows 10+** | ✅ Supported |
+            | **Linux** | 🚧 In Progress |
+
+            ### 📥 Downloads
+
+            - **macOS (Apple Silicon)**: `AI_Toolkit-${{ steps.get_version_release.outputs.VERSION }}-macOS-aarch64.dmg`
+            - **Windows (x64)**: `AI_Toolkit-${{ steps.get_version_release.outputs.VERSION }}-Windows-x64.msi`
+
+            **Note**: Auto-updater uses `.app.tar.gz` (macOS) and `.msi` (Windows) bundles which are included in this release.
+
+            ### New in v2.2.2
+
+            - `/v1/models` exposes known `context_window` and `max_output_tokens` capacities for prefixed routes and verified aliases
+            - Shared routes advertise only the minimum positive capacity explicitly declared by every eligible account; missing limits stay unknown
+            - Capacity metadata helps clients configure budgets without rewriting caller-specified output limits or truncation reasons
+
+            MiniMax CN identity, credits, catalog, and selected short text/tool inference have prior live validation. Global accounts, image understanding, complete browser login, and real claims remain unverified. International support remains experimental; TRAE international catalog and chat remain disabled (HTTP 501). See the [support and verification matrix](https://github.com/zenolore/quoly-ai/blob/main/docs/credits-international.md).
+
+            ### ✨ Features
+
+            - MCP and Skills adapters for 25 AI programming tools, including DeepSeek Harness
+            - Skills management panel with batch sync
+            - Offline in-app changelog with version cards and the running version highlighted
+            - MiniMax Code regional accounts, local import, personal credits, daily check-in, live catalog, and dual-protocol managed model proxy
+            - Automatic credit balance refresh with foreground, background, and post-request scheduling
+            - Independent balance, reward eligibility, and model catalog sync with cached-data status
+            - Shared in-flight account queries, three-account concurrency, backoff, and Retry-After handling
+            - Git repository installation for Skills
+            - Online Skills search from skills.sh
+            - Top 20 skills.sh recommendations by cumulative installs, with error details and retry
+            - JSON paste mode with smart parsing
+            - Built-in connection testing
+            - Real-time sync to configuration files
+            - OpenAI and Anthropic proxy protocols with 32 MiB request bodies
+            - Tool definition and JSON Schema structural preflight with errors naming the original field path
+            - Safe upstream diagnostics and correlated JSON/SSE errors with request IDs
+            - Image, tool, and unsigned reasoning history compatibility
+            - Preserve TRAE tool-call IDs across empty continuation chunks
+            - Model detail cards with catalog limits, capabilities, underlying model IDs, and reasoning levels
+            - DeepSeek Harness desktop and CLI discovery, launching, MCP configuration, and Skills sync
+            - Client store=false, Qoder developer messages, and WorkBuddy Harness template compatibility
+            - Specific upstream channel-rejection errors without automatic retries or account failover
+            - Prefer the highest account catalog context tier, with model-specific options and preserved output limits
+            - Route TRAE CN check-in status and claims through the separate UG gateway
+            - Correct TRAE CN check-in amounts and distinguish account confirmation from device limits
+            - Skill path validation, private caches, and desktop/OAuth hardening
+
+            Full changelog: https://github.com/zenolore/quoly-ai/blob/main/CHANGELOG.md
+          files: release-assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger website rebuild
+        shell: bash
+        env:
+          WEBSITE_DISPATCH_TOKEN: ${{ secrets.WEBSITE_DISPATCH_TOKEN }}
+          VERSION: ${{ steps.get_version_release.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEBSITE_DISPATCH_TOKEN}" ]; then
+            echo "WEBSITE_DISPATCH_TOKEN is not set" >&2
+            exit 1
+          fi
+
+          payload=$(jq -nc \
+            --arg version "${VERSION}" \
+            --arg tag "v${VERSION}" \
+            --arg url "https://github.com/zenolore/quoly-ai/releases/tag/v${VERSION}" \
+            '{
+              event_type: "ai-toolkit-release",
+              client_payload: {
+                version: $version,
+                tag: $tag,
+                url: $url
+              }
+            }')
+
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${WEBSITE_DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/zenolore/quoly-ai-website/dispatches \
+            -d "${payload}"

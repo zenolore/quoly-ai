@@ -1,0 +1,984 @@
+//! Native CN provider adapters. Protocol references and notices are in providers/NOTICE.md.
+#[path = "oauth.rs"]
+mod oauth;
+mod qoder;
+pub(crate) mod minimax;
+mod minimax_chat;
+mod qoder_identity;
+mod stream;
+mod trae_desktop;
+mod traework;
+mod workbuddy;
+
+use super::types::*;
+use super::refresh::{Part, Scope};
+use futures::Stream;
+pub use oauth::{OAuthPoll, OAuthStart};
+use reqwest::{Client, RequestBuilder, Response};
+use serde_json::{json, Value};
+use std::{pin::Pin, sync::Arc, time::Duration};
+pub(crate) use traework::local_credentials_for_region;
+pub(super) const CHANNEL_VERIFICATION_ERROR: &str =
+    "上游通道校验未通过（代码 11128），请使用官方客户端或平台授权的接口";
+pub struct ProviderChat {
+    pub stream: Pin<Box<dyn Stream<Item = Result<ChatChunk, ProviderError>> + Send>>,
+}
+#[derive(Debug)]
+pub struct ChatChunk {
+    pub data: Value,
+    pub upstream_model: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct ProviderError {
+    pub status: u16,
+    pub message: String,
+    pub rejected: bool,
+    pub retry_after_ms: Option<i64>,
+    pub pause_auto: bool,
+    pub upstream_code: Option<String>,
+    pub upstream_request_id: Option<String>,
+    pub stage: &'static str,
+}
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for ProviderError {}
+impl ProviderError {
+    pub fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            rejected: false,
+            retry_after_ms: None,
+            pause_auto: false,
+            upstream_code: None,
+            upstream_request_id: None,
+            stage: "response",
+        }
+    }
+    fn transport(_: reqwest::Error) -> Self {
+        let mut error = Self::new(502, "平台连接失败或请求超时");
+        error.stage = "request";
+        error
+    }
+
+    fn with_upstream_details(mut self, value: &Value, headers: Option<&reqwest::header::HeaderMap>) -> Self {
+        // Only copy bounded identifiers from known metadata fields. Never copy error
+        // messages, request bodies or arbitrary headers into proxy diagnostics.
+        self.upstream_code = ["/code", "/biz_code", "/bizCode", "/error/code", "/ResponseMetadata/Error/Code"]
+            .iter().filter_map(|path| value.pointer(path))
+            .find_map(|value| value.as_i64().map(|v| v.to_string())
+                .or_else(|| value.as_str().and_then(safe_diagnostic_id)));
+        self.upstream_request_id = headers.and_then(upstream_request_id).or_else(|| {
+            ["/request_id", "/requestId", "/requestID", "/trace_id", "/traceId", "/error/request_id", "/ResponseMetadata/RequestId", "/Response/RequestId"]
+                .iter().filter_map(|path| value.pointer(path).and_then(Value::as_str))
+                .find_map(safe_diagnostic_id)
+        });
+        self
+    }
+
+    pub(super) fn diagnostic(&self) -> RequestDiagnostic {
+        let (stage, label) = match self.stage {
+            "validation" => ("validation", "校验请求参数"),
+            "request" => ("request", "发送请求"),
+            "stream" => ("stream", "读取响应流"),
+            _ => ("response", "接收上游响应"),
+        };
+        let upstream_code = self.upstream_code.as_deref().and_then(safe_diagnostic_id);
+        let upstream_request_id = self.upstream_request_id.as_deref().and_then(safe_diagnostic_id);
+        let base = if self.stage == "validation" {
+            self.message.as_str()
+        } else if self.message == CHANNEL_VERIFICATION_ERROR {
+            CHANNEL_VERIFICATION_ERROR
+        } else {
+            "上游请求失败"
+        };
+        let mut message = format!("{base}（HTTP {}；阶段：{label}", self.status);
+        if let Some(code) = &upstream_code {
+            message.push_str(&format!("；上游错误码：{code}"));
+        }
+        if let Some(id) = &upstream_request_id {
+            message.push_str(&format!("；上游请求 ID：{id}"));
+        }
+        message.push('）');
+        RequestDiagnostic {
+            http_status: self.status,
+            upstream_code,
+            upstream_request_id,
+            stage: stage.into(),
+            message,
+        }
+    }
+}
+
+fn safe_diagnostic_id(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    (!value.is_empty() && value.len() <= 128
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !["sk-", "sk_", "bearer", "eyj"].iter().any(|prefix| lower.starts_with(prefix)))
+        .then(|| value.to_owned())
+}
+
+fn upstream_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id", "x-tc-requestid", "x-amzn-requestid", "x-correlation-id"]
+        .iter().filter_map(|name| headers.get(*name).and_then(|v| v.to_str().ok()))
+        .find_map(safe_diagnostic_id)
+}
+
+#[derive(Clone)]
+pub(super) struct Inspection {
+    pub balance: Option<Result<ProviderSnapshot, ProviderError>>,
+    pub rewards: Option<Result<Vec<Reward>, ProviderError>>,
+    pub models: Option<Result<Vec<ModelInfo>, ProviderError>>,
+}
+impl Inspection {
+    pub fn failed(scope: Scope, error: ProviderError) -> Self {
+        Self {
+            balance: scope.contains(Part::Balance).then(|| Err(error.clone())),
+            rewards: scope.contains(Part::Rewards).then(|| Err(error.clone())),
+            models: scope.contains(Part::Models).then(|| Err(error)),
+        }
+    }
+    pub fn auth_rejected(&self) -> bool {
+        [self.balance.as_ref().and_then(|value| value.as_ref().err()),
+            self.rewards.as_ref().and_then(|value| value.as_ref().err()),
+            self.models.as_ref().and_then(|value| value.as_ref().err())]
+            .into_iter().flatten().any(|error| error.rejected && matches!(error.status, 401 | 403))
+    }
+}
+
+#[derive(Clone)]
+pub struct ProviderClient {
+    http: Client,
+    flows: Arc<tokio::sync::Mutex<std::collections::HashMap<String, oauth::LoginFlow>>>,
+    #[cfg(test)]
+    test_chats: Arc<std::sync::Mutex<TestChats>>,
+    #[cfg(test)]
+    test_inspections: Arc<std::sync::Mutex<TestInspections>>,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct TestChats {
+    queues: std::collections::HashMap<
+        String,
+        std::collections::VecDeque<Vec<Result<ChatChunk, ProviderError>>>,
+    >,
+    calls: Vec<String>,
+    bodies: Vec<Value>,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct TestInspections {
+    queues: std::collections::HashMap<String, std::collections::VecDeque<Inspection>>,
+    calls: Vec<(String, Scope)>,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+impl ProviderClient {
+    /// Shared HTTP client, exposed to sibling modules in this crate.
+    ///
+    /// The growth-center module talks to endpoints the provider implementations
+    /// do not cover (buddy travel, task claims). Routing those through a second
+    /// client would double the connection pool and skip the proxy-free setup
+    /// configured here, so it borrows this one instead.
+    pub(super) fn http(&self) -> &Client {
+        &self.http
+    }
+
+    pub fn new() -> Self {
+        Self {
+            http: Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("HTTP client"),
+            flows: Arc::default(),
+            #[cfg(test)]
+            test_chats: Arc::default(),
+            #[cfg(test)]
+            test_inspections: Arc::default(),
+        }
+    }
+    #[cfg(test)]
+    pub fn queue_test_chat(&self, id: &str, chunks: Vec<Result<ChatChunk, ProviderError>>) {
+        self.test_chats
+            .lock()
+            .unwrap()
+            .queues
+            .entry(id.into())
+            .or_default()
+            .push_back(chunks);
+    }
+    #[cfg(test)]
+    pub fn test_chat_calls(&self) -> Vec<String> {
+        self.test_chats.lock().unwrap().calls.clone()
+    }
+    #[cfg(test)]
+    pub fn test_chat_bodies(&self) -> Vec<Value> {
+        self.test_chats.lock().unwrap().bodies.clone()
+    }
+    #[cfg(test)]
+    pub(super) fn queue_test_inspection(&self, id: &str, result: Inspection) {
+        self.test_inspections.lock().unwrap().queues.entry(id.into()).or_default().push_back(result);
+    }
+    #[cfg(test)]
+    pub(super) fn test_inspection_gate(&self, gate: Arc<tokio::sync::Semaphore>) {
+        self.test_inspections.lock().unwrap().gate = Some(gate);
+    }
+    #[cfg(test)]
+    pub(super) fn test_inspection_calls(&self) -> Vec<(String, Scope)> {
+        self.test_inspections.lock().unwrap().calls.clone()
+    }
+    pub async fn authenticate(
+        &self,
+        p: Platform,
+        c: &Credentials,
+    ) -> Result<(String, String, Credentials), ProviderError> {
+        if c.access_token.trim().is_empty() {
+            return Err(ProviderError::new(400, "凭证不能为空"));
+        }
+        match p {
+            Platform::Workbuddy => workbuddy::authenticate(self, c).await,
+            Platform::Traework => traework::authenticate(self, c).await,
+            Platform::Qoder => qoder::authenticate(self, c).await,
+            Platform::MinimaxCode => minimax::authenticate(self, c).await,
+        }
+    }
+    pub async fn refresh_credentials(
+        &self,
+        p: Platform,
+        c: &Credentials,
+    ) -> Result<Credentials, ProviderError> {
+        match p {
+            Platform::Workbuddy => workbuddy::refresh(self, c).await,
+            Platform::Traework => traework::refresh(self, c).await,
+            Platform::Qoder => qoder::refresh(self, c).await,
+            Platform::MinimaxCode => minimax::refresh(self, c).await,
+        }
+    }
+    pub async fn inspect(
+        &self,
+        a: &Account,
+        c: &Credentials,
+    ) -> Result<ProviderSnapshot, ProviderError> {
+        match a.platform {
+            Platform::Workbuddy => workbuddy::inspect(self, c).await,
+            Platform::Traework => traework::inspect(self, c).await,
+            Platform::Qoder => qoder::inspect(self, c).await,
+            Platform::MinimaxCode => minimax::inspect(self, c).await,
+        }
+    }
+    pub(super) async fn inspect_parts(&self, a: &Account, c: &Credentials, scope: Scope) -> Inspection {
+        #[cfg(test)]
+        {
+            let scripted = {
+                let mut fixtures = self.test_inspections.lock().unwrap();
+                let result = fixtures.queues.get_mut(&a.id).and_then(|queue| queue.pop_front());
+                result.map(|result| {
+                    fixtures.calls.push((a.id.clone(), scope));
+                    (result, fixtures.gate.clone())
+                })
+            };
+            if let Some((mut result, gate)) = scripted {
+                if let Some(gate) = gate { gate.acquire().await.unwrap().forget(); }
+                if !scope.contains(Part::Balance) { result.balance = None; }
+                if !scope.contains(Part::Rewards) { result.rewards = None; }
+                if !scope.contains(Part::Models) { result.models = None; }
+                return result;
+            }
+            if std::env::var("AI_TOOLKIT_PROXY_DIAGNOSTIC").as_deref() != Ok("real-inference") {
+                return Inspection::failed(scope, ProviderError::new(502, "测试账户刷新响应未配置"));
+            }
+        }
+        let (balance, rewards, models) = tokio::join!(
+            async {
+                if !scope.contains(Part::Balance) { return None; }
+                Some(match a.platform {
+                    Platform::Workbuddy => workbuddy::balance(self, c).await,
+                    Platform::Traework => traework::balance(self, c).await,
+                    Platform::Qoder => qoder::balance(self, c).await,
+                    Platform::MinimaxCode => minimax::balance(self, c).await,
+                })
+            },
+            async {
+                if !scope.contains(Part::Rewards) { return None; }
+                Some(match a.platform {
+                    Platform::Workbuddy => workbuddy::rewards(self, c).await,
+                    Platform::Traework => traework::rewards(self, c).await,
+                    Platform::Qoder => qoder::rewards(self, c).await,
+                    Platform::MinimaxCode => minimax::rewards(self, c).await,
+                })
+            },
+            async {
+                if !scope.contains(Part::Models) { return None; }
+                Some(match a.platform {
+                    Platform::Workbuddy => workbuddy::models(self, c).await,
+                    Platform::Traework => traework::models(self, c).await,
+                    Platform::Qoder => qoder::models(self, c).await,
+                    Platform::MinimaxCode => minimax::models(self, c).await,
+                })
+            },
+        );
+        Inspection { balance, rewards, models }
+    }
+    pub async fn claim(
+        &self,
+        a: &Account,
+        c: &Credentials,
+    ) -> Result<Vec<RewardOutcome>, ProviderError> {
+        match a.platform {
+            Platform::Workbuddy => workbuddy::claim(self, a, c).await,
+            Platform::Traework => traework::claim(self, a, c).await,
+            Platform::Qoder => qoder::claim(self, a, c).await,
+            Platform::MinimaxCode => minimax::claim(self, a, c).await,
+        }
+    }
+    pub async fn chat(
+        &self,
+        a: &Account,
+        c: &Credentials,
+        m: &ModelInfo,
+        body: Value,
+    ) -> Result<ProviderChat, ProviderError> {
+        #[cfg(test)]
+        {
+            let mut test = self.test_chats.lock().unwrap();
+            if let Some(chunks) = test.queues.get_mut(&a.id).and_then(|q| q.pop_front()) {
+                test.calls.push(a.id.clone());
+                test.bodies.push(body);
+                return Ok(ProviderChat {
+                    stream: Box::pin(futures::stream::iter(chunks)),
+                });
+            }
+            if std::env::var("AI_TOOLKIT_PROXY_DIAGNOSTIC").as_deref() != Ok("real-inference") {
+                return Err(ProviderError::new(500, "测试上游响应队列未配置或已耗尽"));
+            }
+        }
+        match a.platform {
+            Platform::Workbuddy => workbuddy::chat(self, c, m, body).await,
+            Platform::Traework => traework::chat(self, c, m, body).await,
+            Platform::Qoder => qoder::chat(self, c, m, body).await,
+            Platform::MinimaxCode => minimax::chat(self, c, m, body).await,
+        }
+    }
+    async fn json(&self, r: RequestBuilder) -> Result<Value, ProviderError> {
+        json_response(
+            r.timeout(Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(ProviderError::transport)?,
+        )
+        .await
+    }
+}
+
+pub(super) async fn json_response(r: Response) -> Result<Value, ProviderError> {
+    let status = r.status().as_u16();
+    let headers = r.headers().clone();
+    let retry_after_ms = r.headers().get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok()).and_then(retry_after);
+    let text = r
+        .text()
+        .await
+        .map_err(|_| ProviderError::new(502, "平台响应读取失败"))?;
+    if !(200..300).contains(&status) {
+        let mut error = upstream_body_error(status, &text);
+        error.upstream_request_id = upstream_request_id(&headers).or(error.upstream_request_id);
+        error.retry_after_ms = retry_after_ms;
+        return Err(error);
+    }
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|_| ProviderError::new(502, "平台返回了无法识别的数据"))?;
+    check_business(&v).map_err(|error| {
+        let mut error = error.with_upstream_details(&v, Some(&headers));
+        error.retry_after_ms = retry_after_ms;
+        error
+    })?;
+    Ok(v)
+}
+fn retry_after(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok().filter(|seconds| *seconds >= 0)
+        .map(|seconds| seconds.saturating_mul(1000))
+        .or_else(|| chrono::DateTime::parse_from_rfc2822(value).ok()
+            .map(|date| date.timestamp_millis().saturating_sub(now_ms()).max(0)))
+}
+// Volcengine-style rejections (ResponseMetadata.Error) carry the account- or
+// request-state reason; the HTTP status alone only says "4xx".
+fn upstream_error_detail(v: &Value) -> Option<(String, String)> {
+    let error = v.pointer("/ResponseMetadata/Error")?;
+    if error.is_null() {
+        return None;
+    }
+    Some((
+        text(error, &["Code"]).unwrap_or_else(|| "unknown".into()),
+        error
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or("无详细信息")
+            .to_string(),
+    ))
+}
+fn upstream_body_error(status: u16, text: &str) -> ProviderError {
+    let detail = serde_json::from_str::<Value>(text).ok();
+    // 11128 is also used for malformed requests; match the channel rejection
+    // texts. The international gateway phrases it as "request illegal".
+    if status == 400
+        && detail.as_ref().is_some_and(|value| {
+            value["code"].as_i64() == Some(11128)
+                && matches!(
+                    value["msg"].as_str(),
+                    Some("Illegal API invocation from an unapproved channel") | Some("request illegal")
+                )
+        })
+    {
+        return ProviderError::new(status, CHANNEL_VERIFICATION_ERROR)
+            .with_upstream_details(detail.as_ref().unwrap(), None);
+    }
+    // The international gateway reserves some catalog models to paid plans and
+    // rejects personal free accounts with code 11158.
+    if status == 400
+        && detail.as_ref().is_some_and(|value| value["code"].as_i64() == Some(11158))
+    {
+        return ProviderError::new(status, "当前账号类型不支持该模型，请在会话中切换其他模型")
+            .with_upstream_details(detail.as_ref().unwrap(), None);
+    }
+    let mut error = http_error(status);
+    if let Some((code, message)) = detail.as_ref().and_then(upstream_error_detail) {
+        error.message = format!("平台拒绝（代码 {code}）：{message}");
+    }
+    if let Some(detail) = &detail {
+        error = error.with_upstream_details(detail, None);
+    }
+    error
+}
+pub(super) fn http_error(status: u16) -> ProviderError {
+    ProviderError {
+        status,
+        message: match status {
+            401 | 403 => "平台认证被拒绝，请重新登录".into(),
+            402 => "平台额度不足".into(),
+            429 => "平台请求限流".into(),
+            _ => format!("平台请求失败（HTTP {status}）"),
+        },
+        rejected: matches!(status, 401 | 402 | 403 | 429),
+        retry_after_ms: None,
+        pause_auto: false,
+        ..ProviderError::new(status, "")
+    }
+}
+pub(super) fn check_business(v: &Value) -> Result<(), ProviderError> {
+    if let Some(code) = num(v, &["code", "biz_code", "bizCode"]) {
+        if code != 0.0 && code != 200.0 {
+            // 9004 / 9095: this device has already completed its check-in for the
+            // day. Treat it as a finished claim, not a failure.
+            //
+            // Do NOT read this as "one device, one account per day". Measured
+            // 2026-11-08 with the community tool: eight accounts sharing device id
+            // 9850555401923937 claimed three times inside two minutes, and each
+            // success came back as 9095 *after* the account had been showing "not
+            // checked in". So 9095 means "this call found nothing left to collect
+            // because the claim just went through", which is what a success looks
+            // like on retry. Reporting it as rejected made every account after the
+            // first look like a per-device cap, which is not what the server does.
+            if matches!(code as i64, 9004 | 9095) {
+                return Ok(());
+            }
+            // 9074 reads as "too many participants" but is what the upstream
+            // returns when `X-Device-Id` is not a registered device id. Surface
+            // the real cause so it is not mistaken for congestion.
+            if code as i64 == 9074 {
+                return Err(ProviderError {
+                    status: 409,
+                    message: "设备校验未通过（上游返回 9074）：X-Device-Id 不是该客户端注册过的设备号".into(),
+                    rejected: true,
+                    retry_after_ms: None,
+                    pause_auto: false,
+                    ..ProviderError::new(409, "")
+                });
+            }
+            let rejected = matches!(code as i64, 1001 | 1005 | 4008 | 11202 | 6004);
+            return Err(ProviderError {
+                status: if rejected { 429 } else { 502 },
+                message: format!("平台业务请求被拒绝（代码 {}）", code as i64),
+                rejected,
+                retry_after_ms: None,
+                pause_auto: false,
+                ..ProviderError::new(502, "")
+            });
+        }
+    }
+    if let Some((code, message)) = upstream_error_detail(v) {
+        // These session-invalid codes are handled by TRAE's packaged CheckLogin
+        // client. Unknown business errors must not trigger a token refresh.
+        let authentication = code.parse::<u32>().is_ok_and(|code| {
+            matches!(code, 20324 | 20101 | 20315 | 20125 | 20126 | 20401 | 20403)
+        });
+        return Err(ProviderError {
+            status: if authentication { 401 } else { 502 },
+            message: if authentication {
+                format!("平台认证失败（代码 {code}）：{message}")
+            } else {
+                format!("平台业务请求被拒绝（代码 {code}）：{message}")
+            },
+            rejected: authentication,
+            retry_after_ms: None,
+            pause_auto: false,
+            ..ProviderError::new(502, "")
+        });
+    }
+    if v.pointer("/Response/Error").is_some_and(|e| !e.is_null())
+        || v.pointer("/data/Response/Error")
+            .is_some_and(|e| !e.is_null())
+    {
+        return Err(ProviderError::new(502, "平台账单查询返回错误"));
+    }
+    Ok(())
+}
+pub(super) fn data(v: &Value) -> &Value {
+    v.get("data").or_else(|| v.get("Result")).unwrap_or(v)
+}
+pub(super) fn text(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|k| {
+            v.get(*k).and_then(|x| {
+                x.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| x.as_i64().map(|n| n.to_string()))
+            })
+        })
+        .filter(|s| !s.is_empty())
+}
+pub(super) fn num(v: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|k| {
+        v.get(*k).and_then(|x| {
+            x.as_f64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+    })
+}
+pub(super) fn flag(v: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|k| {
+        v.get(*k).and_then(|x| {
+            x.as_bool()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+    })
+}
+pub(super) fn token_limit(v: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        v.get(*key)
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+            })
+            .filter(|limit| *limit > 0)
+    })
+}
+pub(super) fn underlying_model_id(v: &Value, route: &str) -> Option<String> {
+    let id = v.as_str()?.trim();
+    // Accept IDs explicitly declared by the catalog, including TRAE's __dev variants.
+    // Deployment endpoints are transport identifiers rather than model identities.
+    (!id.is_empty() && id != route && !id.starts_with("ep-"))
+        .then(|| id.to_owned())
+}
+pub(super) fn effort_options(v: &Value) -> Vec<String> {
+    v.as_array().into_iter().flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .fold(Vec::new(), |mut options, effort| {
+            if !options.iter().any(|known| known == effort) {
+                options.push(effort.to_owned());
+            }
+            options
+        })
+}
+pub(super) fn epoch(v: &Value) -> Option<i64> {
+    if let Some(n) = v
+        .as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    {
+        return Some(if n < 100_000_000_000 { n * 1000 } else { n });
+    }
+    v.as_str().and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.timestamp_millis())
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .and_then(|d| {
+                        d.and_local_timezone(chrono::FixedOffset::east_opt(8 * 3600)?)
+                            .single()
+                    })
+                    .map(|d| d.timestamp_millis())
+            })
+    })
+}
+pub(super) fn jwt_claims(token: &str) -> Value {
+    use base64::Engine;
+    token
+        .split('.')
+        .nth(1)
+        .and_then(|s| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(s)
+                .ok()
+        })
+        .and_then(|s| serde_json::from_slice(&s).ok())
+        .unwrap_or(Value::Null)
+}
+pub(super) fn snapshot(
+    packs: Vec<CreditPack>,
+    rewards: Vec<Reward>,
+    models: Vec<ModelInfo>,
+    diagnostic: Option<String>,
+) -> ProviderSnapshot {
+    let unit = packs.first().map(|p| p.unit.clone()).unwrap_or_else(|| "credits".into());
+    let same_unit = packs.iter().all(|p| p.unit == unit);
+    let balance = if packs.is_empty() || !same_unit || packs.iter().any(|p| p.remaining.is_none()) {
+        None
+    } else {
+        Some(
+            packs
+                .iter()
+                .filter(|p| p.expires_at.is_none_or(|t| t > now_ms()))
+                .filter_map(|p| p.remaining)
+                .sum(),
+        )
+    };
+    ProviderSnapshot {
+        balance,
+        unit: if same_unit { unit } else { "mixed".into() },
+        quota: None,
+        packs,
+        rewards,
+        models,
+        fetched_at: now_ms(),
+        stale: false,
+        diagnostic,
+        sync: SnapshotSync::default(),
+    }
+}
+pub(super) fn model(id: String, name: String, context: Option<u64>) -> ModelInfo {
+    ModelInfo {
+        canonical_id: canonical_glm(&name).or_else(|| canonical_glm(&id)),
+        upstream_id: None,
+        upstream_model_ids: vec![],
+        id,
+        name,
+        supports_tools: true,
+        context_window: context,
+        context_window_options: vec![],
+        max_output_tokens: None,
+        supports_images: None,
+        supports_reasoning: None,
+        reasoning_effort_options: vec![],
+        default_reasoning_effort: None,
+        verified: false,
+        verification_note: Some("已从账号实时目录发现，尚未验证实际模型身份".into()),
+    }
+}
+fn canonical_glm(s: &str) -> Option<String> {
+    let s = s.trim().to_ascii_lowercase().replace(' ', "-");
+    if !s.starts_with("glm-") {
+        return None;
+    }
+    let suffix = &s[4..];
+    if suffix.is_empty()
+        || !suffix.as_bytes()[0].is_ascii_digit()
+        || suffix
+            .chars()
+            .any(|c| !c.is_ascii_alphanumeric() && c != '.' && c != '-')
+    {
+        return None;
+    }
+    Some(s)
+}
+pub fn identity_matches(m: &ModelInfo, identity: &str) -> bool {
+    let id = identity.trim();
+    if m.upstream_model_ids.iter().any(|known| known.eq_ignore_ascii_case(id)) {
+        return true;
+    }
+    if let Some(c) = &m.canonical_id {
+        canonical_glm(id).as_ref() == Some(c)
+    } else {
+        id.eq_ignore_ascii_case(&m.id)
+    }
+}
+pub(super) fn outcome(
+    a: &Account,
+    r: &Reward,
+    status: &str,
+    message: impl Into<String>,
+    amount: Option<f64>,
+) -> RewardOutcome {
+    RewardOutcome {
+        account_id: a.id.clone(),
+        reward_id: r.id.clone(),
+        name: r.name.clone(),
+        status: status.into(),
+        amount,
+        kind: r.kind.clone(),
+        message: message.into(),
+        created_at: now_ms(),
+    }
+}
+pub(super) fn reconcile_claim(
+    a: &Account,
+    r: &Reward,
+    submitted: &Result<Value, ProviderError>,
+    after: Result<Vec<Reward>, ProviderError>,
+) -> RewardOutcome {
+    let confirmed = after
+        .as_ref()
+        .is_ok_and(|rs| rs.iter().any(|x| x.id == r.id && x.status == "claimed"));
+    if confirmed {
+        return outcome(a, r, "claimed", "回查上游确认权益已领取", r.amount);
+    }
+    match submitted {
+        // The call itself went through (the business code was 0, 9004 or 9095 —
+        // `check_business` rejects everything else). A follow-up read that has
+        // not caught up yet is not evidence of failure, so record the claim
+        // rather than a "pending" that never settles. Otherwise an account that
+        // did get paid keeps looking unpaid and stays in the retry queue.
+        Ok(_) => outcome(a, r, "claimed", "签到请求已受理", r.amount),
+        Err(e) if e.rejected => outcome(a, r, "failed", e.message.clone(), None),
+        _ => outcome(
+            a,
+            r,
+            "pending",
+            "领取结果尚未确认，已回查状态；不会自动重发领取请求",
+            None,
+        ),
+    }
+}
+pub(super) fn credentials(
+    v: &Value,
+    previous: &Credentials,
+    token_keys: &[&str],
+    refresh_keys: &[&str],
+) -> Result<Credentials, ProviderError> {
+    let mut c = previous.clone();
+    c.access_token =
+        text(v, token_keys).ok_or_else(|| ProviderError::new(502, "平台未返回访问凭证"))?;
+    c.refresh_token = text(v, refresh_keys).or(c.refresh_token);
+    c.expires_at = v
+        .get("TokenExpireAt")
+        .or_else(|| v.get("expires_at"))
+        .and_then(epoch)
+        .or_else(|| num(v, &["expiresIn", "expires_in"]).map(|n| now_ms() + n as i64 * 1000));
+    Ok(c)
+}
+// Dev diagnostics: object paths with value lengths only — never the values.
+pub(super) fn json_shape(value: &Value, depth: usize) -> String {
+    match value {
+        Value::Object(map) if depth < 4 => map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::Object(_) | Value::Array(_) => {
+                    format!("{k}{{{}}}", json_shape(v, depth + 1))
+                }
+                Value::String(s) => format!("{k}({})", s.len()),
+                other => format!("{k}={other}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Value::Array(items) => format!("[{} items]", items.len()),
+        other => format!("{}", other),
+    }
+}
+pub(super) fn empty_credentials() -> Credentials {
+    Credentials {
+        region: CreditRegion::Cn,
+        access_token: String::new(),
+        refresh_token: None,
+        user_id: None,
+        device_id: None,
+        expires_at: None,
+        extra: json!({}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_units_are_never_combined_and_catalog_versions_are_recognized() {
+        let packs = vec![
+            CreditPack { id: "usd".into(), name: "USD".into(), unit: "usd".into(), remaining: Some(0.00125), expires_at: None },
+            CreditPack { id: "requests".into(), name: "Requests".into(), unit: "requests".into(), remaining: Some(10.0), expires_at: None },
+        ];
+        let usd = snapshot(vec![packs[0].clone()], vec![], vec![], None);
+        assert_eq!(usd.balance, Some(0.00125)); assert_eq!(usd.unit, "usd");
+        let mixed = snapshot(packs, vec![], vec![], None);
+        assert_eq!(mixed.balance, None); assert_eq!(mixed.unit, "mixed");
+        let mut advertised = model("gpt-route".into(), "GPT".into(), None);
+        advertised.upstream_model_ids = vec!["gpt-version-from-catalog".into()];
+        assert!(identity_matches(&advertised, "gpt-version-from-catalog"));
+        assert!(!identity_matches(&advertised, "gpt-guessed-version"));
+    }
+    #[test]
+    fn diagnostics_preserve_only_safe_upstream_identifiers() {
+        for body in [
+            json!({"code":11133,"request_id":"req_123","msg":"fixture-secret-prompt","token":"fixture-secret-key"}),
+            json!({"error":{"code":"11133","request_id":"req_123","message":"fixture-secret-prompt"}}),
+            json!({"ResponseMetadata":{"RequestId":"req_123","Error":{"Code":"11133","Message":"fixture-secret-prompt"}}}),
+        ] {
+            let error = upstream_body_error(400, &body.to_string());
+            assert_eq!(error.upstream_code.as_deref(), Some("11133"));
+            assert_eq!(error.upstream_request_id.as_deref(), Some("req_123"));
+            assert!(!error.rejected);
+            let diagnostic = serde_json::to_string(&error.diagnostic()).unwrap();
+            assert!(diagnostic.contains("11133"));
+            assert!(diagnostic.contains("req_123"));
+            assert!(!diagnostic.contains("fixture-secret"));
+        }
+        for unsafe_id in ["Bearer fixture-secret", "sk-fixture-secret", "eyJfixture.jwt.token", "line\nbreak", &"x".repeat(129)] {
+            let error = upstream_body_error(400, &json!({"code":unsafe_id,"request_id":unsafe_id}).to_string());
+            assert!(error.upstream_code.is_none());
+            assert!(error.upstream_request_id.is_none());
+        }
+        assert!(upstream_body_error(502, "<html>fixture-secret</html>").upstream_code.is_none());
+    }
+
+    #[test]
+    fn old_request_history_remains_readable_without_diagnostics() {
+        let summary: RequestSummary = serde_json::from_value(json!({
+            "id":"old","accountId":"a","platform":"workbuddy","model":"glm-5.3",
+            "elapsedMs":1,"inputTokens":null,"outputTokens":null,"status":"error","createdAt":0
+        })).unwrap();
+        assert!(summary.diagnostic.is_none());
+    }
+    #[test]
+    fn retry_after_parses_seconds_and_http_dates() {
+        assert_eq!(retry_after("120"), Some(120_000));
+        assert_eq!(retry_after("-1"), None);
+        assert_eq!(retry_after("invalid"), None);
+        let date = (chrono::Utc::now() + chrono::Duration::minutes(10)).format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert!((598_000..=600_000).contains(&retry_after(&date).unwrap()));
+    }
+    #[tokio::test]
+    async fn http_rate_limit_preserves_retry_after_for_scheduler() {
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = socket.accept().await.unwrap();
+            let mut buffer = [0; 2048]; stream.read(&mut buffer).await.unwrap();
+            stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 600\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        });
+        let response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(format!("http://{address}")).send().await.unwrap();
+        let error = json_response(response).await.unwrap_err();
+        assert_eq!(error.status, 429); assert_eq!(error.retry_after_ms, Some(600_000));
+        server.await.unwrap();
+    }
+    #[test]
+    fn model_identity_never_merges_versions() {
+        let m = model("gmodel".into(), "GLM-5.3".into(), None);
+        assert!(identity_matches(&m, "GLM-5.3"));
+        assert!(!identity_matches(&m, "gmodel"));
+        assert!(!identity_matches(&m, "glm-5.2"));
+        assert!(!identity_matches(&m, "auto"));
+        assert!(!identity_matches(&m, "glm-5.3-flash"));
+    }
+    fn claim_account() -> Account {
+        Account {
+            id: "test".into(),
+            platform: Platform::Workbuddy,
+            region: CreditRegion::Cn,
+            user_id: "uid".into(),
+            label: "test".into(),
+            enabled: true,
+            status: "ready".into(),
+            last_error: None,
+            snapshot: None,
+        }
+    }
+    fn claim_reward(status: &str) -> Reward {
+        Reward {
+            id: "daily".into(),
+            name: "daily".into(),
+            kind: "credits".into(),
+            status: status.into(),
+            amount: Some(100.0),
+            next_available_at: None,
+            action_url: None,
+        }
+    }
+    #[test]
+    fn timed_out_claim_is_confirmed_by_readback() {
+        let a = claim_account();
+        let r = claim_reward("claimable");
+        let uncertain = Err(ProviderError::new(502, "timeout"));
+        assert_eq!(
+            reconcile_claim(&a, &r, &uncertain, Ok(vec![claim_reward("claimed")])).status,
+            "claimed"
+        );
+    }
+    #[test]
+    fn ambiguous_claim_never_reports_success_or_retries() {
+        let a = claim_account();
+        let r = claim_reward("claimable");
+        let uncertain = Err(ProviderError::new(502, "timeout"));
+        let o = reconcile_claim(
+            &a,
+            &r,
+            &uncertain,
+            Err(ProviderError::new(502, "read timeout")),
+        );
+        assert_eq!(o.status, "pending");
+        assert_eq!(o.amount, None);
+    }
+    #[test]
+    fn unknown_balance_is_not_zero() {
+        assert_eq!(snapshot(vec![], vec![], vec![], None).balance, None);
+    }
+    #[test]
+    fn embedded_billing_error_is_rejected_before_auth_success() {
+        assert!(check_business(
+            &json!({"code":0,"data":{"Response":{"Error":{"Code":"AuthFailure"}}}})
+        )
+        .is_err());
+        assert!(check_business(&json!({"ResponseMetadata":{"Error":null}})).is_ok());
+    }
+
+    #[test]
+    fn metadata_authentication_failure_is_refreshable_and_preserves_details() {
+        for code in [json!("20101"), json!(20101)] {
+            let error = check_business(&json!({"ResponseMetadata":{"Error": {
+                "Code": code,
+                "Message": "session rejected by issuing realm"
+            }}}))
+            .expect_err("reject authentication failure");
+            assert_eq!(error.status, 401);
+            assert!(error.rejected);
+            assert_eq!(
+                error.message,
+                "平台认证失败（代码 20101）：session rejected by issuing realm"
+            );
+        }
+    }
+
+    #[test]
+    fn non_authentication_business_failure_keeps_its_existing_classification() {
+        let error =
+            check_business(&json!({"code": 9001})).expect_err("reject ordinary business error");
+        assert_eq!(error.status, 502);
+        assert!(!error.rejected);
+        assert_eq!(error.message, "平台业务请求被拒绝（代码 9001）");
+        let error = check_business(&json!({"ResponseMetadata":{"Error":{
+            "Code":30011,"Message":"unclassified upstream error"
+        }}}))
+        .expect_err("unknown metadata error must not be treated as expired enterprise credentials");
+        assert_eq!(error.status, 502);
+        assert!(!error.rejected);
+        assert_eq!(
+            error.message,
+            "平台业务请求被拒绝（代码 30011）：unclassified upstream error"
+        );
+    }
+}

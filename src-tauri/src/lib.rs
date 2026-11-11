@@ -1,0 +1,367 @@
+pub mod agents;
+pub mod app_state;
+pub mod commands;
+pub mod core;
+pub mod credits;
+pub mod database;
+pub mod error;
+mod float_window;
+pub mod import;
+pub mod mcp;
+pub mod migration;
+mod navigation;
+pub mod services;
+pub mod skill_core;
+pub mod tool_detection;
+mod tray;
+pub mod ui_settings;
+pub mod utils;
+
+use agents::{get_last_detected_agents, save_detected_agents};
+use app_state::AppState;
+use database::Database;
+use std::time::Duration;
+use tauri::{async_runtime::spawn, Emitter, Manager};
+use tool_detection::detect_all_tools;
+
+#[cfg(not(windows))]
+fn push_path_parts(parts: &mut Vec<String>, path: &str) {
+    for part in path.split(':') {
+        let part = part.trim();
+        if !part.is_empty() && !parts.iter().any(|existing| existing == part) {
+            parts.push(part.to_string());
+        }
+    }
+}
+
+#[cfg(windows)]
+fn expand_path_from_shell() {}
+
+/// 从用户的 shell 环境中获取完整 PATH 并扩展到当前进程环境中。
+/// 解决 macOS .app 进程 PATH 不完整的问题（缺少 Homebrew/nvm 等路径）。
+#[cfg(not(windows))]
+fn expand_path_from_shell() {
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let mut paths = Vec::new();
+    push_path_parts(&mut paths, &current_path);
+
+    // GUI 启动的 .app 不会继承用户 shell 的 PATH。login shell 覆盖
+    // .zprofile/.profile，interactive login shell 额外覆盖 .zshrc 里的
+    // nvm/mise/asdf/bun/pnpm 等初始化。
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    for mode in ["-lc", "-lic"] {
+        if let Ok(output) = std::process::Command::new(&shell)
+            .args([mode, "printf '\\n__AI_TOOLKIT_PATH__%s\\n' \"$PATH\""])
+            .output()
+        {
+            if output.status.success() {
+                let shell_path = String::from_utf8_lossy(&output.stdout);
+                if let Some(path_line) = shell_path
+                    .lines()
+                    .rev()
+                    .find_map(|line| line.strip_prefix("__AI_TOOLKIT_PATH__"))
+                {
+                    push_path_parts(&mut paths, path_line);
+                }
+            }
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        for path in [
+            format!("{}/.local/bin", home),
+            format!("{}/.cargo/bin", home),
+            format!("{}/.volta/bin", home),
+            format!("{}/.bun/bin", home),
+            format!("{}/Library/pnpm", home),
+            format!("{}/.pnpm-global/bin", home),
+            format!("{}/.yarn/bin", home),
+            format!("{}/.asdf/shims", home),
+            format!("{}/.local/share/mise/shims", home),
+            format!("{}/.nvmd/bin", home),
+        ] {
+            push_path_parts(&mut paths, &path);
+        }
+    }
+
+    for path in [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ] {
+        push_path_parts(&mut paths, path);
+    }
+
+    std::env::set_var("PATH", paths.join(":"));
+}
+
+/// Record panics to a file so an unexplained exit can be diagnosed.
+///
+/// The release build aborts on panic (`0xc0000409` / `STATUS_STACK_BUFFER_OVERRUN`
+/// with fast-fail code 7), and because the app is a GUI process its stderr goes
+/// nowhere — the crash left no trace at all, only a Windows Error Reporting
+/// entry pointing at the same offset every time. Writing the panic message and
+/// backtrace next to the database turns that into something actionable.
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".into());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic>".into());
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // 先把「什么时候、哪儿、为什么」三行写进文件，再去抓回溯。
+        //
+        // 实测 2026-11-10：崩溃点落在 backtrace 符号化内部（stash.rs /
+        // coff.rs），而 panic.log 从来没写出来过——说明 force_capture()
+        // 在符号化阶段自己就死了，消息跟着一起陪葬。先写消息再抓回溯，
+        // 消息部分就一定能落盘，下次崩了至少知道 panic 的原因和位置；
+        // 回溯抓不到也不影响这个底线。
+        if let Some(dir) = dirs::home_dir().map(|h| h.join(".ai-toolkit")) {
+            let path = dir.join("panic.log");
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                // Fully qualified: a bare `use std::io::Write` here shadows the
+                // trait for the whole module and breaks `thiserror`'s derive.
+                let _ = std::io::Write::write_all(
+                    &mut file,
+                    format!("\n===== panic at {stamp} ({location}) =====\n{payload}\n")
+                        .as_bytes(),
+                );
+            }
+        }
+        // 回溯放在消息之后，且包在一层保护里：它死了也只丢回溯，不丢消息。
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        if let Some(dir) = dirs::home_dir().map(|h| h.join(".ai-toolkit")) {
+            let path = dir.join("panic.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = std::io::Write::write_all(&mut file, format!("{backtrace}\n").as_bytes());
+            }
+        }
+        // Still run the default hook so behaviour is unchanged otherwise.
+        default_hook(info);
+    }));
+}
+
+pub fn run() {
+    expand_path_from_shell();
+    install_panic_logger();
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tray::restore_main_window(app);
+        }))
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        // 开机自启项带 --silent，启动后不弹主窗口，只留托盘。
+        // MacosLauncher 参数在 Windows 上不生效，写 LaunchAgent 是为了编译期一致。
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--silent"]),
+        ))
+        .setup(|app| {
+            navigation::create_main_window(app)?;
+            tray::setup(app)?;
+
+            // 静默启动（自启项带入的 --silent）：主窗口和悬浮窗都先不显形。
+            // 用户从托盘点「打开主界面」或「显示悬浮窗」时才露脸。
+            let silent = float_window::launched_silently();
+            if silent {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            // 悬浮窗按上次的开关恢复。静默启动时也建出来，但不显示——
+            // 这样托盘点「显示悬浮窗」是即时的，不用等窗口初始化。
+            commands::shell::create_float_if_enabled(app, !silent);
+
+            // 首次运行默认开启开机自启（静默进托盘）。只做一次，
+            // 之后用户手动关掉就完全听用户的。
+            commands::shell::apply_default_autostart(app);
+
+            // 迁移旧数据目录 ~/.ai-tool-manager/ → ~/.ai-toolkit/
+            // 必须在数据库初始化之前执行
+            migration::migrate_from_old_dir();
+
+            // 初始化数据库
+            let db = Database::new()?;
+            app.manage(AppState::new(db)?);
+
+            // 自动导入已安装 Agent 的 MCP 配置
+            let state = app.state::<AppState>();
+            let credit_manager = state.credits.clone();
+            credit_manager.attach_events(app.app_handle().clone());
+            spawn(async move { credit_manager.start_scheduler(); });
+            commands::app::init_skills_install_location(&state);
+            if let Err(error) = services::mcp_service::import_on_startup(&state.db) {
+                eprintln!("MCP 启动导入失败: {error}");
+            }
+
+            // 在后台异步检测新安装的 Agent 工具，延迟发送事件确保前端已就绪
+            let app_handle = app.app_handle().clone();
+            spawn(async move {
+                // 等待 1 秒，确保前端 React 应用已挂载并完成事件监听器注册
+                tokio::time::sleep(Duration::from_secs(1)).await;
+
+                // 执行统一的工具检测并缓存结果
+                match detect_all_tools() {
+                    Ok(report) => {
+                        // 检测新安装的工具
+                        let previous = get_last_detected_agents();
+                        let current_names: Vec<String> = report
+                            .agents
+                            .iter()
+                            .filter(|a| a.exists)
+                            .map(|a| a.id.clone())
+                            .collect();
+                        let new_agents: Vec<_> = report
+                            .agents
+                            .iter()
+                            .filter(|a| a.exists && !previous.contains(&a.id))
+                            .cloned()
+                            .collect();
+
+                        // 保存检测状态并更新缓存
+                        save_detected_agents(&current_names);
+
+                        // 在异步块内获取 state 来更新缓存
+                        if let Some(state) = app_handle.try_state::<AppState>() {
+                            if let Ok(mut cache) = state.installed_tools.write() {
+                                *cache = report.clone();
+                            }
+                        }
+
+                        let _ = app_handle.emit("installed-tools-updated", &report);
+
+                        // 如果有新工具，通过事件通知前端
+                        if !new_agents.is_empty() {
+                            let _ = app_handle.emit("agents-detected", &new_agents);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to detect tools: {}", e);
+                    }
+                }
+            });
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::credits::credits_dashboard,
+            commands::credits::credits_set_view_active,
+            commands::credits::credits_network_restored,
+            commands::credits::credits_import_local,
+            commands::credits::credits_parse_account_file,
+            commands::credits::credits_import_accounts,
+            commands::credits::credits_set_account_enabled,
+            commands::credits::credits_delete_account,
+            commands::credits::credits_refresh,
+            commands::credits::credits_claim,
+            commands::credits::credits_run_growth,
+            commands::credits::credits_growth_snapshot,
+            commands::credits::credits_growth_daily,
+            commands::credits::credits_usage_daily,
+            commands::credits::credits_growth_accounts,
+            commands::credits::credits_activate_accounts,
+            commands::credits::credits_activations,
+            commands::credits::credits_save_settings,
+            commands::credits::credits_start_proxy,
+            commands::credits::credits_stop_proxy,
+            commands::credits::credits_proxy_key,
+            commands::credits::credits_probe_proxy,
+            commands::credits::credits_model_health,
+            commands::credits::credits_oauth_start,
+            commands::credits::credits_oauth_poll,
+            // MCP 命令
+            commands::mcp::get_mcp_servers,
+            commands::mcp::upsert_mcp_server,
+            commands::mcp::delete_mcp_server,
+            commands::mcp::toggle_mcp_app,
+            commands::mcp::import_mcp_from_apps,
+            commands::mcp::preview_trae_migration,
+            commands::mcp::apply_trae_migration,
+            commands::mcp::restore_trae_migration,
+            commands::mcp::test_mcp_connection,
+            // 新手引导与 MCP 批量导入命令
+            commands::enhancements::get_onboarding_checklist,
+            commands::enhancements::bulk_import_mcp_servers,
+            // 应用配置命令
+            commands::app::get_app_configs,
+            // 界面偏好：悬浮窗 / 开机静默启动
+            commands::shell::shell_settings,
+            commands::shell::set_float_enabled,
+            commands::shell::float_remember_position,
+            commands::shell::float_hide,
+            commands::shell::float_show,
+            commands::shell::set_autostart,
+            commands::shell::open_main_window,
+            commands::shell::open_log_folder,
+            commands::app::get_skills_install_preferences,
+            commands::app::import_mcp_from_app,
+            commands::app::set_skills_install_location_preference,
+            // Agent 检测命令
+            commands::agents::detect_agents,
+            commands::agents::sync_agent_mcp,
+            commands::agents::open_config_file,
+            commands::agents::launch_agent,
+            // 技能管理命令
+            commands::skills::get_managed_skills,
+            commands::skills::get_tool_status,
+            commands::skills::open_skill_path,
+            commands::skills::detect_skill_name_conflicts,
+            commands::skills::get_onboarding_plan,
+            commands::skills::install_git,
+            commands::skills::list_git_skills,
+            commands::skills::install_git_selection,
+            commands::skills::install_local_selection,
+            commands::skills::sync_skill_to_tool,
+            commands::skills::unsync_skill_from_tool,
+            commands::skills::delete_managed_skill,
+            commands::skills::update_skill,
+            commands::skills::rename_skill,
+            commands::skills::get_skill_readme,
+            commands::skills::search_skills_online,
+            commands::skills::get_featured_skills,
+            commands::skills::validate_local_skill,
+            // 更新命令
+            commands::update::check_update,
+            commands::update::install_update,
+            // 统一工具检测命令
+            commands::tool_detection::get_installed_tools,
+            commands::tool_detection::refresh_installed_tools,
+            // 应用信息命令
+            commands::app::get_version,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            tray::handle_run_event(app, &event);
+        });
+}
