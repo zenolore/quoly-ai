@@ -96,6 +96,18 @@ pnpm tauri build    # 打包安装包
 
 需要 Node 20+、Rust 1.77+，以及 Tauri 2 的系统依赖。
 
+## 数据与安全
+
+这个程序要读你的账号凭据才能工作，所以它把凭据存在哪、请求发往哪，都写成文档公开：
+
+- **凭据存在系统钥匙串**（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service），
+  不写明文文件
+- **网关只监听 `127.0.0.1`**，不对局域网或公网开放
+- **没有任何上报或遥测端点**，程序不向作者发送任何数据
+
+完整说明见 **[docs/OPEN-SOURCE.md](docs/OPEN-SOURCE.md)** —— 包括开源了什么、
+没开源什么、Key 存在哪、二次开发的注意事项。
+
 ## 来源与致谢
 
 Quoly AI 基于 [whyfail/AI-Toolkit](https://github.com/whyfail/AI-Toolkit)（MIT）修改而来，
