@@ -1,0 +1,4014 @@
+use super::providers::{ProviderChat, ProviderError};
+use super::types::{
+    now_ms, Account, CreditRegion, GatewayStatus, ModelInfo, Platform, RequestDiagnostic,
+    RequestSummary,
+};
+use super::CreditManager;
+use axum::{
+    body::Body,
+    extract::{DefaultBodyLimit, Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use futures::StreamExt;
+use parking_lot::Mutex;
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+use std::{collections::HashMap, sync::Arc, time::Instant};
+use tokio::{net::TcpListener, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
+
+#[path = "anthropic.rs"]
+mod anthropic;
+#[path = "tool_validation.rs"]
+mod tool_validation;
+
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum Protocol {
+    Openai,
+    Messages,
+}
+
+impl Protocol {
+    fn error(self, status: StatusCode, code: &str, message: &str) -> Response {
+        match self {
+            Self::Openai => api_error(status, code, message),
+            Self::Messages => anthropic::error(status, message),
+        }
+    }
+
+    fn failure_value(self, error: &ProviderError, guard: &mut RequestGuard) -> Value {
+        let diagnostic = error.diagnostic();
+        let message = format!("{}；代理请求 ID：{}", diagnostic.message, guard.id);
+        let code = if diagnostic.stage == "validation" {
+            "invalid_request"
+        } else if error.message == super::providers::CHANNEL_VERIFICATION_ERROR {
+            "upstream_channel_rejected"
+        } else if diagnostic.stage == "stream" {
+            "upstream_stream_error"
+        } else {
+            "upstream_error"
+        };
+        let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut value = match self {
+            Self::Openai => json!({"error":{"type":"invalid_request_error","message":message}}),
+            Self::Messages => anthropic::error_value(status, &message),
+        };
+        value["request_id"] = json!(guard.id);
+        value["error"]["code"] = json!(code);
+        value["error"]["stage"] = json!(diagnostic.stage);
+        if let Some(code) = &diagnostic.upstream_code {
+            value["error"]["upstream_code"] = json!(code);
+        }
+        if let Some(id) = &diagnostic.upstream_request_id {
+            value["error"]["upstream_request_id"] = json!(id);
+        }
+        guard.set_status("error");
+        guard.diagnostic = Some(diagnostic);
+        value
+    }
+
+    fn upstream_error(self, error: &ProviderError, guard: &mut RequestGuard) -> Response {
+        let value = self.failure_value(error, guard);
+        (
+            StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_GATEWAY),
+            [("x-request-id", guard.id.clone()), ("request-id", guard.id.clone())],
+            Json(value),
+        ).into_response()
+    }
+
+    fn upstream_stream_error(self, mut error: ProviderError, guard: &mut RequestGuard) -> String {
+        error.stage = "stream";
+        let mut value = self.failure_value(&error, guard);
+        match self {
+            Self::Openai => format!("data: {value}\n\n"),
+            Self::Messages => {
+                // Content may already be committed. Keep the existing terminal
+                // stream error type instead of suggesting a fresh rate-limit retry.
+                value["error"]["type"] = json!("api_error");
+                format!("event: error\ndata: {value}\n\n")
+            }
+        }
+    }
+}
+
+pub struct GatewayManager {
+    running: Mutex<Option<RunningGateway>>,
+    lifecycle: tokio::sync::Mutex<()>,
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
+struct RunningGateway {
+    port: u16,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+    /// Kept so the panel can read live routing state (per-model health,
+    /// in-flight counts, cooldowns) without going through the HTTP API.
+    context: Arc<GatewayContext>,
+}
+
+/// One row in the panel's model-health table.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHealthReport {
+    /// Fully-qualified route, e.g. `workbuddy/kimi-k3.1-pro`.
+    pub route: String,
+    /// Leading segment of the route (`workbuddy` / `qoder` / `traework`).
+    pub platform: String,
+    /// Model name without the platform prefix.
+    pub model: String,
+    /// Requests that produced a complete answer.
+    pub total_ok: u64,
+    /// Requests the upstream rejected or that failed.
+    pub total_fail: u64,
+    /// Requests the client aborted, or that the gateway gave up on. Counted
+    /// separately from failures: they say nothing about the model's health, and
+    /// folding them into either side distorts the rate.
+    pub total_cancelled: u64,
+    /// Success rate over the most recent attempts, 0.0–1.0. `None` until the
+    /// route has been tried. Drives quarantine decisions; use `success_rate`
+    /// for anything shown next to the absolute counters.
+    pub recent_rate: Option<f64>,
+    /// `total_ok / (total_ok + total_fail)`.
+    ///
+    /// Cancelled requests are excluded from both sides: a user pressing stop is
+    /// not the model failing, and counting it as a success would be equally
+    /// wrong. This is what the panel shows, so the percentage always reconciles
+    /// with the `ok / fail` counters beside it.
+    pub success_rate: Option<f64>,
+    pub avg_latency_ms: Option<u64>,
+    /// Remaining quarantine time in ms; `None` means the route is usable now.
+    pub quarantined_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+struct GatewayContext {
+    manager: Arc<CreditManager>,
+    key: String,
+    routing: Mutex<RoutingState>,
+    cancellation: CancellationToken,
+}
+
+impl GatewayContext {
+    /// Live per-route health, read straight from the routing table.
+    fn health_snapshot(&self) -> Vec<ModelHealthReport> {
+        health_snapshot_of(self)
+    }
+}
+
+#[derive(Default)]
+struct RoutingState {
+    loads: HashMap<String, usize>,
+    assigned: HashMap<String, u64>,
+    cooldowns: HashMap<String, i64>,
+    /// Per (account, model) short backoff. Upstream rate limits come in two
+    /// flavours and only one of them is about the account:
+    ///   - `6004` / `1005` mean "this *model* is busy/limited for now". The
+    ///     account itself is fine and may serve other models, so parking the
+    ///     whole account here is what turned one hot model into a full-pool
+    ///     outage (every account cooled down -> 503 for every model).
+    ///   - A plain account-level 429 is about the account, handled by
+    ///     `cooldowns` above.
+    model_backoff: HashMap<(String, String), i64>,
+    /// Rolling health per model route, keyed by the fully-qualified name the
+    /// client asks for (e.g. `traework/kimi-k3.1-pro`). A route whose recent
+    /// attempts nearly all failed is skipped at selection time rather than
+    /// retried on every request — the upstream has told us it cannot serve it
+    /// (TRAE's free-credit tier rejects `kimi-k3.1-pro` outright), so probing it
+    /// again wastes a round trip on every call. Recovered routes are re-admitted
+    /// as soon as a probe or a real request succeeds.
+    health: HashMap<String, ModelHealth>,
+    /// Conversation → account binding, so follow-up turns of the same chat keep
+    /// hitting the account that already holds the upstream prompt cache. Value
+    /// is `(account_id, expires_at)`.
+    sticky: HashMap<String, (String, i64)>,
+    sequence: u64,
+}
+
+/// Requests allowed to run simultaneously against one account. Upstreams meter
+/// per account, so a handful of parallel calls is enough to start earning 429s
+/// while adding nothing to perceived speed.
+const MAX_IN_FLIGHT_PER_ACCOUNT: usize = 3;
+/// Global ceiling across all accounts. Prevents a burst from occupying every
+/// account at once and starving the rest of the pool.
+const MAX_IN_FLIGHT_TOTAL: usize = 8;
+/// How long a conversation stays bound to one account.
+const STICKY_TTL_MS: i64 = 30 * 60 * 1000;
+
+#[derive(Default, Clone)]
+struct ModelHealth {
+    /// Recent outcomes, `true` = succeeded. Kept short so a recovered route is
+    /// re-admitted quickly instead of being punished by ancient failures.
+    window: std::collections::VecDeque<bool>,
+    /// Consecutive failures. Crossing `UNHEALTHY_STREAK` quarantines the route.
+    failures: u32,
+    /// Quarantined until this instant; `None` means healthy/unknown.
+    quarantined_until: Option<i64>,
+    /// Lifetime counters, exposed to the panel so the user can see which model
+    /// on which platform actually works.
+    total_ok: u64,
+    total_fail: u64,
+    /// Sum of successful latencies in ms, for an average the panel can show.
+    latency_ms_sum: u64,
+    last_error: Option<String>,
+}
+
+impl ModelHealth {
+    const WINDOW: usize = 8;
+    const UNHEALTHY_STREAK: u32 = 3;
+    /// Short quarantine: long enough to stop burning a doomed request per call,
+    /// short enough that a transient upstream hiccup self-heals without help.
+    const QUARANTINE_MS: i64 = 120_000;
+
+    fn record(&mut self, ok: bool, now: i64) {
+        self.record_with(ok, now, None, None);
+    }
+
+    /// Record an outcome together with the latency and error text the panel
+    /// needs. `record` stays as the minimal form for call sites that only know
+    /// success/failure.
+    fn record_with(&mut self, ok: bool, now: i64, latency_ms: Option<u64>, error: Option<&str>) {
+        if self.window.len() >= Self::WINDOW {
+            self.window.pop_front();
+        }
+        self.window.push_back(ok);
+        if ok {
+            self.failures = 0;
+            self.quarantined_until = None;
+            self.total_ok += 1;
+            if let Some(ms) = latency_ms {
+                self.latency_ms_sum = self.latency_ms_sum.saturating_add(ms);
+            }
+            self.last_error = None;
+        } else {
+            self.failures += 1;
+            self.total_fail += 1;
+            if let Some(message) = error {
+                self.last_error = Some(message.chars().take(160).collect());
+            }
+            if self.failures >= Self::UNHEALTHY_STREAK {
+                self.quarantined_until = Some(now + Self::QUARANTINE_MS);
+            }
+        }
+    }
+
+    fn usable(&self, now: i64) -> bool {
+        self.quarantined_until.is_none_or(|until| until <= now)
+    }
+
+    /// Success rate over the recent window, which is what a user should act on.
+    fn recent_rate(&self) -> Option<f64> {
+        if self.window.is_empty() {
+            return None;
+        }
+        let ok = self.window.iter().filter(|v| **v).count();
+        Some(ok as f64 / self.window.len() as f64)
+    }
+
+    /// Success rate over the route's whole life.
+    ///
+    /// The panel shows this next to lifetime `ok / fail` counts, so a windowed
+    /// rate made the two disagree: a route with 93 successes and 2 early
+    /// failures displayed "100%" beside "93 / 2". The rate a user reads next to
+    /// absolute counts has to be computed over the same set.
+    fn lifetime_rate(&self) -> Option<f64> {
+        let total = self.total_ok + self.total_fail;
+        (total > 0).then(|| self.total_ok as f64 / total as f64)
+    }
+
+    fn avg_latency_ms(&self) -> Option<u64> {
+        if self.total_ok == 0 {
+            return None;
+        }
+        Some(self.latency_ms_sum / self.total_ok)
+    }
+}
+
+#[derive(Clone)]
+struct Candidate {
+    account: Account,
+    model: ModelInfo,
+    expiry: i64,
+}
+
+impl Default for GatewayManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GatewayManager {
+    pub fn new() -> Self {
+        Self {
+            running: Mutex::new(None),
+            lifecycle: tokio::sync::Mutex::new(()),
+            last_error: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn start(
+        &self,
+        manager: Arc<CreditManager>,
+        port: u16,
+    ) -> Result<GatewayStatus, String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let already_running = self
+            .running
+            .lock()
+            .as_ref()
+            .is_some_and(|v| !v.task.is_finished());
+        if already_running {
+            return Ok(self.status(port));
+        }
+        let key = manager.gateway_key()?;
+        if key.trim().is_empty() {
+            return Err("本地代理密钥为空".into());
+        }
+        // LAN share: bind all interfaces so other devices can call
+        // http://<lan-ip>:port/v1; otherwise loopback only. The stored
+        // settings predate this flag, so a missing column means "share".
+        let bind_addr = if manager
+            .store
+            .settings()
+            .map(|s| s.lan_share)
+            .unwrap_or(true)
+        {
+            std::net::Ipv4Addr::UNSPECIFIED
+        } else {
+            std::net::Ipv4Addr::LOCALHOST
+        };
+        let listener = match TcpListener::bind((bind_addr, port)).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                let message = format!("无法启动本地代理端口 {port}：{error}");
+                *self.last_error.lock() = Some(message.clone());
+                return Err(message);
+            }
+        };
+        let actual_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let cancellation = CancellationToken::new();
+        let context = Arc::new(GatewayContext {
+            manager,
+            key,
+            routing: Mutex::new(RoutingState::default()),
+            cancellation: cancellation.clone(),
+        });
+        let router = Router::new()
+            .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+            .route("/v1/models", get(models))
+            .route("/v1/usage", get(usage))
+            .route("/v1/chat/completions", post(chat))
+            .route("/v1/messages", post(messages))
+            // Anthropic SDKs append /v1/messages to the configured base URL.
+            // Accept the app's shared /v1 base URL without arbitrary path rewriting.
+            .route("/v1/v1/messages", post(messages))
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .with_state(context.clone());
+        let shutdown = cancellation.clone();
+        let last_error = self.last_error.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+            {
+                *last_error.lock() = Some(format!("本地代理停止：{error}"));
+                log::error!("Local credit gateway stopped: {error}");
+            }
+        });
+        *self.running.lock() = Some(RunningGateway {
+            port: actual_port,
+            cancellation,
+            task,
+            context,
+        });
+        *self.last_error.lock() = None;
+        Ok(self.status(actual_port))
+    }
+
+    /// Live health snapshot for the panel. Empty when the proxy is not running.
+    /// Per-route health for the panel.
+    ///
+    /// Counters come from the request table, not from the in-memory routing
+    /// state. The in-memory counters start at zero whenever the proxy restarts,
+    /// so they only ever describe "since the last restart" while the panel reads
+    /// as if it were the whole history — that discrepancy is what made the
+    /// displayed 1571 successes contradict the database's 2961 for the same
+    /// model. Memory is now consulted only for the live quarantine flag, which
+    /// genuinely is session-scoped.
+    pub fn model_health(&self) -> Vec<ModelHealthReport> {
+        // Take both the stored counters and the live quarantine flags under one
+        // lock so the two halves of a row cannot come from different instants.
+        let (stored, quarantine) = {
+            let running = self.running.lock();
+            match running.as_ref().filter(|v| !v.task.is_finished()) {
+                Some(active) => {
+                    let stored = active
+                        .context
+                        .manager
+                        .store
+                        .request_health()
+                        .unwrap_or_default();
+                    let routing = active.context.routing.lock();
+                    let quarantine = routing
+                        .health
+                        .iter()
+                        .map(|(route, health)| {
+                            (
+                                route.clone(),
+                                (health.quarantined_until, health.last_error.clone()),
+                            )
+                        })
+                        .collect::<std::collections::HashMap<_, _>>();
+                    (stored, quarantine)
+                }
+                // Proxy stopped: history is still meaningful, quarantine is not.
+                None => (Vec::new(), Default::default()),
+            }
+        };
+        let now = now_ms();
+
+        let mut reports: Vec<ModelHealthReport> = stored
+            .into_iter()
+            .map(|row| {
+                let (platform, model) = row
+                    .model
+                    .split_once('/')
+                    .map(|(p, m)| (p.to_string(), m.to_string()))
+                    // A model stored without a prefix still belongs in the table.
+                    .unwrap_or_else(|| ("unknown".to_string(), row.model.clone()));
+                let live = quarantine.get(&row.model);
+                ModelHealthReport {
+                    route: row.model,
+                    platform,
+                    model,
+                    total_ok: row.ok,
+                    total_fail: row.fail,
+                    total_cancelled: row.cancelled,
+                    // The windowed rate is only used to decide quarantine, and
+                    // that decision already happened above.
+                    recent_rate: None,
+                    success_rate: {
+                        let attempted = row.ok + row.fail;
+                        (attempted > 0).then(|| row.ok as f64 / attempted as f64)
+                    },
+                    avg_latency_ms: row.avg_latency_ms,
+                    quarantined_ms: live
+                        .and_then(|(until, _)| *until)
+                        .filter(|until| *until > now)
+                        .map(|until| (until - now) as u64),
+                    last_error: live.and_then(|(_, e)| e.clone()),
+                }
+            })
+            .collect();
+        // Worst first: the panel's job is to surface trouble.
+        reports.sort_by(|a, b| {
+            a.success_rate
+                .unwrap_or(1.0)
+                .partial_cmp(&b.success_rate.unwrap_or(1.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.route.cmp(&b.route))
+        });
+        reports
+    }
+
+    pub async fn stop(&self) -> Result<GatewayStatus, String> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let running = self.running.lock().take();
+        let port = running.as_ref().map(|v| v.port).unwrap_or(17860);
+        if let Some(mut running) = running {
+            running.cancellation.cancel();
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut running.task)
+                .await
+                .is_err()
+            {
+                running.task.abort();
+                let _ = running.task.await;
+            }
+        }
+        Ok(self.status(port))
+    }
+
+    pub fn status(&self, port: u16) -> GatewayStatus {
+        let running = self.running.lock();
+        let active = running.as_ref().filter(|v| !v.task.is_finished());
+        let port = active.map(|v| v.port).unwrap_or(port);
+        GatewayStatus {
+            running: active.is_some(),
+            port,
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            last_error: self.last_error.lock().clone(),
+        }
+    }
+}
+
+impl Drop for GatewayManager {
+    fn drop(&mut self) {
+        if let Some(running) = self.running.get_mut().take() {
+            running.cancellation.cancel();
+            running.task.abort();
+        }
+    }
+}
+
+fn authorized(headers: &HeaderMap, key: &str) -> bool {
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    // Never log authentication headers. Compare every byte for equal-length keys.
+    key_matches(supplied, key)
+}
+
+fn key_matches(supplied: &str, key: &str) -> bool {
+    supplied.len() == key.len()
+        && !key.is_empty()
+        && supplied
+            .as_bytes()
+            .iter()
+            .zip(key.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({"error": {"message": message, "type": "invalid_request_error", "code": code}})),
+    )
+        .into_response()
+}
+
+fn insert_catalog_model(
+    entries: &mut std::collections::BTreeMap<String, Value>,
+    id: String,
+    owner: &str,
+    model: &ModelInfo,
+) {
+    let entry = entries.entry(id.clone()).or_insert_with(|| json!({
+        "id": id, "object": "model", "created": 0, "owned_by": owner,
+        "context_window": model.context_window, "max_output_tokens": model.max_output_tokens
+    }));
+    // A route can choose any eligible account. Advertise only a capacity shared
+    // by all of them; a missing limit must stay unknown rather than be guessed.
+    for (field, capacity) in [("context_window", model.context_window), ("max_output_tokens", model.max_output_tokens)] {
+        match (entry[field].as_u64().filter(|value| *value > 0), capacity.filter(|value| *value > 0)) {
+            (Some(previous), Some(current)) => entry[field] = json!(previous.min(current)),
+            _ => { entry.as_object_mut().unwrap().remove(field); }
+        }
+    }
+}
+
+/// Build a per-platform / per-model usage report from stored requests.
+///
+/// Records written before `cached_tokens` existed carry no cache data. For those
+/// the billable figure falls back to the full prompt count, which *overstates*
+/// the bill — the report marks such buckets by leaving `cacheHitRate` at `None`
+/// so a consumer can tell "no cache hits" from "cache unknown".
+fn build_usage_report(
+    rows: Vec<super::types::RequestSummary>,
+    since: Option<i64>,
+    until: i64,
+    stats: super::types::UsageStats,
+    health: Vec<ModelHealthReport>,
+    truncated: bool,
+) -> super::types::UsageReport {
+    use std::collections::HashMap;
+    use super::types::{ModelUsage, PlatformUsage, RequestSummary, UsageBucket};
+
+    #[derive(Default)]
+    struct Acc {
+        usage: UsageBucket,
+        latencies: Vec<u64>,
+        /// True while every record in the bucket predates cache accounting.
+        cache_known: bool,
+    }
+
+    let mut total = Acc::default();
+    let mut per_platform: HashMap<String, (Acc, HashMap<String, Acc>)> = HashMap::new();
+
+    for RequestSummary {
+        platform,
+        model,
+        elapsed_ms,
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        status,
+        ..
+    } in rows
+    {
+        let key = platform.route_key(CreditRegion::Cn).to_string();
+        // Route names are stored as `<platform>/<model>`; strip the prefix so
+        // the inner bucket shows just the model.
+        let model_name = model
+            .split_once('/')
+            .map(|(_, m)| m.to_string())
+            .unwrap_or_else(|| model.clone());
+
+        let prompt = input_tokens.unwrap_or(0);
+        let completion = output_tokens.unwrap_or(0);
+        let billable_prompt = match cached_tokens {
+            Some(cached) => prompt.saturating_sub(cached),
+            // Unknown cache state: assume nothing was cached so the bill is not
+            // understated.
+            None => prompt,
+        };
+        let ok = status == "success";
+
+        let mut apply = |acc: &mut Acc| {
+            acc.usage.requests += 1;
+            acc.usage.prompt_tokens += prompt;
+            acc.usage.billable_prompt_tokens += billable_prompt;
+            acc.usage.completion_tokens += completion;
+            // Track the cache-reporting subset separately so the hit rate is
+            // computed over records that actually carry a figure. Pre-upgrade
+            // rows have no cache data; charging them as full misses is right for
+            // the cost estimate but wrong for the rate.
+            if cached_tokens.is_some() {
+                acc.usage.prompt_tokens_with_cache += prompt;
+                acc.usage.billable_prompt_tokens_with_cache += billable_prompt;
+            }
+            if ok {
+                acc.usage.succeeded += 1;
+                acc.latencies.push(elapsed_ms);
+            } else {
+                acc.usage.failed += 1;
+            }
+            acc.cache_known = acc.cache_known || cached_tokens.is_some();
+        };
+
+        apply(&mut total);
+        let entry = per_platform.entry(key).or_default();
+        apply(&mut entry.0);
+        apply(entry.1.entry(model_name).or_default());
+    }
+
+    let mut finish = |mut acc: Acc| {
+        acc.usage.finish(&mut acc.latencies);
+        // A bucket with no cache data must not advertise a 100% hit rate.
+        if !acc.cache_known {
+            acc.usage.cache_hit_rate = None;
+            acc.usage.billable_prompt_tokens = acc.usage.prompt_tokens;
+        }
+        acc.usage
+    };
+
+    let total_usage = finish(Acc { usage: total.usage.clone(), latencies: total.latencies, cache_known: total.cache_known });
+
+    let mut platforms: Vec<PlatformUsage> = per_platform
+        .into_iter()
+        .map(|(platform, (agg, models))| {
+            let mut model_rows: Vec<ModelUsage> = models
+                .into_iter()
+                .map(|(model, acc)| ModelUsage { model, usage: finish(acc) })
+                .collect();
+            model_rows.sort_by(|a, b| b.usage.total_tokens.cmp(&a.usage.total_tokens));
+            PlatformUsage { platform, usage: finish(agg), models: model_rows }
+        })
+        .collect();
+    // Busiest platform first: the reader usually wants the one that costs most.
+    platforms.sort_by(|a, b| b.usage.total_tokens.cmp(&a.usage.total_tokens));
+
+    super::types::UsageReport {
+        since,
+        until,
+        total: total_usage,
+        platforms,
+        stats,
+        health,
+        truncated,
+    }
+}
+
+/// `GET /v1/usage` — token usage broken down by platform and model.
+///
+/// Query parameters (all optional):
+///   * `since` / `until` — epoch **milliseconds**. `since` defaults to
+///     the start of the current local day; `until` defaults to now.
+///   * `hours` — convenience alternative to `since`: look back N hours.
+///   * `platform` — restrict to one platform (`workbuddy`, `qoder`, …).
+///
+/// Reports both the tokens *sent* and the tokens actually *billable*. The two
+/// differ by however much the prompt cache absorbed, which in practice is most
+/// of the input; quoting only the sent figure overstates cost by orders of
+/// magnitude.
+async fn usage(
+    State(context): State<Arc<GatewayContext>>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !authorized(&headers, &context.key) {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "本地代理密钥无效",
+        );
+    }
+
+    let now = now_ms();
+    let until = params
+        .get("until")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(now);
+    let since = params
+        .get("since")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| {
+            params
+                .get("hours")
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|h| until - h * 3_600_000)
+        })
+        .or_else(|| Some(start_of_local_day(now)));
+
+    // The report walks every stored row in the window, so cap the amount of work
+    // one call can ask for.
+    const MAX_ROWS: usize = 200_000;
+    let mut rows = match context.manager.store.requests_between(since, until, MAX_ROWS) {
+        Ok(rows) => rows,
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "usage_store_error",
+                "读取请求记录失败",
+            )
+        }
+    };
+    if let Some(filter) = params.get("platform").filter(|v| !v.is_empty()) {
+        let wanted = filter.to_ascii_lowercase();
+        rows.retain(|r| r.platform.route_key(CreditRegion::Cn).eq_ignore_ascii_case(&wanted));
+    }
+
+    let stats = context.manager.usage_stats().unwrap_or_default();
+    let health = context.health_snapshot();
+    let truncated = stats.truncated;
+    Json(build_usage_report(rows, since, until, stats, health, truncated)).into_response()
+}
+/// Midnight of the current local day, epoch ms.
+fn start_of_local_day(now_ms: i64) -> i64 {
+    use chrono::{Local, TimeZone};
+    let Some(now) = Local.timestamp_millis_opt(now_ms).single() else {
+        return now_ms;
+    };
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| Local.from_local_datetime(&midnight).single())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(now_ms)
+}
+
+async fn models(State(context): State<Arc<GatewayContext>>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &context.key) {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "本地代理密钥无效",
+        );
+    }
+    let accounts = match context.manager.accounts() {
+        Ok(accounts) => accounts,
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "account_store_error",
+                "读取账号失败",
+            )
+        }
+    };
+    let mut entries = std::collections::BTreeMap::new();
+    for account in accounts.into_iter().filter(account_eligible) {
+        if let Some(snapshot) = &account.snapshot {
+            for model in &snapshot.models {
+                let alias = format!("{}/{}", account.platform.route_key(account.region), model.id);
+                insert_catalog_model(&mut entries, alias, &account.platform.route_key(account.region), model);
+                if let Some(canonical) = model.canonical_id.as_ref().filter(|_| model.verified && account.region == super::types::CreditRegion::Cn) {
+                    insert_catalog_model(&mut entries, canonical.clone(), "auto", model);
+                }
+            }
+        }
+    }
+    Json(json!({"object": "list", "data": entries.into_values().collect::<Vec<_>>()}))
+        .into_response()
+}
+
+fn account_eligible(account: &Account) -> bool {
+    account.enabled
+        && account.status == "ready"
+        && account
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.balance.is_none_or(|balance| balance > 0.0))
+}
+
+fn model_matches(account: &Account, model: &ModelInfo, requested: &str) -> bool {
+    requested == format!("{}/{}", account.platform.route_key(account.region), model.id)
+        || (account.region == super::types::CreditRegion::Cn && model.verified && model.canonical_id.as_deref() == Some(requested))
+}
+
+fn candidates(accounts: Vec<Account>, requested: &str, tools: bool, now: i64) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for account in accounts.into_iter().filter(account_eligible) {
+        let Some(snapshot) = &account.snapshot else {
+            continue;
+        };
+        let expiry = snapshot
+            .packs
+            .iter()
+            .filter(|p| p.remaining.is_none_or(|v| v > 0.0))
+            .filter_map(|p| p.expires_at)
+            .filter(|expiry| *expiry > now)
+            .min()
+            .unwrap_or(i64::MAX);
+        for model in &snapshot.models {
+            if model_matches(&account, model, requested) && (!tools || model.supports_tools) {
+                candidates.push(Candidate {
+                    account: account.clone(),
+                    model: model.clone(),
+                    expiry,
+                });
+            }
+        }
+    }
+    candidates
+}
+
+/// Which `reasoning_effort` to send upstream, given what the client asked for
+/// and which model will actually serve the request.
+///
+/// Measured on the workbuddy pool with `max_tokens=2000` and an identical
+/// prompt, passing *any* explicit tier pushed `deepseek-v4.1-flash` into its
+/// thinking mode, which then spent the whole token budget on hidden reasoning
+/// and returned HTTP 200 with empty content and `finish_reason=length`:
+///
+/// ```text
+/// reasoning_effort=max|high|medium|low -> 2000/2000 tokens on thinking, 0 chars
+/// reasoning_effort absent              -> 1598 tokens, 4519 chars, finish=stop
+/// ```
+///
+/// So inventing a default tier is actively harmful here. Drop the field unless
+/// the model genuinely exposes a reasoning dial, and forward the client's own
+/// value only for those models.
+fn effective_reasoning_effort(model: &str, client_value: Option<&Value>) -> Option<Value> {
+    let name = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let honours_effort = name.contains("thinking")
+        || name.contains("kimi-k3")
+        || name.contains("glm-5")
+        || name.contains("minimax")
+        || name.contains("mimo")
+        || name.contains("step-");
+    match client_value {
+        Some(v) if !v.is_null() && honours_effort => Some(v.clone()),
+        _ => None,
+    }
+}
+
+/// Ordered list of substitutes to try when every channel for the requested
+/// model is exhausted.
+///
+/// Design rules:
+///  * Stay inside the same platform prefix — a `workbuddy/` request must never
+///    silently switch to `qoder/` or `traework/`.
+///  * Never fall *down* in capability if a stronger sibling exists. The chains
+///    below walk from the strongest usable model down to the cheapest, so a
+///    degraded request still gets the best available answer rather than the
+///    fastest one.
+///  * Models that are known to fail upstream (TRAE cannot serve `kimi-k3.1-pro`
+///    because the free-credit tier excludes it) are never used as targets.
+///  * Keep it explicit: guessing a substitute is worse than returning an error.
+fn fallback_chain(requested: &str) -> Vec<String> {
+    let Some((platform, model)) = requested.split_once('/') else {
+        return Vec::new();
+    };
+    let name = model.to_ascii_lowercase();
+
+    // Strongest-first ordering shared by the chains below. `kimi-k3` is
+    // deliberately omitted for `traework`: its free-credit pool cannot use
+    // either kimi-k3 variant, so those requests must land on a different family.
+    let no_kimi = platform == "traework";
+
+    // Each chain lists substitutes in descending capability order.
+    const CHAINS: &[(&str, &[&str])] = &[
+        // kimi-k3.1-pro cannot be served on TRAE's free tier; jump to the
+        // strongest non-kimi families instead of dropping to a weaker kimi.
+        ("kimi-k3.1-pro", &["kimi-k3", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash"]),
+        ("kimi-k3", &["kimi-k3.1-pro", "kimi-k2.8-preview", "deepseek-v4.1-flash", "glm-5.3-flash"]),
+        ("kimi-k2.8-preview", &["deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash"]),
+        ("deepseek-v4.1-flash", &["glm-5.3", "glm-5.3-flash"]),
+        ("deepseek-v4-pro", &["deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash"]),
+        ("deepseek-v4-flash", &["deepseek-v4.1-flash", "glm-5.3-flash"]),
+        ("deepseek-v4", &["deepseek-v4.1-flash", "glm-5.3-flash"]),
+        ("glm-5.3", &["glm-5.3-flash", "deepseek-v4.1-flash"]),
+        ("glm-5.2", &["glm-5.3", "glm-5.3-flash"]),
+        ("glm-5.0", &["glm-5.3", "glm-5.3-flash"]),
+        ("minimax-m3.1-flash", &["glm-5.3-flash", "deepseek-v4.1-flash"]),
+        ("minimax-m3", &["glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"]),
+        ("qwen3.8-max", &["glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"]),
+        ("step-5-preview", &["glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"]),
+        ("mimo-v2.6-pro", &["glm-5.3", "glm-5.3-flash", "deepseek-v4.1-flash"]),
+        ("Doubao-Seed-2.1-Pro", &["glm-5.3", "deepseek-v4.1-flash", "glm-5.3-flash"]),
+    ];
+
+    let chain = CHAINS
+        .iter()
+        .find(|(from, _)| name == from.to_ascii_lowercase())
+        .map(|(_, to)| *to)
+        .unwrap_or(&[]);
+
+    chain
+        .iter()
+        .filter(|candidate| {
+            // Drop kimi targets on TRAE: that pool cannot spend credits there.
+            !(no_kimi && candidate.to_ascii_lowercase().contains("kimi"))
+        })
+        .map(|candidate| format!("{platform}/{candidate}"))
+        .collect()
+}
+
+/// Stable identifier for a conversation, used for session affinity.
+///
+/// Preference order:
+///  1. `session_id` — clients that track sessions themselves
+///  2. `user` — per-end-user stickiness
+///  3. first user message of the conversation — enough to keep a multi-turn
+///     chat on one account, since every turn resends the same opening prompt
+///
+/// Never includes the growing tail of the history, otherwise each turn would
+/// produce a different key and stickiness would never hold.
+fn conversation_key(data: &Value, model: &str) -> String {
+    for field in ["session_id", "conversation_id", "user"] {
+        if let Some(value) = data.get(field).and_then(Value::as_str) {
+            if !value.is_empty() {
+                return format!("{model}\u{1}{value}");
+            }
+        }
+    }
+    let opening = data
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .find(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        })
+        .map(|m| {
+            let text = m.get("content").map(|c| match c {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
+            text.unwrap_or_default()
+        })
+        .unwrap_or_default();
+    // A short stable digest: length + prefix is plenty to tell conversations
+    // apart without keeping whole prompts in memory.
+    format!("{model}\u{1}{}\u{1}{}", opening.len(), opening.chars().take(96).collect::<String>())
+}
+
+/// Outcome of trying to pick an account for one request.
+enum Selection {
+    /// An account is reserved and its in-flight slot is counted.
+    Ready(Box<(Candidate, RequestGuard)>),
+    /// Every candidate was skipped for a reason that will clear on its own
+    /// (cooldown, model backoff, concurrency ceiling). The caller should wait
+    /// and retry instead of failing the request.
+    Busy,
+    /// Nothing can serve this model: it is not in any account's catalog.
+    Exhausted,
+}
+
+impl Selection {
+    /// Test-only: pull the picked candidate out or panic naming the variant.
+    /// Production code must match on the enum (see the gateway loop) — only
+    /// tests can assume a `Ready` because they construct inputs that guarantee
+    /// one.
+    #[cfg(test)]
+    fn unwrap_ready(self) -> (Candidate, RequestGuard) {
+        match self {
+            // Deref out of the Box so callers destructure a plain tuple, the
+            // shape the old `.unwrap()` returned before Ready wrapped it.
+            Selection::Ready(picked) => *picked,
+            Selection::Busy => panic!("expected Selection::Ready, got Busy"),
+            Selection::Exhausted => panic!("expected Selection::Ready, got Exhausted"),
+        }
+    }
+}
+
+/// Per-route health for the usage endpoint.
+///
+/// Uses the same database aggregation as the panel so both report identical
+/// numbers. The in-memory counters reset on every restart and would make the
+/// API disagree with the UI, which is worse than either being slightly stale.
+fn health_snapshot_of(context: &GatewayContext) -> Vec<ModelHealthReport> {
+    let now = now_ms();
+    let stored = context
+        .manager
+        .store
+        .request_health()
+        .unwrap_or_default();
+    let routing = context.routing.lock();
+    let mut reports: Vec<ModelHealthReport> = stored
+        .into_iter()
+        .map(|row| {
+            let (platform, model) = row
+                .model
+                .split_once('/')
+                .map(|(p, m)| (p.to_string(), m.to_string()))
+                .unwrap_or_else(|| ("unknown".to_string(), row.model.clone()));
+            let live = routing.health.get(&row.model);
+            ModelHealthReport {
+                route: row.model,
+                platform,
+                model,
+                total_ok: row.ok,
+                total_fail: row.fail,
+                total_cancelled: row.cancelled,
+                recent_rate: None,
+                success_rate: {
+                    let attempted = row.ok + row.fail;
+                    (attempted > 0).then(|| row.ok as f64 / attempted as f64)
+                },
+                avg_latency_ms: row.avg_latency_ms,
+                quarantined_ms: live
+                    .and_then(|h| h.quarantined_until)
+                    .filter(|until| *until > now)
+                    .map(|until| (until - now) as u64),
+                last_error: live.and_then(|h| h.last_error.clone()),
+            }
+        })
+        .collect();
+    reports.sort_by(|a, b| {
+        a.success_rate
+            .unwrap_or(1.0)
+            .partial_cmp(&b.success_rate.unwrap_or(1.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.route.cmp(&b.route))
+    });
+    reports
+}
+
+fn select_candidate(
+    context: &GatewayContext,
+    candidates: &[Candidate],
+    sticky_key: Option<&str>,
+) -> Selection {
+    let now = now_ms();
+    let mut routing = context.routing.lock();
+
+    // Concurrency guard. Upstreams throttle per account, so firing many
+    // simultaneous requests at one account is what turns a burst into a pile of
+    // 429s. Keep at most `MAX_IN_FLIGHT_PER_ACCOUNT` requests on any single
+    // account and `MAX_IN_FLIGHT_TOTAL` overall; a saturated pool simply means
+    // the caller's request waits for the next slot rather than being answered
+    // with an error.
+    let total_in_flight: usize = routing.loads.values().sum();
+    if total_in_flight >= MAX_IN_FLIGHT_TOTAL {
+        return Selection::Busy;
+    }
+
+    // Session affinity: reuse the account that served this conversation before,
+    // which keeps the upstream prompt cache warm and avoids re-billing the same
+    // context on every turn. Cleared on failure so a dead account is not stuck
+    // to the session.
+    if let Some(key) = sticky_key {
+        if let Some((account_id, until)) = routing.sticky.get(key) {
+            if *until > now {
+                if let Some(candidate) = candidates
+                    .iter()
+                    .filter(|c| &c.account.id == account_id)
+                    .filter(|c| routing.cooldowns.get(&c.account.id).copied().unwrap_or(0) <= now)
+                    .filter(|c| {
+                        routing
+                            .model_backoff
+                            .get(&(c.account.id.clone(), c.model.id.clone()))
+                            .copied()
+                            .unwrap_or(0)
+                            <= now
+                    })
+                    .min_by_key(|c| c.expiry)
+                {
+                    let candidate = candidate.clone();
+                    let load = routing.loads.entry(candidate.account.id.clone()).or_default();
+                    if *load < MAX_IN_FLIGHT_PER_ACCOUNT {
+                        *load += 1;
+                        routing.sequence += 1;
+                        let sequence = routing.sequence;
+                        routing
+                            .assigned
+                            .insert(candidate.account.id.clone(), sequence);
+                        drop(routing);
+                        return Selection::Ready(Box::new((
+                            candidate.clone(),
+                            RequestGuard::new(candidate.account),
+                        )));
+                    }
+                }
+            }
+            // Expired or unusable: forget the binding and fall through.
+            routing.sticky.remove(key);
+        }
+    }
+
+    // A saturated account is temporary; a cooled-down or backing-off one is
+    // temporary too. Only "no candidate at all" is permanent. Separating the two
+    // is what lets the caller wait for a slot instead of returning an error that
+    // the user reads as "the gateway is down".
+    let idle = candidates
+        .iter()
+        .filter(|c| routing.loads.get(&c.account.id).copied().unwrap_or(0) < MAX_IN_FLIGHT_PER_ACCOUNT)
+        .collect::<Vec<_>>();
+    if idle.is_empty() {
+        return Selection::Busy;
+    }
+    let Some(candidate) = idle
+        .into_iter()
+        .filter(|c| routing.cooldowns.get(&c.account.id).copied().unwrap_or(0) <= now)
+        .filter(|c| {
+            // Skip only the (account, model) pair that is backing off, so a
+            // model-level rate limit does not remove the account from service
+            // for every other model it can serve.
+            routing
+                .model_backoff
+                .get(&(c.account.id.clone(), c.model.id.clone()))
+                .copied()
+                .unwrap_or(0)
+                <= now
+        })
+        .min_by_key(|c| {
+            (
+                c.expiry,
+                routing.loads.get(&c.account.id).copied().unwrap_or(0),
+                routing.assigned.get(&c.account.id).copied().unwrap_or(0),
+            )
+        })
+        .cloned()
+    else {
+        // Every idle account is cooling down or backing off: wait, don't fail.
+        return Selection::Busy;
+    };
+    *routing
+        .loads
+        .entry(candidate.account.id.clone())
+        .or_default() += 1;
+    routing.sequence += 1;
+    let sequence = routing.sequence;
+    routing
+        .assigned
+        .insert(candidate.account.id.clone(), sequence);
+    // Remember the choice for this conversation.
+    if let Some(key) = sticky_key {
+        routing.sticky.insert(
+            key.to_string(),
+            (candidate.account.id.clone(), now + STICKY_TTL_MS),
+        );
+    }
+    drop(routing);
+    // The owning Arc is attached by the caller after selection.
+    Selection::Ready(Box::new((
+        candidate.clone(),
+        RequestGuard::new(candidate.account),
+    )))
+}
+
+struct RequestGuard {
+    context: Option<Arc<GatewayContext>>,
+    account: Account,
+    id: String,
+    model: String,
+    started: Instant,
+    created_at: i64,
+    attempted: bool,
+    expose_thinking: bool,
+    status: &'static str,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    /// Prompt tokens served from the upstream cache, when the upstream reports
+    /// them. Drives the billable-vs-sent split in usage reports.
+    cached_tokens: Option<u64>,
+    /// Credits the upstream actually charged for this request, when it reports
+    /// them. This is the only figure that is authoritative about cost: token
+    /// counts vary by model and cache hit rate, so any token→credit conversion
+    /// is a guess. WorkBuddy returns it as `usage.credit`; TRAE and Qoder do not
+    /// report it at all, which is why it stays optional.
+    credit: Option<f64>,
+    diagnostic: Option<RequestDiagnostic>,
+}
+
+impl RequestGuard {
+    fn new(account: Account) -> Self {
+        Self {
+            context: None,
+            account,
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            model: String::new(),
+            started: Instant::now(),
+            created_at: now_ms(),
+            attempted: false,
+            expose_thinking: false,
+            status: "cancelled",
+            input_tokens: None,
+            output_tokens: None,
+            cached_tokens: None,
+            credit: None,
+            diagnostic: None,
+        }
+    }
+
+    fn observe(&mut self, data: &Value) {
+        if let Some(usage) = data.get("usage") {
+            self.input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .or(self.input_tokens);
+            self.output_tokens = usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .or(self.output_tokens);
+            // Prompt-cache accounting. Upstreams disagree on the field name, and
+            // getting this wrong is what makes a usage report look hundreds of
+            // times larger than the actual bill, so accept every spelling seen
+            // in the wild and take the first hit.
+            let cached = [
+                "/prompt_tokens_details/cached_tokens",
+                "/prompt_cache_hit_tokens",
+                "/cache_read_input_tokens",
+                "/cached_tokens",
+            ]
+            .iter()
+            .find_map(|pointer| usage.pointer(pointer).and_then(Value::as_u64));
+            if let Some(cached) = cached {
+                self.cached_tokens = Some(cached.min(self.input_tokens.unwrap_or(cached)));
+            }
+            // Actual amount charged. Authoritative when present — token counts
+            // are only a proxy for cost, and the ratio differs per model.
+            if let Some(credit) = usage.get("credit").and_then(Value::as_f64) {
+                self.credit = Some(credit);
+            }
+        }
+    }
+
+    // Drop reads `status` for the request summary, but rustc's generator dataflow
+    // misses that read across yield points in async-stream bodies, so writes go
+    // through this method instead of triggering `unused_assignments`.
+    fn set_status(&mut self, status: &'static str) {
+        self.status = status;
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let Some(context) = &self.context else { return };
+        let mut routing = context.routing.lock();
+        if let Some(load) = routing.loads.get_mut(&self.account.id) {
+            *load = load.saturating_sub(1);
+        }
+        drop(routing);
+        if self.attempted {
+            context.manager.mark_stale(&self.account.id);
+            let _ = context.manager.record_request(RequestSummary {
+                id: self.id.clone(),
+                account_id: self.account.id.clone(),
+                platform: self.account.platform,
+                region: self.account.region,
+                model: self.model.clone(),
+                elapsed_ms: self.started.elapsed().as_millis() as u64,
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                cached_tokens: self.cached_tokens,
+                credit: self.credit,
+                status: self.status.into(),
+                created_at: self.created_at,
+                diagnostic: self.diagnostic.clone(),
+            });
+        }
+    }
+}
+
+fn validate_image_url(image: &Value) -> Result<(), &'static str> {
+    use base64::Engine;
+    let image = image.as_object().ok_or("image_url 必须是对象")?;
+    let url = image
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or("图片缺少有效 URL")?;
+    if let Some(data) = url.strip_prefix("data:") {
+        let (media, data) = data.split_once(',').ok_or("图片 data URL 格式无效")?;
+        if !matches!(
+            media,
+            "image/jpeg;base64" | "image/png;base64" | "image/gif;base64" | "image/webp;base64"
+        ) || data.is_empty()
+            || base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .is_err()
+        {
+            return Err("图片必须是 JPEG、PNG、GIF 或 WebP 的有效 base64 数据");
+        }
+    } else if reqwest::Url::parse(url)
+        .ok()
+        .is_none_or(|url| !matches!(url.scheme(), "http" | "https") || url.host_str().is_none())
+    {
+        return Err("图片 URL 必须使用 http 或 https");
+    }
+    if image
+        .get("detail")
+        .is_some_and(|detail| !matches!(detail.as_str(), Some("auto" | "low" | "high")))
+    {
+        return Err("图片 detail 仅支持 auto、low 或 high");
+    }
+    Ok(())
+}
+
+fn validate_request(data: &Value) -> Result<(&str, bool, bool), &'static str> {
+    let object = data.as_object().ok_or("请求必须是 JSON 对象")?;
+    // Unknown top-level fields are ignored rather than rejected. Clients send a
+    // wide and ever-changing set of optional OpenAI parameters (`system`,
+    // `logprobs`, `service_tier`, `thinking`, `enable_thinking`, vendor extras,
+    // MCP/session hints…). A strict allow-list turned every such request into a
+    // 400 "请求包含不支持的字段", which made the shared proxy look broken for
+    // perfectly valid clients. We still validate the fields we actually act on.
+    let _ = object;
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty() && v.len() <= 256)
+        .ok_or("缺少有效的 model")?;
+    if object.get("stream").is_some_and(|v| !v.is_boolean()) {
+        return Err("stream 必须是布尔值");
+    }
+    if object
+        .get("store")
+        .is_some_and(|value| value.as_bool() != Some(false))
+    {
+        return Err("代理仅支持 store=false，不提供响应存储");
+    }
+    if object.get("n").is_some_and(|v| v.as_u64() != Some(1)) {
+        return Err("代理仅支持 n=1");
+    }
+    if object.contains_key("max_tokens") && object.contains_key("max_completion_tokens") {
+        return Err("输出 token 上限参数不能同时设置两种格式");
+    }
+    for field in ["max_tokens", "max_completion_tokens"] {
+        if object
+            .get(field)
+            .is_some_and(|v| v.as_u64().is_none_or(|n| n == 0))
+        {
+            return Err("输出 token 上限必须是正整数");
+        }
+    }
+    for field in [
+        "temperature",
+        "top_p",
+        "presence_penalty",
+        "frequency_penalty",
+    ] {
+        if object.get(field).is_some_and(|v| !v.is_number()) {
+            return Err("采样参数必须是数字");
+        }
+    }
+    if object
+        .get("parallel_tool_calls")
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return Err("parallel_tool_calls 必须是布尔值");
+    }
+    if object.get("stream_options").is_some_and(|v| !v.is_object()) {
+        return Err("stream_options 必须是对象");
+    }
+    let messages = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .filter(|v| !v.is_empty() && v.len() <= 4096)
+        .ok_or("messages 必须是非空数组")?;
+    let mut has_tools = false;
+    for message in messages {
+        let message = message.as_object().ok_or("message 必须是对象")?;
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or("message 缺少 role")?;
+        if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+            return Err("不支持的消息 role");
+        }
+        if role == "tool" {
+            has_tools = true;
+            if message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("工具结果缺少 tool_call_id");
+            }
+        }
+        if message
+            .get("reasoning_content")
+            .is_some_and(|reasoning| role != "assistant" || !reasoning.is_string())
+        {
+            return Err("reasoning_content 仅支持 assistant 消息中的字符串");
+        }
+        if let Some(content) = message.get("content") {
+            if !content.is_string() && !content.is_null() {
+                let parts = content.as_array().ok_or("content 必须是文本或内容块数组")?;
+                for part in parts {
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("text") if part.get("text").and_then(Value::as_str).is_some() => {}
+                        Some("image_url") if matches!(role, "user" | "tool") => {
+                            validate_image_url(&part["image_url"])?
+                        }
+                        _ => return Err("内容块仅支持文本，以及 user 或 tool 消息中的图片"),
+                    }
+                }
+            }
+        } else if message.get("tool_calls").is_none() {
+            return Err("message 缺少 content");
+        }
+        if let Some(calls) = message.get("tool_calls") {
+            has_tools = true;
+            let calls = calls.as_array().ok_or("tool_calls 必须是数组")?;
+            if calls.iter().any(|v| {
+                v.get("type").and_then(Value::as_str) != Some("function")
+                    || v.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .is_none()
+                    || v.get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .is_none()
+            }) {
+                return Err("工具调用格式无效");
+            }
+        }
+    }
+    if let Some(tools) = object.get("tools") {
+        let tools = tools.as_array().ok_or("tools 必须是数组")?;
+        has_tools |= !tools.is_empty();
+        if tools.iter().any(|v| {
+            v.get("type").and_then(Value::as_str) != Some("function")
+                || v.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                || v.get("function")
+                    .and_then(|f| f.get("parameters"))
+                    .is_some_and(|p| !p.is_object())
+        }) {
+            return Err("tools 仅支持 function 工具");
+        }
+    }
+    if let Some(choice) = object.get("tool_choice") {
+        if let Some(choice) = choice.as_str() {
+            if !matches!(choice, "auto" | "required" | "none") {
+                return Err("tool_choice 字符串仅支持 auto、required 或 none");
+            }
+        } else if let Some(choice) = choice.as_object() {
+            match choice.get("type").and_then(Value::as_str) {
+                Some("auto" | "required" | "none") => {}
+                Some("function") => {
+                    let name = choice
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .ok_or("tool_choice 缺少函数名称")?;
+                    if !object
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| {
+                            tools.iter().any(|tool| {
+                                tool.pointer("/function/name").and_then(Value::as_str) == Some(name)
+                            })
+                        })
+                    {
+                        return Err("tool_choice 指定的函数不在 tools 中");
+                    }
+                }
+                _ => return Err("tool_choice 格式无效"),
+            }
+        } else {
+            return Err("tool_choice 必须是字符串或对象");
+        }
+    }
+    Ok((
+        model,
+        object
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        has_tools,
+    ))
+}
+
+async fn chat(
+    State(context): State<Arc<GatewayContext>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    protocol_request(context, headers, body, Protocol::Openai).await
+}
+
+async fn messages(
+    State(context): State<Arc<GatewayContext>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    protocol_request(context, headers, body, Protocol::Messages).await
+}
+
+/// Depth budget for parsing a request body on a dedicated thread.
+///
+/// Measured 2026-11-08: the app died four times with 0xc0000409 (STATUS_STACK_
+/// BUFFER_OVERRUN) inside its own module, every time within seconds of a burst of
+/// 100k-700k token requests. Those payloads are normal traffic here — 40% of a
+/// day's requests exceed 150k tokens, the largest being 697k — so capping size
+/// would reject the traffic the proxy exists to serve.
+///
+/// The stack was the problem, not the payload: serde_json recurses once per
+/// nesting level, so parsing moved off the default 8 MiB stack onto a bigger one.
+///
+/// **The size was then wrong in the other direction.** 2026-11-10: the crash
+/// turned out to be `std::alloc::rust_oom`, not stack overflow — the *reservation*
+/// of 128 MiB per parsing thread was itself what exhausted the commit limit.
+/// Every >512 KiB body spawned its own 128 MiB-stack thread; with a burst of
+/// 400-700k token requests that is gigabytes of pure stack reservation while the
+/// machine already sits at 80-88% commit.
+///
+/// 16 MiB is still ~2000x the deepest JSON nesting a chat request reaches (a
+/// tool schema nests maybe 20 levels) and 16x the default stack, while costing
+/// an eighth of the reservation.
+const BODY_PARSE_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Parsing threads are bounded: a burst of big bodies must not turn into a burst
+/// of 16 MiB stacks plus a burst of parsed `Value` trees (each ~15x its JSON).
+/// Two in flight is deliberately tight — measured traffic never has more than
+/// two overlapping large requests, and waiting a beat is far better than being
+/// killed by the commit limit. Worst case stack reservation: 32 MiB.
+static BIG_BODY_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+fn big_body_slots() -> &'static tokio::sync::Semaphore {
+    BIG_BODY_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
+fn parse_json_on_big_stack(raw: &[u8]) -> Result<Value, String> {
+    // Fast path: small bodies never come close to the limit, and spawning a
+    // thread per request would be wasteful for the ~60% that are under 100k.
+    if raw.len() <= 512 * 1024 {
+        return serde_json::from_slice(raw).map_err(|e| e.to_string());
+    }
+    let owned = raw.to_vec();
+    let handle = std::thread::Builder::new()
+        .stack_size(BODY_PARSE_STACK_BYTES)
+        .spawn(move || serde_json::from_slice::<Value>(&owned).map_err(|e| e.to_string()))
+        .map_err(|e| format!("无法创建解析线程: {e}"))?;
+    handle
+        .join()
+        .map_err(|_| "请求解析线程异常退出".to_string())?
+}
+
+async fn protocol_request(
+    context: Arc<GatewayContext>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    protocol: Protocol,
+) -> Response {
+    let authenticated = authorized(&headers, &context.key)
+        || (matches!(protocol, Protocol::Messages)
+            && headers
+                .get("x-api-key")
+                .and_then(|key| key.to_str().ok())
+                .is_some_and(|key| key_matches(key, &context.key)));
+    if !authenticated {
+        return protocol.error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "本地代理密钥无效",
+        );
+    }
+    if body.is_empty() {
+        return protocol.error(StatusCode::BAD_REQUEST, "invalid_json", "请求 JSON 无效");
+    }
+    // Parsed off the async runtime: 100k-700k token bodies recurse deeply enough
+    // that the default stack overruns (0xc0000409). See parse_json_on_big_stack.
+    //
+    // A slot is held only while a *big* body is being parsed, so ordinary traffic
+    // never waits. Waiting here is async — the runtime keeps serving other
+    // requests — and it is what stops a burst of large bodies from multiplying
+    // into a burst of stacks and `Value` trees at once.
+    let _slot = if body.len() > 512 * 1024 {
+        match big_body_slots().acquire().await {
+            Ok(slot) => Some(slot),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let data = match parse_json_on_big_stack(&body) {
+        Ok(data) => data,
+        Err(_) => {
+            return protocol.error(StatusCode::BAD_REQUEST, "invalid_json", "请求 JSON 无效")
+        }
+    };
+    if let Err(message) = tool_validation::validate(&data, matches!(protocol, Protocol::Messages)) {
+        return protocol.error(StatusCode::BAD_REQUEST, "invalid_request", &message);
+    }
+    let expose_thinking = matches!(protocol, Protocol::Messages)
+        && matches!(data.pointer("/thinking/type").and_then(Value::as_str), Some("enabled" | "adaptive"))
+        && data.pointer("/thinking/display").and_then(Value::as_str) != Some("omitted");
+    let mut data = if matches!(protocol, Protocol::Messages) {
+        match anthropic::request(data) {
+            Ok(data) => data,
+            Err(message) => {
+                return protocol.error(StatusCode::BAD_REQUEST, "invalid_request", message)
+            }
+        }
+    } else {
+        data
+    };
+    let (requested, stream, tools) = match validate_request(&data) {
+        Ok(v) => v,
+        Err(message) => return protocol.error(StatusCode::BAD_REQUEST, "invalid_request", message),
+    };
+    let requested = requested.to_owned();
+    // Consume the client's opt-out locally; providers need not support stored completions.
+    if let Some(object) = data.as_object_mut() {
+        object.remove("store");
+    }
+    // Normalise the reasoning dial. Sending an explicit tier to a plain chat
+    // model makes it start "thinking" and burn the entire output budget, so the
+    // field is dropped unless the target model really exposes that control.
+    // See `effective_reasoning_effort` for the measurements behind this.
+    {
+        let client_effort = data.get("reasoning_effort").cloned();
+        let decided = effective_reasoning_effort(&requested, client_effort.as_ref());
+        if let Some(object) = data.as_object_mut() {
+            object.remove("reasoning_effort");
+            if let Some(value) = decided {
+                object.insert("reasoning_effort".into(), value);
+            }
+        }
+    }
+    let accounts = match context.manager.accounts() {
+        Ok(v) => v,
+        Err(_) => {
+            return protocol.error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "account_store_error",
+                "读取账号失败",
+            )
+        }
+    };
+    let all = candidates(accounts.clone(), &requested, false, now_ms());
+    if all.is_empty() {
+        return protocol.error(
+            StatusCode::NOT_FOUND,
+            "model_not_available",
+            "请求的精确模型没有可用账号",
+        );
+    }
+    let mut remaining = candidates(accounts, &requested, tools, now_ms());
+    if remaining.is_empty() {
+        return protocol.error(
+            StatusCode::BAD_REQUEST,
+            "tools_not_supported",
+            "该模型当前可用通道不支持工具调用",
+        );
+    }
+    let requested_output = ["max_tokens", "max_completion_tokens"]
+        .into_iter()
+        .find_map(|field| {
+            data.get(field)
+                .and_then(Value::as_u64)
+                .map(|limit| (field, limit))
+        });
+    if let Some((field, limit)) = requested_output {
+        let largest_context = remaining
+            .iter()
+            .filter_map(|candidate| candidate.model.context_window)
+            .max();
+        remaining.retain(|candidate| {
+            candidate
+                .model
+                .context_window
+                .is_none_or(|context| limit <= context)
+        });
+        if let (true, Some(context)) = (remaining.is_empty(), largest_context) {
+            return protocol.error(
+                StatusCode::BAD_REQUEST,
+                "context_limit_exceeded",
+                &format!("{requested} 请求 {field}={limit}，超过当前可用通道最大的已知上下文窗口 {context}；请在客户端降低输出 token 上限，并按通道目录配置上下文窗口"),
+            );
+        }
+    }
+    let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
+    // Skip routes the pool has recently proven it cannot serve, so a request
+    // bound for a dead model goes straight to a working substitute instead of
+    // spending a round trip to rediscover the failure on every call.
+    {
+        let now = now_ms();
+        let routing = context.routing.lock();
+        if routing
+            .health
+            .get(&requested)
+            .is_some_and(|health| !health.usable(now))
+        {
+            remaining.clear();
+        }
+    }
+    // When every channel for the requested model is exhausted, walk a
+    // capability-ordered list of substitutes on the *same* platform instead of
+    // failing the request. Without this, one overloaded model surfaces to the
+    // client as a hard error even though the same account pool serves its
+    // siblings fine.
+    let mut fallback_chain: std::collections::VecDeque<String> =
+        fallback_chain(&requested).into();
+    let mut serving_model = requested.clone();
+    // Conversation identity for session affinity. Clients that pass `session_id`
+    // or `user` get exact stickiness; otherwise fall back to a stable hash of the
+    // conversation prefix so multi-turn chats still land on one account.
+    let sticky_key = conversation_key(&data, &requested);
+    // Waiting for a concurrency slot is bounded: after this many attempts the
+    // request is answered with 429 + Retry-After so the client can back off
+    // itself instead of hanging.
+    const MAX_SLOT_WAITS: u32 = 40;
+    let mut slot_waits: u32 = 0;
+    loop {
+        let (candidate, guard) = match select_candidate(&context, &remaining, Some(&sticky_key)) {
+            Selection::Ready(picked) => *picked,
+            Selection::Busy => {
+                // All accounts are saturated or briefly cooling down. Wait for a
+                // slot rather than failing: to the caller this looks like a slow
+                // response, not an outage.
+                if slot_waits >= MAX_SLOT_WAITS {
+                    return protocol.error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "gateway_saturated",
+                        "本地代理并发已满且长时间无空闲通道，请稍后重试或降低并发",
+                    );
+                }
+                slot_waits += 1;
+                tokio::select! {
+                    _ = context.cancellation.cancelled() => {
+                        return protocol.error(StatusCode::SERVICE_UNAVAILABLE, "gateway_stopped", "本地代理已停止")
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                }
+                continue;
+            }
+            Selection::Exhausted => {
+                // Current model has no channels at all: move to the next
+                // substitute in the chain.
+                let Some(fallback) = fallback_chain.pop_front() else {
+                    break;
+                };
+                let Ok(accounts) = context.manager.accounts() else {
+                    break;
+                };
+                let mut fallback_candidates = candidates(accounts, &fallback, tools, now_ms());
+                if fallback_candidates.is_empty() {
+                    // Nothing can serve this substitute either; try the next one.
+                    continue;
+                }
+                fallback_candidates.retain(|c| {
+                    !remaining
+                        .iter()
+                        .any(|used| used.account.id == c.account.id && used.model.id == c.model.id)
+                });
+                if fallback_candidates.is_empty() {
+                    continue;
+                }
+                remaining = fallback_candidates;
+                serving_model = fallback;
+                continue;
+            }
+        };
+        let mut guard = guard;
+        remaining.retain(|v| v.account.id != candidate.account.id);
+        guard.context = Some(context.clone());
+        // Record the model that actually answers. When a fallback kicked in this
+        // differs from what the client asked for, which is what makes the switch
+        // visible in the request log instead of silent.
+        guard.model = serving_model.clone();
+        guard.expose_thinking = expose_thinking;
+        let credentials = tokio::select! {
+            _ = context.cancellation.cancelled() => return protocol.error(StatusCode::SERVICE_UNAVAILABLE, "gateway_stopped", "本地代理已停止"),
+            result = context.manager.credentials_for(&candidate.account) => match result { Ok(v) => v, Err(_) => { guard.set_status("error"); continue; } },
+        };
+        let mut request = data.clone();
+        request["model"] = Value::String(candidate.model.id.clone());
+        request["stream"] = Value::Bool(true);
+        guard.attempted = true;
+        let mut upstream = tokio::select! {
+            _ = context.cancellation.cancelled() => return protocol.error(StatusCode::SERVICE_UNAVAILABLE, "gateway_stopped", "本地代理已停止"),
+            result = context.manager.provider.chat(&candidate.account, &credentials, &candidate.model, request.clone()) => result,
+        };
+        if let Ok(response) = upstream {
+            upstream = prime_response(response, &context, &candidate).await;
+        }
+        // A confirmed authentication rejection happened before generation, so one refresh
+        // and retry is safe. Timeouts, 5xx and stream failures never take this path.
+        if upstream
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.status == 401 && error.rejected)
+        {
+            let refreshed = tokio::select! {
+                _ = context.cancellation.cancelled() => return protocol.error(StatusCode::SERVICE_UNAVAILABLE, "gateway_stopped", "本地代理已停止"),
+                result = context.manager.force_refresh_credentials(&candidate.account) => result,
+            };
+            if let Ok(refreshed) = refreshed {
+                upstream = tokio::select! {
+                    _ = context.cancellation.cancelled() => return protocol.error(StatusCode::SERVICE_UNAVAILABLE, "gateway_stopped", "本地代理已停止"),
+                    result = context.manager.provider.chat(&candidate.account, &refreshed, &candidate.model, request) => result,
+                };
+                if let Ok(response) = upstream {
+                    upstream = prime_response(response, &context, &candidate).await;
+                }
+            }
+        }
+        match upstream {
+            Ok(upstream) => {
+                // Re-admit the route immediately: the pool can serve it again.
+                context.routing.lock().health.entry(serving_model.clone()).or_default().record_with(
+                    true,
+                    now_ms(),
+                    Some(guard.started.elapsed().as_millis() as u64),
+                    None,
+                );
+                return if stream {
+                    stream_response_for(context.clone(), candidate.model, upstream, guard, protocol)
+                } else {
+                    collect_response_for(
+                        context.clone(),
+                        candidate.model,
+                        upstream,
+                        guard,
+                        protocol,
+                    )
+                    .await
+                }
+            }
+            Err(error) => {
+                guard.set_status("error");
+                guard.diagnostic = Some(error.diagnostic());
+                last_status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_GATEWAY);
+
+                // Distinguish *what* was rejected before backing anything off.
+                // Retrying the same (account, model) immediately is pointless,
+                // but the punishment must match the cause:
+                //
+                //  6004/1005  model-level limit -> back off this pair briefly,
+                //            keep the account serving its other models.
+                //  429        account-level       -> short account cooldown.
+                //  401/402/403 account unusable  -> long cooldown; a token
+                //            refresh or a top-up is needed.
+                //
+                // Previously every 429 parked the whole account for 30s, so a
+                // single hot model cooled every account and the gateway then
+                // answered 503 for *all* models of that platform.
+                if error.rejected {
+                    // Feed the per-route health window. A route that keeps
+                    // failing gets quarantined and skipped on later requests.
+                    let now = now_ms();
+                    let reason = error.diagnostic().message.clone();
+                    context
+                        .routing
+                        .lock()
+                        .health
+                        .entry(serving_model.clone())
+                        .or_default()
+                        .record_with(false, now, None, Some(&reason));
+                    // The bound account just failed for this conversation: drop
+                    // the affinity so the next turn is free to pick another.
+                    context.routing.lock().sticky.remove(&sticky_key);
+                    let model_limited = matches!(
+                        error.upstream_code.as_deref(),
+                        Some("6004") | Some("1005") | Some("4008")
+                    );
+                    if model_limited {
+                        context.routing.lock().model_backoff.insert(
+                            (candidate.account.id.clone(), candidate.model.id.clone()),
+                            now_ms() + 4_000,
+                        );
+                        continue;
+                    }
+                    match error.status {
+                        429 => {
+                            context
+                                .routing
+                                .lock()
+                                .cooldowns
+                                .insert(candidate.account.id, now_ms() + 5_000);
+                            continue;
+                        }
+                        401 | 402 | 403 => {
+                            context
+                                .routing
+                                .lock()
+                                .cooldowns
+                                .insert(candidate.account.id, now_ms() + 60_000);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                return protocol.upstream_error(&error, &mut guard);
+            }
+        }
+    }
+    protocol.error(
+        last_status,
+        "no_available_account",
+        "该精确模型的账号暂时不可用，请刷新余额或重新登录",
+    )
+}
+
+async fn prime_response(
+    mut upstream: ProviderChat,
+    context: &GatewayContext,
+    candidate: &Candidate,
+) -> Result<ProviderChat, ProviderError> {
+    let first = tokio::select! {
+        _ = context.cancellation.cancelled() => return Err(ProviderError::new(503, "本地代理已停止")),
+        next = tokio::time::timeout(std::time::Duration::from_secs(180), upstream.stream.next()) => next.map_err(|_| ProviderError::new(504, "等待平台首个有效响应超时"))?,
+    };
+    match first {
+        Some(Ok(chunk)) => {
+            if !matching_upstream(&candidate.model, chunk.upstream_model.as_deref(), candidate.account.platform) {
+                let _ = context
+                    .manager
+                    .invalidate_model(
+                        &candidate.account.id,
+                        &candidate.model.id,
+                        "上游返回的模型身份与所选模型不一致",
+                    )
+                    .await;
+                return Err(ProviderError::new(502, "上游模型身份不一致"));
+            }
+            if chunk.data.get("error").is_some() {
+                return Err(ProviderError::new(502, "上游返回错误"));
+            }
+            Ok(ProviderChat {
+                stream: Box::pin(
+                    futures::stream::once(async move { Ok(chunk) }).chain(upstream.stream),
+                ),
+            })
+        }
+        Some(Err(error)) => Err(error),
+        None => Err(ProviderError::new(502, "上游未返回有效响应")),
+    }
+}
+
+fn matching_upstream(model: &ModelInfo, actual: Option<&str>, platform: Platform) -> bool {
+    // Qoder maps model keys server-side and always reports "auto" upstream, so
+    // identity confirmation is impossible by design; its catalog is trusted.
+    platform == Platform::Qoder
+        || actual.is_none_or(|actual| super::providers::identity_matches(model, actual))
+}
+
+fn normalized_chunk(data: Value, guard: &RequestGuard) -> Value {
+    let mut output = json!({"id": guard.id, "object": "chat.completion.chunk", "created": guard.created_at / 1000, "model": guard.model, "choices": data.get("choices").cloned().unwrap_or_else(|| json!([]))});
+    if let Some(usage) = data.get("usage") {
+        output["usage"] = usage.clone();
+    }
+    output
+}
+
+fn stream_response_for(
+    context: Arc<GatewayContext>,
+    model: ModelInfo,
+    mut upstream: ProviderChat,
+    mut guard: RequestGuard,
+    protocol: Protocol,
+) -> Response {
+    let request_id = guard.id.clone();
+    let stream = async_stream::stream! {
+        let mut messages = anthropic::MessageStream::new(guard.expose_thinking);
+        if matches!(protocol, Protocol::Messages) {
+            yield Ok::<_, std::convert::Infallible>(messages.start(&guard));
+        }
+        loop {
+            let next = tokio::select! {
+                _ = context.cancellation.cancelled() => {
+                    if matches!(protocol, Protocol::Messages) {
+                        yield Ok(anthropic::stream_error("本地代理已停止"));
+                    }
+                    break;
+                },
+                next = upstream.stream.next() => next,
+            };
+            match next {
+                Some(Ok(chunk)) if matching_upstream(&model, chunk.upstream_model.as_deref(), guard.account.platform) && chunk.data.get("error").is_none() => {
+                    guard.observe(&chunk.data);
+                    match protocol {
+                        Protocol::Openai => {
+                            let output = normalized_chunk(chunk.data, &guard);
+                            yield Ok(format!("data: {output}\n\n"));
+                        }
+                        Protocol::Messages => match messages.push(&chunk.data) {
+                            Ok(events) => for event in events { yield Ok(event); },
+                            Err(message) => {
+                                guard.set_status("error");
+                                yield Ok(anthropic::stream_error(message));
+                                break;
+                            }
+                        },
+                    }
+                }
+                Some(Ok(chunk)) => {
+                    if !matching_upstream(&model, chunk.upstream_model.as_deref(), guard.account.platform) {
+                        let _ = context.manager.invalidate_model(&guard.account.id, &model.id, "上游返回的模型身份与所选模型不一致").await;
+                    }
+                    guard.set_status("error");
+                    yield Ok(match protocol {
+                        Protocol::Openai => "data: {\"error\":{\"message\":\"上游流中断或模型不匹配\",\"code\":\"upstream_stream_error\"}}\n\n".to_string(),
+                        Protocol::Messages => anthropic::stream_error("上游流中断或模型不匹配"),
+                    });
+                    break;
+                }
+                Some(Err(error)) => {
+                    yield Ok(protocol.upstream_stream_error(error, &mut guard));
+                    break;
+                }
+                None => {
+                    match protocol {
+                        Protocol::Openai => {
+                            guard.set_status("success");
+                            yield Ok("data: [DONE]\n\n".to_string());
+                        }
+                        Protocol::Messages => match messages.finish() {
+                            Ok(events) => {
+                                guard.set_status("success");
+                                for event in events { yield Ok(event); }
+                            }
+                            Err(message) => {
+                                guard.set_status("error");
+                                yield Ok(anthropic::stream_error(message));
+                            }
+                        },
+                    }
+                    break;
+                }
+            }
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONNECTION, "keep-alive"),
+            (header::HeaderName::from_static("x-request-id"), request_id.as_str()),
+            (header::HeaderName::from_static("request-id"), request_id.as_str()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+#[derive(Default)]
+struct Completion {
+    content: String,
+    reasoning: String,
+    tools: std::collections::BTreeMap<u64, Value>,
+    finish: Option<Value>,
+    usage: Option<Value>,
+}
+
+impl Completion {
+    fn push(&mut self, data: &Value) {
+        if let Some(usage) = data.get("usage") {
+            self.usage = Some(usage.clone());
+        }
+        let Some(choice) = data
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|v| v.first())
+        else {
+            return;
+        };
+        if let Some(finish) = choice.get("finish_reason").filter(|v| !v.is_null()) {
+            self.finish = Some(finish.clone());
+        }
+        let Some(delta) = choice.get("delta").or_else(|| choice.get("message")) else {
+            return;
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            self.content.push_str(text);
+        }
+        if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+            self.reasoning.push_str(text);
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let target = self.tools.entry(index).or_insert_with(|| json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}));
+                for field in ["id", "type"] {
+                    if let Some(value) = call.get(field) {
+                        // TRAE continuation chunks can explicitly carry an empty ID.
+                        // It omits metadata for this fragment, not the existing call ID.
+                        if field == "id" && (value.is_null() || value.as_str() == Some("")) {
+                            continue;
+                        }
+                        target[field] = value.clone();
+                    }
+                }
+                if let Some(function) = call.get("function") {
+                    for field in ["name", "arguments"] {
+                        if let Some(part) = function.get(field).and_then(Value::as_str) {
+                            let current = target["function"][field].as_str().unwrap_or("");
+                            target["function"][field] = Value::String(format!("{current}{part}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn response(self, guard: &RequestGuard) -> Value {
+        let mut message = Map::new();
+        message.insert("role".into(), json!("assistant"));
+        message.insert(
+            "content".into(),
+            if self.content.is_empty() && !self.tools.is_empty() {
+                Value::Null
+            } else {
+                json!(self.content)
+            },
+        );
+        if !self.reasoning.is_empty() {
+            message.insert("reasoning_content".into(), json!(self.reasoning));
+        }
+        if !self.tools.is_empty() {
+            message.insert(
+                "tool_calls".into(),
+                json!(self.tools.into_values().collect::<Vec<_>>()),
+            );
+        }
+        let mut response = json!({"id": guard.id, "object": "chat.completion", "created": guard.created_at / 1000, "model": guard.model, "choices": [{"index": 0, "message": message, "finish_reason": self.finish.unwrap_or_else(|| json!("stop"))}]});
+        if let Some(usage) = self.usage {
+            response["usage"] = usage;
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+async fn collect_response(
+    context: Arc<GatewayContext>,
+    model: ModelInfo,
+    upstream: ProviderChat,
+    guard: RequestGuard,
+) -> Response {
+    collect_response_for(context, model, upstream, guard, Protocol::Openai).await
+}
+
+async fn collect_response_for(
+    context: Arc<GatewayContext>,
+    model: ModelInfo,
+    mut upstream: ProviderChat,
+    mut guard: RequestGuard,
+    protocol: Protocol,
+) -> Response {
+    let mut completion = Completion::default();
+    let mut received_bytes = 0usize;
+    loop {
+        let next = tokio::select! { _ = context.cancellation.cancelled() => return protocol.error(StatusCode::SERVICE_UNAVAILABLE, "gateway_stopped", "本地代理已停止"), next = upstream.stream.next() => next };
+        match next {
+            Some(Ok(chunk))
+                if matching_upstream(&model, chunk.upstream_model.as_deref(), guard.account.platform)
+                    && chunk.data.get("error").is_none() =>
+            {
+                received_bytes += chunk.data.to_string().len();
+                if received_bytes > 16 * 1024 * 1024 {
+                    guard.set_status("error");
+                    return protocol.error(
+                        StatusCode::BAD_GATEWAY,
+                        "response_too_large",
+                        "上游非流式响应超过内存保护上限",
+                    );
+                }
+                guard.observe(&chunk.data);
+                // Breadcrumb around the accumulate step: Completion::push merges
+                // streamed deltas into one growing Value, and a fault here would
+                // explain a crash on light traffic that request-volume stats miss.
+                crate::credits::trail::mark("completion.push");
+                completion.push(&chunk.data);
+            }
+            Some(Ok(chunk)) => {
+                if !matching_upstream(&model, chunk.upstream_model.as_deref(), guard.account.platform) {
+                    let _ = context
+                        .manager
+                        .invalidate_model(
+                            &guard.account.id,
+                            &model.id,
+                            "上游返回的模型身份与所选模型不一致",
+                        )
+                        .await;
+                }
+                guard.set_status("error");
+                return protocol.error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_model_mismatch",
+                    "上游返回错误或模型版本不匹配",
+                );
+            }
+            Some(Err(mut error)) => {
+                error.stage = "stream";
+                return protocol.upstream_error(&error, &mut guard);
+            }
+            None => {
+                let output = match protocol {
+                    Protocol::Openai => completion.response(&guard),
+                    Protocol::Messages => match anthropic::response(completion, &guard) {
+                        Ok(response) => response,
+                        Err(message) => {
+                            guard.set_status("error");
+                            return protocol.error(
+                                StatusCode::BAD_GATEWAY,
+                                "invalid_upstream_response",
+                                message,
+                            );
+                        }
+                    },
+                };
+                guard.set_status("success");
+                return Json(output).into_response();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::types::{CreditPack, CreditRegion, Platform, ProviderSnapshot};
+    use super::*;
+
+    fn account(id: &str, canonical: &str, expiry: i64) -> Account {
+        Account {
+            id: id.into(),
+            platform: Platform::Workbuddy,
+            region: CreditRegion::Cn,
+            user_id: id.into(),
+            label: id.into(),
+            enabled: true,
+            status: "ready".into(),
+            last_error: None,
+            snapshot: Some(ProviderSnapshot {
+                balance: Some(100.0),
+                unit: "credits".into(),
+                quota: None,
+                packs: vec![CreditPack {
+                    unit: "credits".into(),
+                    id: "pack".into(),
+                    name: "pack".into(),
+                    remaining: Some(100.0),
+                    expires_at: Some(expiry),
+                }],
+                rewards: vec![],
+                models: vec![ModelInfo {
+                    upstream_id: None,
+                    upstream_model_ids: vec![],
+                    id: canonical.into(),
+                    name: canonical.into(),
+                    canonical_id: Some(canonical.into()),
+                    supports_tools: true,
+                    context_window: None,
+                    context_window_options: vec![],
+                    max_output_tokens: None,
+                    supports_images: None,
+                    supports_reasoning: None,
+                    reasoning_effort_options: vec![],
+                    default_reasoning_effort: None,
+                    verified: true,
+                    verification_note: None,
+                }],
+                fetched_at: now_ms(),
+                stale: false,
+                diagnostic: None,
+                sync: super::super::types::SnapshotSync::default(),
+            }),
+        }
+    }
+
+    #[test]
+    fn authorization_requires_exact_bearer_key() {
+        let mut headers = HeaderMap::new();
+        assert!(!authorized(&headers, "secret"));
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert!(authorized(&headers, "secret"));
+        assert!(!authorized(&headers, "secreu"));
+        assert!(!authorized(&headers, ""));
+    }
+
+    #[test]
+    fn validation_rejects_endpoint_injection_and_validates_image_inputs() {
+        let valid = json!({"model": "glm-5.3", "messages": [{"role": "user", "content": "hello"}], "stream": true});
+        assert_eq!(validate_request(&valid).unwrap(), ("glm-5.3", true, false));
+        let mut injected = valid.clone();
+        injected["base_url"] = json!("https://attacker.invalid");
+        assert!(validate_request(&injected).is_err());
+        let mut image = valid;
+        image["messages"][0]["content"] =
+            json!([{"type": "image_url", "image_url": {"url": "https://example.invalid/image"}}]);
+        assert!(validate_request(&image).is_ok());
+        image["messages"][0]["content"][0]["image_url"]["url"] = json!("file:///tmp/image.png");
+        assert!(validate_request(&image).is_err());
+        image["messages"][0]["content"][0]["image_url"]["url"] =
+            json!("data:image/png;base64,invalid base64");
+        assert!(validate_request(&image).is_err());
+    }
+
+    #[test]
+    fn store_option_only_allows_explicitly_disabling_storage() {
+        let mut request = json!({"model":"workbuddy/deepseek-v4.1-flash","messages":[{"role":"user","content":"hello"}],"stream":true});
+        assert_eq!(
+            validate_request(&request).unwrap(),
+            ("workbuddy/deepseek-v4.1-flash", true, false)
+        );
+        request["store"] = json!(false);
+        assert_eq!(
+            validate_request(&request).unwrap(),
+            ("workbuddy/deepseek-v4.1-flash", true, false)
+        );
+        for value in [
+            json!(true),
+            json!(null),
+            json!("false"),
+            json!(0),
+            json!({}),
+        ] {
+            request["store"] = value;
+            assert_eq!(
+                validate_request(&request).unwrap_err(),
+                "代理仅支持 store=false，不提供响应存储"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_choice_requires_an_available_named_function() {
+        let mut request = json!({"model":"workbuddy/glm-5.3","messages":[{"role":"user","content":"hello"}],
+            "tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"}}}],
+            "tool_choice":{"type":"function","function":{"name":"read_file"}}});
+        assert!(validate_request(&request).is_ok());
+        request["tool_choice"]["function"]["name"] = json!("missing");
+        assert!(validate_request(&request).is_err());
+        request["tool_choice"] = json!({"type":"unsupported"});
+        assert!(validate_request(&request).is_err());
+        request["tool_choice"] = json!("none");
+        assert!(validate_request(&request).is_ok());
+    }
+
+    #[test]
+    fn platform_models_are_callable_while_cross_platform_aliases_require_verification() {
+        let first = account("first", "glm-5.3", now_ms() + 10000);
+        let mut second = account("second", "glm-5.2", now_ms() + 5000);
+        assert_eq!(
+            candidates(
+                vec![first.clone(), second.clone()],
+                "glm-5.3",
+                false,
+                now_ms()
+            )
+            .len(),
+            1
+        );
+        second.snapshot.as_mut().unwrap().models[0].verified = false;
+        assert!(candidates(vec![second.clone()], "glm-5.2", false, now_ms()).is_empty());
+        assert_eq!(
+            candidates(vec![second], "workbuddy/glm-5.2", false, now_ms()).len(),
+            1
+        );
+        assert_eq!(
+            candidates(vec![first], "workbuddy/glm-5.3", true, now_ms()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn model_prefixes_select_one_platform_and_region_and_bare_aliases_stay_domestic() {
+        let mut accounts = Vec::new();
+        for platform in [Platform::Workbuddy, Platform::Traework, Platform::Qoder] {
+            for region in [CreditRegion::Cn, CreditRegion::Intl] {
+                let mut a = account(&platform.route_key(region), "glm-5.3", now_ms() + 10000);
+                a.platform = platform;
+                a.region = region;
+                accounts.push(a);
+            }
+        }
+        for a in &accounts {
+            let model = format!("{}/glm-5.3", a.platform.route_key(a.region));
+            let found = candidates(accounts.clone(), &model, true, now_ms());
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].account.id, a.id);
+        }
+        let bare = candidates(accounts, "glm-5.3", false, now_ms());
+        assert_eq!(bare.len(), 3);
+        assert!(bare.iter().all(|entry| entry.account.region == CreditRegion::Cn));
+    }
+
+    #[test]
+    fn local_provider_validation_reports_the_parameter_error_instead_of_an_upstream_failure() {
+        let error = ProviderError { stage: "validation", ..ProviderError::new(400, "MiniMax Code 当前模型强制开启思考") };
+        let mut guard = RequestGuard::new(account("fixture", "glm-5.3", now_ms()));
+        for protocol in [Protocol::Openai, Protocol::Messages] {
+            let value = protocol.failure_value(&error, &mut guard);
+            assert_eq!(value["error"]["code"], "invalid_request");
+            assert_eq!(value["error"]["stage"], "validation");
+            assert!(value["error"]["message"].as_str().unwrap().contains("强制开启思考"));
+            assert!(value["error"]["message"].as_str().unwrap().contains("校验请求参数"));
+        }
+    }
+
+    #[test]
+    fn aggregates_fragmented_tool_calls_and_usage() {
+        let mut completion = Completion::default();
+        completion.push(&json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":"}}]}, "finish_reason": null}]}));
+        completion.push(&json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id":"", "function": {"arguments": "\"test.txt\"}"}}]}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 3}}));
+        let mut guard = RequestGuard::new(account("first", "glm-5.3", now_ms()));
+        guard.model = "glm-5.3".into();
+        let response = completion.response(&guard);
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"test.txt\"}"
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(response["usage"]["prompt_tokens"], 10);
+    }
+
+    #[test]
+    fn empty_tool_ids_do_not_erase_parallel_or_late_ids() {
+        let mut completion = Completion::default();
+        completion.push(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_a","function":{"name":"read","arguments":"{}"}},
+            {"index":1,"function":{"name":"read","arguments":"{}"}}
+        ]}}]}));
+        completion.push(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":null}, {"index":1,"id":"call_b"}
+        ]}}]}));
+        completion.push(&json!({"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":""}, {"index":1,"id":null}
+        ]},"finish_reason":"tool_calls"}]}));
+        assert_eq!(completion.tools.len(), 2);
+        assert_eq!(completion.tools[&0]["id"], "call_a");
+        assert_eq!(completion.tools[&1]["id"], "call_b");
+        assert_eq!(completion.tools[&0]["function"]["arguments"], "{}");
+        assert_eq!(completion.tools[&1]["function"]["arguments"], "{}");
+    }
+
+    fn test_context() -> Arc<GatewayContext> {
+        Arc::new(GatewayContext {
+            manager: CreditManager::test(),
+            key: "test-local-key".into(),
+            routing: Mutex::new(RoutingState::default()),
+            cancellation: CancellationToken::new(),
+        })
+    }
+
+    #[test]
+    fn routing_prioritizes_expiry_then_load_and_releases_leases() {
+        let context = test_context();
+        let now = now_ms();
+        let entries = candidates(
+            vec![
+                account("first", "glm-5.3", now + 10000),
+                account("second", "glm-5.3", now + 10000),
+            ],
+            "glm-5.3",
+            false,
+            now,
+        );
+        let (first, mut lease) = select_candidate(&context, &entries, None).unwrap_ready();
+        lease.context = Some(context.clone());
+        let (second, mut second_lease) = select_candidate(&context, &entries, None).unwrap_ready();
+        second_lease.context = Some(context.clone());
+        assert_ne!(first.account.id, second.account.id);
+        drop(lease);
+        assert_eq!(context.routing.lock().loads[&first.account.id], 0);
+        let mut earlier = entries;
+        earlier[0].expiry = now + 1000;
+        assert_eq!(
+            select_candidate(&context, &earlier, None).unwrap_ready().0.account.id,
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_exposes_route_capacities_and_keeps_unknown_output_limits_unknown() {
+        let manager = CreditManager::test();
+        for (id, context, output) in [("wide", 1_000_000, 32_768), ("narrow", 512_000, 8192)] {
+            let mut account = account(id, "shared", now_ms() + 60_000);
+            let model = &mut account.snapshot.as_mut().unwrap().models[0];
+            model.context_window = Some(context);
+            model.max_output_tokens = Some(output);
+            manager.store.save_account(&account).unwrap();
+        }
+        let mut minimax = account("minimax", "MiniMax-M3.1-Flash", now_ms() + 60_000);
+        minimax.platform = Platform::MinimaxCode;
+        let model = &mut minimax.snapshot.as_mut().unwrap().models[0];
+        model.context_window = Some(1_000_000);
+        model.verified = false;
+        manager.store.save_account(&minimax).unwrap();
+        let status = manager.gateway.start(manager.clone(), 0).await.unwrap();
+        let http = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(3)).build().unwrap();
+        let key = manager.gateway_key().unwrap();
+        let catalog: Value = http.get(format!("{}/models", status.base_url)).bearer_auth(&key)
+            .send().await.unwrap().json().await.unwrap();
+        for id in ["workbuddy/shared", "shared"] {
+            let entry = catalog["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
+            assert_eq!(entry["context_window"], 512_000);
+            assert_eq!(entry["max_output_tokens"], 8192);
+        }
+        let entry = catalog["data"].as_array().unwrap().iter().find(|entry| entry["id"] == "minimax-code/MiniMax-M3.1-Flash").unwrap();
+        assert_eq!(entry["context_window"], 1_000_000);
+        assert!(entry.get("max_output_tokens").is_none());
+        // Unknown capacity in one eligible account cannot inherit another account's limit.
+        manager.store.save_account(&account("unknown", "shared", now_ms() + 60_000)).unwrap();
+        let catalog: Value = http.get(format!("{}/models", status.base_url)).bearer_auth(&key)
+            .send().await.unwrap().json().await.unwrap();
+        for id in ["workbuddy/shared", "shared"] {
+            let entry = catalog["data"].as_array().unwrap().iter().find(|entry| entry["id"] == id).unwrap();
+            assert!(entry.get("context_window").is_none());
+            assert!(entry.get("max_output_tokens").is_none());
+        }
+        manager.gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn localhost_lifecycle_authentication_and_schema_errors() {
+        let manager = CreditManager::test();
+        let gateway = GatewayManager::new();
+        let occupied = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        assert!(gateway.start(manager.clone(), occupied_port).await.is_err());
+        assert!(!gateway.status(occupied_port).running);
+        assert!(gateway.status(occupied_port).last_error.is_some());
+        drop(occupied);
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        assert!(status.running);
+        assert_ne!(status.port, 0);
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let root = format!("http://127.0.0.1:{}", status.port);
+        assert_eq!(
+            http.get(format!("{root}/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            http.get(format!("{root}/v1/models"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let key = manager.gateway_key().unwrap();
+        let models = http
+            .get(format!("{root}/v1/models"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+        assert_eq!(models.json::<Value>().await.unwrap()["data"], json!([]));
+        let unknown = http.post(format!("{root}/v1/chat/completions")).bearer_auth(&key)
+            .json(&json!({"model": "glm-unknown", "messages": [{"role": "user", "content": "hello"}]})).send().await.unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let invalid = http.post(format!("{root}/v1/chat/completions")).bearer_auth(&key)
+            .json(&json!({"model": "glm-unknown", "messages": [], "base_url": "https://invalid.test"})).send().await.unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(!gateway.stop().await.unwrap().running);
+        assert!(http.get(format!("{root}/health")).send().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_response_cancels_upstream_and_releases_account() {
+        struct PendingUpstream(Arc<std::sync::atomic::AtomicBool>);
+        impl futures::Stream for PendingUpstream {
+            type Item = Result<super::super::providers::ChatChunk, ProviderError>;
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for PendingUpstream {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        for protocol in [Protocol::Openai, Protocol::Messages] {
+            let context = test_context();
+            let candidate = candidates(
+                vec![account("first", "glm-5.3", now_ms() + 10000)],
+                "glm-5.3",
+                false,
+                now_ms(),
+            );
+            let (candidate, mut guard) = select_candidate(&context, &candidate, None).unwrap_ready();
+            guard.context = Some(context.clone());
+            guard.model = "glm-5.3".into();
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let response = stream_response_for(
+                context.clone(),
+                candidate.model,
+                ProviderChat {
+                    stream: Box::pin(PendingUpstream(dropped.clone())),
+                },
+                guard,
+                protocol,
+            );
+            drop(response);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(context.routing.lock().loads["first"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_upstream_model_revokes_verification_and_returns_error() {
+        let context = test_context();
+        let account = account("first", "glm-5.3", now_ms() + 10000);
+        context.manager.store.save_account(&account).unwrap();
+        let model = account.snapshot.as_ref().unwrap().models[0].clone();
+        let mut guard = RequestGuard::new(account);
+        guard.context = Some(context.clone());
+        guard.model = "glm-5.3".into();
+        let upstream = ProviderChat {
+            stream: Box::pin(futures::stream::iter(vec![Ok(
+                super::super::providers::ChatChunk {
+                    data: json!({"choices": [{"delta": {"content": "wrong-model-output"}, "finish_reason": "stop"}]}),
+                    upstream_model: Some("glm-5.2".into()),
+                },
+            )])),
+        };
+        let response = collect_response(context.clone(), model, upstream, guard).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            !context
+                .manager
+                .store
+                .account("first")
+                .unwrap()
+                .snapshot
+                .unwrap()
+                .models[0]
+                .verified
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("wrong-model-output"));
+    }
+
+    #[tokio::test]
+    async fn first_stream_error_preserves_safe_rejection_without_assuming_transport_safety() {
+        let context = test_context();
+        let candidate = candidates(
+            vec![account("first", "glm-5.3", now_ms() + 10000)],
+            "glm-5.3",
+            false,
+            now_ms(),
+        )
+        .remove(0);
+        for rejected in [true, false] {
+            let upstream = ProviderChat {
+                stream: Box::pin(futures::stream::iter(vec![Err(ProviderError {
+                    status: 429,
+                    message: "test rejection".into(),
+                    rejected,
+                    retry_after_ms: None,
+                    pause_auto: false,
+                    ..ProviderError::new(502, "")
+                })])),
+            };
+            let error = match prime_response(upstream, &context, &candidate).await {
+                Ok(_) => panic!("error frame must be propagated before committing HTTP response"),
+                Err(error) => error,
+            };
+            assert_eq!(error.status, 429);
+            assert_eq!(error.rejected, rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_stream_content_is_preserved_in_order() {
+        let context = test_context();
+        let candidate = candidates(
+            vec![account("first", "glm-5.3", now_ms() + 10000)],
+            "glm-5.3",
+            false,
+            now_ms(),
+        )
+        .remove(0);
+        let upstream = ProviderChat {
+            stream: Box::pin(futures::stream::iter(["first", "second"].into_iter().map(
+                |text| {
+                    Ok(super::super::providers::ChatChunk {
+                        data: json!({"choices": [{"delta": {"content": text}}]}),
+                        upstream_model: Some("glm-5.3".into()),
+                    })
+                },
+            ))),
+        };
+        let mut primed = prime_response(upstream, &context, &candidate)
+            .await
+            .unwrap();
+        assert_eq!(
+            primed.stream.next().await.unwrap().unwrap().data["choices"][0]["delta"]["content"],
+            "first"
+        );
+        assert_eq!(
+            primed.stream.next().await.unwrap().unwrap().data["choices"][0]["delta"]["content"],
+            "second"
+        );
+    }
+
+    fn routed_test_manager() -> Arc<CreditManager> {
+        routed_test_manager_for(Platform::Workbuddy, CreditRegion::Cn)
+    }
+
+    fn routed_test_manager_for(platform: Platform, region: CreditRegion) -> Arc<CreditManager> {
+        let manager = CreditManager::test();
+        for (id, expiry) in [("first", 5000), ("second", 10000)] {
+            let mut account = account(id, "glm-5.3", now_ms() + expiry);
+            account.platform = platform;
+            account.region = region;
+            manager.store.save_account(&account).unwrap();
+            let credentials = super::super::types::Credentials {
+                region,
+                access_token: "fixture-secret-only-in-memory".into(),
+                refresh_token: None,
+                user_id: Some(id.into()),
+                device_id: None,
+                expires_at: None,
+                extra: json!({}),
+            };
+            manager
+                .secrets
+                .set(id, &serde_json::to_string(&credentials).unwrap())
+                .unwrap();
+        }
+        manager.provider.queue_test_chat("second", vec![Ok(super::super::providers::ChatChunk {
+            data: json!({"choices": [{"delta": {"content": "fallback reply"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 10, "completion_tokens": 3}}),
+            upstream_model: Some("glm-5.3".into()),
+        })]);
+        manager
+    }
+
+    fn fixture_chunks(
+        values: Vec<Value>,
+    ) -> Vec<Result<super::super::providers::ChatChunk, ProviderError>> {
+        values
+            .into_iter()
+            .map(|data| {
+                Ok(super::super::providers::ChatChunk {
+                    data,
+                    upstream_model: Some("glm-5.3".into()),
+                })
+            })
+            .collect()
+    }
+
+    fn messages_body(stream: bool) -> Value {
+        json!({"model":"workbuddy/glm-5.3","max_tokens":64,"messages":[{"role":"user","content":"hello"}],"stream":stream})
+    }
+
+    fn local_http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap()
+    }
+
+    fn regional_test_manager() -> Arc<CreditManager> {
+        let manager = CreditManager::test();
+        for platform in [Platform::Workbuddy, Platform::Traework, Platform::Qoder, Platform::MinimaxCode] {
+            for region in [CreditRegion::Cn, CreditRegion::Intl] {
+                let id = platform.route_key(region);
+                let mut a = account(&id, "glm-5.3", now_ms() + 10000);
+                a.platform = platform;
+                a.region = region;
+                a.user_id = "same-user-across-regions".into();
+                let model = &mut a.snapshot.as_mut().unwrap().models[0];
+                model.supports_images = Some(true);
+                model.supports_reasoning = Some(true);
+                manager.store.save_account(&a).unwrap();
+                let credentials = super::super::types::Credentials {
+                    region,
+                    access_token: format!("synthetic-{id}"),
+                    refresh_token: None,
+                    user_id: Some(a.user_id.clone()),
+                    device_id: None,
+                    expires_at: None,
+                    extra: json!({}),
+                };
+                manager.secrets.set(&id, &serde_json::to_string(&credentials).unwrap()).unwrap();
+            }
+        }
+        manager
+    }
+
+    #[tokio::test]
+    async fn eight_region_routes_preserve_protocol_tools_images_thinking_and_history() {
+        let manager = regional_test_manager();
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let http = local_http();
+        let key = manager.gateway_key().unwrap();
+        let listed: Value = http.get(format!("{}/models", status.base_url)).bearer_auth(&key)
+            .send().await.unwrap().json().await.unwrap();
+        assert_eq!(listed["data"].as_array().unwrap().len(), 9);
+        let image = "data:image/png;base64,iVBORw0KGgo=";
+        for platform in [Platform::Workbuddy, Platform::Traework, Platform::Qoder, Platform::MinimaxCode] {
+            for region in [CreditRegion::Cn, CreditRegion::Intl] {
+                let id = platform.route_key(region);
+                let requested = format!("{id}/glm-5.3");
+                assert!(listed["data"].as_array().unwrap().iter().any(|m| m["id"] == requested));
+                for endpoint in ["chat/completions", "messages"] {
+                    for streaming in [false, true] {
+                        manager.provider.queue_test_chat(&id, fixture_chunks(vec![
+                            json!({"choices":[{"delta":{"reasoning_content":"fixture thinking"}}]}),
+                            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_read","type":"function","function":{"name":"read","arguments":"{\"path\":\"sample.txt\"}"}}]},"finish_reason":"tool_calls"}]}),
+                        ]));
+                        let messages_protocol = endpoint == "messages";
+                        let mut body = if messages_protocol {
+                            json!({"max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"read sample"},{"type":"image","source":{"type":"url","url":image}}]}],
+                                "tools":[{"name":"read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]})
+                        } else {
+                            json!({"messages":[{"role":"user","content":[{"type":"text","text":"read sample"},{"type":"image_url","image_url":{"url":image}}]}],
+                                "tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}]})
+                        };
+                        body["model"] = json!(requested);
+                        body["stream"] = json!(streaming);
+                        if messages_protocol {
+                            body["thinking"] = json!({"type":"enabled"});
+                        }
+                        let response = http.post(format!("{}/{endpoint}", status.base_url)).bearer_auth(&key)
+                            .json(&body).send().await.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK, "{requested} {endpoint}");
+                        let text = response.text().await.unwrap();
+                        assert!(text.contains("call_read"), "{text}");
+                        assert!(text.contains("fixture thinking"), "{text}");
+                        assert_eq!(manager.provider.test_chat_calls().last(), Some(&id));
+                        let forwarded = manager.provider.test_chat_bodies().pop().unwrap();
+                        assert_eq!(forwarded["messages"][0]["content"][1]["image_url"]["url"], image);
+                        assert_eq!(forwarded["tools"][0]["function"]["name"], "read");
+
+                        // Send the matching tool result through the same platform/region route.
+                        manager.provider.queue_test_chat(&id, fixture_chunks(vec![json!({"choices":[{"delta":{"content":"toolkit-ok"},"finish_reason":"stop"}]})]));
+                        let followup = if messages_protocol {
+                            json!([{"role":"user","content":"read sample"},{"role":"assistant","content":[{"type":"tool_use","id":"call_read","name":"read","input":{"path":"sample.txt"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_read","content":"toolkit-ok"}]}])
+                        } else {
+                            json!([{"role":"user","content":"read sample"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_read","type":"function","function":{"name":"read","arguments":"{\"path\":\"sample.txt\"}"}}]},{"role":"tool","tool_call_id":"call_read","content":"toolkit-ok"}])
+                        };
+                        body["messages"] = followup;
+                        let response = http.post(format!("{}/{endpoint}", status.base_url)).bearer_auth(&key)
+                            .json(&body).send().await.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert!(response.text().await.unwrap().contains("toolkit-ok"));
+                        assert_eq!(manager.provider.test_chat_calls().last(), Some(&id));
+                    }
+                }
+            }
+        }
+        let history = manager.store.requests().unwrap();
+        assert_eq!(history.len(), 64);
+        for row in history {
+            assert!(row.model.starts_with(&format!("{}/", row.platform.route_key(row.region))));
+        }
+        gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn international_rejections_never_retry_domestic_accounts_in_either_protocol() {
+        for platform in [Platform::Workbuddy, Platform::Traework, Platform::Qoder] {
+            for endpoint in ["chat/completions", "messages"] {
+                let manager = regional_test_manager();
+                let id = platform.route_key(CreditRegion::Intl);
+                let mut rejection = ProviderError::new(429, "fixture quota rejected");
+                rejection.rejected = true;
+                manager.provider.queue_test_chat(&id, vec![Err(rejection)]);
+                let gateway = GatewayManager::new();
+                let status = gateway.start(manager.clone(), 0).await.unwrap();
+                let response = local_http().post(format!("{}/{endpoint}", status.base_url))
+                    .bearer_auth(manager.gateway_key().unwrap())
+                    .json(&json!({"model":format!("{id}/glm-5.3"),"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}))
+                    .send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(manager.provider.test_chat_calls(), vec![id]);
+                gateway.stop().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_preflight_reports_schema_paths_before_calling_any_provider() {
+        for endpoint in ["chat/completions", "messages"] {
+            let manager = routed_test_manager();
+            manager.provider.queue_test_chat("first", fixture_chunks(vec![json!({
+                "choices":[{"delta":{"content":"should not be called"},"finish_reason":"stop"}]
+            })]));
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let mut body = messages_body(false);
+            let schema = json!({"type":"object","properties":{"query":{"type":"strng"}}});
+            let path = if endpoint == "messages" {
+                body["tools"] = json!([{"name":"search","input_schema":schema}]);
+                "tools[0].input_schema.properties.query.type"
+            } else {
+                body["tools"] = json!([{"type":"function","function":{"name":"search","parameters":schema}}]);
+                "tools[0].function.parameters.properties.query.type"
+            };
+            let response = local_http().post(format!("{}/{endpoint}", status.base_url))
+                .bearer_auth(manager.gateway_key().unwrap()).json(&body).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = response.json::<Value>().await.unwrap();
+            assert!(error["error"]["message"].as_str().unwrap().contains(path), "{error}");
+            assert!(manager.provider.test_chat_calls().is_empty());
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_diagnostics_correlate_client_errors_with_history_without_body_leaks() {
+        for endpoint in ["chat/completions", "messages"] {
+            let manager = routed_test_manager();
+            manager.provider.queue_test_chat("first", vec![Err(ProviderError {
+                upstream_code: Some("11133".into()),
+                upstream_request_id: Some("req_upstream_123".into()),
+                ..ProviderError::new(400, "fixture-secret-upstream-body")
+            })]);
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let response = local_http().post(format!("{}/{endpoint}", status.base_url))
+                .bearer_auth(manager.gateway_key().unwrap()).json(&messages_body(true)).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let id = response.headers().get("x-request-id").expect("correlation header").to_str().unwrap().to_owned();
+            let error = response.json::<Value>().await.unwrap();
+            assert_eq!(error["request_id"], id);
+            assert_eq!(error["error"]["stage"], "response");
+            assert_eq!(error["error"]["upstream_code"], "11133");
+            assert_eq!(error["error"]["upstream_request_id"], "req_upstream_123");
+            assert!(error["error"]["message"].as_str().unwrap().contains(&id));
+            assert!(!error.to_string().contains("fixture-secret"));
+            let history = serde_json::to_value(manager.store.requests().unwrap()).unwrap();
+            let record = history.as_array().unwrap().iter().find(|record| record["id"] == id).unwrap();
+            assert_eq!(record["diagnostic"]["httpStatus"], 400);
+            assert_eq!(record["diagnostic"]["stage"], "response");
+            assert_eq!(record["diagnostic"]["upstreamCode"], "11133");
+            assert_eq!(record["diagnostic"]["upstreamRequestId"], "req_upstream_123");
+            assert!(!history.to_string().contains("fixture-secret"));
+            assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn late_diagnostics_survive_json_and_sse_without_retrying() {
+        for endpoint in ["chat/completions", "messages"] {
+            for stream in [false, true] {
+                let manager = routed_test_manager();
+                let mut chunks = fixture_chunks(vec![json!({"choices":[{"delta":{"content":"partial"}}]})]);
+                chunks.push(Err(ProviderError {
+                    upstream_code: Some("11148".into()),
+                    upstream_request_id: Some("req_late_123".into()),
+                    ..ProviderError::new(400, "fixture-secret-body")
+                }));
+                manager.provider.queue_test_chat("first", chunks);
+                let gateway = GatewayManager::new();
+                let status = gateway.start(manager.clone(), 0).await.unwrap();
+                let response = local_http().post(format!("{}/{endpoint}", status.base_url))
+                    .bearer_auth(manager.gateway_key().unwrap()).json(&messages_body(stream)).send().await.unwrap();
+                assert_eq!(response.status(), if stream { StatusCode::OK } else { StatusCode::BAD_REQUEST });
+                let id = response.headers()["x-request-id"].to_str().unwrap().to_owned();
+                let body = response.text().await.unwrap();
+                assert!(body.contains("11148") && body.contains("req_late_123") && body.contains(&id));
+                assert!(body.contains("\"stage\":\"stream\""));
+                assert!(!body.contains("fixture-secret") && !body.contains("message_stop") && !body.contains("[DONE]"));
+                if stream && endpoint == "messages" {
+                    assert!(body.contains("\"type\":\"api_error\""));
+                }
+                let history = manager.store.requests().unwrap();
+                let record = history.iter().find(|record| record.id == id).unwrap();
+                assert_eq!(record.diagnostic.as_ref().unwrap().stage, "stream");
+                assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
+                gateway.stop().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_combined_tool_schemas_are_forwarded_unchanged() {
+        let schema = json!({"type":"object","properties":{"query":{"type":["string","null"]}},
+            "oneOf":[{"required":["query"]},{"properties":{"filter":{"$ref":"#/$defs/filter"}}}],
+            "$defs":{"filter":{"type":"object","additionalProperties":true}},"x-extension":{"type":"custom"}});
+        for endpoint in ["chat/completions", "messages"] {
+            let manager = routed_test_manager();
+            manager.provider.queue_test_chat("first", fixture_chunks(vec![json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]})]));
+            let mut body = messages_body(false);
+            body["tools"] = if endpoint == "messages" { json!([{"name":"search","input_schema":schema}]) }
+                else { json!([{"type":"function","function":{"name":"search","parameters":schema}}]) };
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let response = local_http().post(format!("{}/{endpoint}", status.base_url))
+                .bearer_auth(manager.gateway_key().unwrap()).json(&body).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(manager.provider.test_chat_bodies()[0]["tools"][0]["function"]["parameters"], schema);
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn store_false_reaches_each_provider_without_requesting_storage() {
+        for platform in [Platform::Workbuddy, Platform::Traework, Platform::Qoder] {
+            let manager = routed_test_manager_for(platform, CreditRegion::Cn);
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let http = local_http();
+            let key = manager.gateway_key().unwrap();
+            let url = format!("{}/chat/completions", status.base_url);
+            let mut body = json!({
+                "model":format!("{}/glm-5.3",platform.key()),
+                "messages":[{"role":"user","content":"hello"}],
+                "max_completion_tokens":64,
+                "stream":true,
+                "stream_options":{"include_usage":true},
+                "tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object"},"strict":false}}],
+                "store":true
+            });
+            let response = http
+                .post(&url)
+                .bearer_auth(&key)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["message"],
+                "代理仅支持 store=false，不提供响应存储"
+            );
+            assert!(manager.provider.test_chat_calls().is_empty());
+            body["store"] = json!(false);
+            for stream in [false, true] {
+                body["stream"] = json!(stream);
+                manager.provider.queue_test_chat("first", fixture_chunks(vec![
+                    json!({"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}})
+                ]));
+                let response = http
+                    .post(&url)
+                    .bearer_auth(&key)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                if stream {
+                    let events = response.text().await.unwrap();
+                    assert!(events.contains("\"content\":\"hello\""));
+                    assert!(events.ends_with("data: [DONE]\n\n"));
+                } else {
+                    assert_eq!(
+                        response.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+                        "hello"
+                    );
+                }
+            }
+            assert_eq!(manager.provider.test_chat_calls(), vec!["first", "first"]);
+            for forwarded in manager.provider.test_chat_bodies() {
+                assert!(forwarded.get("store").is_none());
+                assert_eq!(forwarded["messages"], body["messages"]);
+                assert_eq!(forwarded["tools"], body["tools"]);
+                assert_eq!(forwarded["stream_options"], body["stream_options"]);
+                assert_eq!(forwarded["max_completion_tokens"], 64);
+            }
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_verification_errors_are_explicit_without_account_failover() {
+        for endpoint in ["chat/completions", "messages"] {
+            let manager = routed_test_manager();
+            manager.provider.queue_test_chat(
+                "first",
+                vec![Err(ProviderError::new(
+                    400,
+                    "上游通道校验未通过（代码 11128），请使用官方客户端或平台授权的接口",
+                ))],
+            );
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let response = local_http()
+                .post(format!("{}/{endpoint}", status.base_url))
+                .bearer_auth(manager.gateway_key().unwrap())
+                .json(&messages_body(true))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = response.json::<Value>().await.unwrap();
+            assert!(error["error"]["message"].as_str().unwrap().starts_with(super::super::providers::CHANNEL_VERIFICATION_ERROR));
+            if endpoint == "chat/completions" {
+                assert_eq!(error["error"]["code"], "upstream_channel_rejected");
+            }
+            assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn output_limit_errors_report_the_requested_value_and_channel_context() {
+        let manager = routed_test_manager();
+        for (id, context) in [("first", 96_000), ("second", 180_000)] {
+            let mut account = manager.store.account(id).unwrap();
+            account.snapshot.as_mut().unwrap().models[0].context_window = Some(context);
+            manager.store.save_account(&account).unwrap();
+        }
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let http = local_http();
+        let key = manager.gateway_key().unwrap();
+        for (endpoint, field) in [
+            ("messages", "max_tokens"),
+            ("chat/completions", "max_tokens"),
+            ("chat/completions", "max_completion_tokens"),
+        ] {
+            let mut body = json!({"model":"workbuddy/glm-5.3","messages":[{"role":"user","content":"hello"}],"stream":false});
+            body[field] = json!(384_000);
+            let response = http
+                .post(format!("{}/{endpoint}", status.base_url))
+                .bearer_auth(&key)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = response.json::<Value>().await.unwrap();
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            let message = error["error"]["message"].as_str().unwrap();
+            for detail in [field, "384000", "180000", "workbuddy/glm-5.3", "客户端"] {
+                assert!(message.contains(detail), "missing {detail}: {message}");
+            }
+        }
+        assert!(manager.provider.test_chat_calls().is_empty());
+
+        for (endpoint, field) in [
+            ("messages", "max_tokens"),
+            ("chat/completions", "max_tokens"),
+            ("chat/completions", "max_completion_tokens"),
+        ] {
+            manager.provider.queue_test_chat(
+                "first",
+                fixture_chunks(vec![
+                    json!({"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}),
+                ]),
+            );
+            let mut body = json!({"model":"workbuddy/glm-5.3","messages":[{"role":"user","content":"hello"}],"stream":false});
+            body[field] = json!(32_000);
+            let response = http
+                .post(format!("{}/{endpoint}", status.base_url))
+                .bearer_auth(&key)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                manager.provider.test_chat_bodies().last().unwrap()[field],
+                32_000
+            );
+        }
+        // An exact-boundary request must still route to the larger channel.
+        let response = http
+            .post(format!("{}/messages", status.base_url))
+            .bearer_auth(&key)
+            .json(&json!({"model":"workbuddy/glm-5.3","max_tokens":180_000,"messages":[{"role":"user","content":"hello"}],"stream":false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            manager.provider.test_chat_calls(),
+            ["first", "first", "first", "second"]
+        );
+        assert_eq!(
+            manager.provider.test_chat_bodies().last().unwrap()["max_tokens"],
+            180_000
+        );
+        gateway.stop().await.unwrap();
+    }
+
+    fn sse_events(body: &str) -> Vec<Value> {
+        body.split("\n\n")
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| {
+                let mut lines = frame.lines();
+                let name = lines.next().unwrap().strip_prefix("event: ").unwrap();
+                let event: Value =
+                    serde_json::from_str(lines.next().unwrap().strip_prefix("data: ").unwrap())
+                        .unwrap();
+                assert_eq!(name, event["type"].as_str().unwrap());
+                event
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reasoning_history_requires_an_assistant_string() {
+        let mut body = json!({"model":"glm-5.3","messages":[{"role":"assistant","content":"","reasoning_content":"history"}]});
+        assert!(validate_request(&body).is_ok());
+        body["messages"][0]["reasoning_content"] = json!(null);
+        assert!(validate_request(&body).is_err());
+        body["messages"][0]["reasoning_content"] = json!("history");
+        for role in ["user", "system", "tool"] {
+            body["messages"][0]["role"] = json!(role);
+            body["messages"][0]["tool_call_id"] = json!("shot");
+            assert!(validate_request(&body).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn zcode_long_history_over_four_mib_reaches_each_provider() {
+        let image_data = "AAAA".repeat(40_000);
+        let mut messages = vec![json!({"role":"user","content":"review the screenshots"})];
+        let mut openai = messages.clone();
+        for index in 0..35 {
+            let id = format!("shot_{index}");
+            let reasoning = format!("inspect screenshot {index}");
+            messages.push(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":reasoning,"signature":""},
+                {"type":"tool_use","id":id,"name":"Read","input":{}}
+            ]}));
+            messages.push(json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":image_data}}
+            ]}]}));
+            openai.push(
+                json!({"role":"assistant","content":"","reasoning_content":reasoning,"tool_calls":[
+                    {"id":id,"type":"function","function":{"name":"Read","arguments":"{}"}}
+                ]}),
+            );
+            openai.push(json!({"role":"tool","tool_call_id":id,"content":[
+                {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{image_data}")}}
+            ]}));
+        }
+        for platform in [Platform::Workbuddy, Platform::Traework, Platform::Qoder] {
+            let manager = routed_test_manager_for(platform, CreditRegion::Cn);
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap();
+            for messages_protocol in [true, false] {
+                manager.provider.queue_test_chat("first", fixture_chunks(vec![
+                    json!({"choices":[{"delta":{"content":"screenshots received"},"finish_reason":"stop"}]})
+                ]));
+                let mut body = json!({"model":format!("{}/glm-5.3",platform.key()),"max_tokens":64,"messages":if messages_protocol { &messages } else { &openai }});
+                if messages_protocol {
+                    body["stream"] = json!(true);
+                }
+                let bytes = serde_json::to_vec(&body).unwrap();
+                assert!(bytes.len() > 4 * 1024 * 1024);
+                let response = http
+                    .post(format!(
+                        "{}/{}",
+                        status.base_url,
+                        if messages_protocol {
+                            "messages"
+                        } else {
+                            "chat/completions"
+                        }
+                    ))
+                    .bearer_auth(manager.gateway_key().unwrap())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                if messages_protocol {
+                    assert_eq!(
+                        sse_events(&response.text().await.unwrap()).last().unwrap()["type"],
+                        "message_stop"
+                    );
+                } else {
+                    assert_eq!(
+                        response.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+                        "screenshots received"
+                    );
+                }
+            }
+            for body in manager.provider.test_chat_bodies() {
+                assert_eq!(body["messages"].as_array().unwrap().len(), 71);
+                for index in 0..35 {
+                    let assistant = &body["messages"][1 + 2 * index];
+                    let result = &body["messages"][2 + 2 * index];
+                    assert_eq!(
+                        assistant["reasoning_content"],
+                        format!("inspect screenshot {index}")
+                    );
+                    assert_eq!(assistant["content"], "");
+                    assert_eq!(result["tool_call_id"], format!("shot_{index}"));
+                    let url = result["content"][0]["image_url"]["url"].as_str().unwrap();
+                    assert!(url.starts_with("data:image/png;base64,"));
+                    assert_eq!(url.len(), "data:image/png;base64,".len() + image_data.len());
+                }
+            }
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_rejections_distinguish_size_json_and_content_type() {
+        let manager = routed_test_manager();
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let key = manager.gateway_key().unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let mut oversized = vec![b' '; 32 * 1024 * 1024 + 1];
+        oversized[..2].copy_from_slice(b"{}");
+        let oversized = bytes::Bytes::from(oversized);
+        for (path, messages_protocol) in [
+            ("messages", true),
+            ("v1/messages", true),
+            ("chat/completions", false),
+        ] {
+            let url = format!("{}/{path}", status.base_url);
+            for chunked in [false, true] {
+                let body = if chunked {
+                    reqwest::Body::wrap_stream(futures::stream::iter([Ok::<_, std::io::Error>(
+                        oversized.clone(),
+                    )]))
+                } else {
+                    oversized.clone().into()
+                };
+                let response = http
+                    .post(&url)
+                    .bearer_auth(&key)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+                let error = response.json::<Value>().await.unwrap();
+                assert_eq!(
+                    error["error"][if messages_protocol { "type" } else { "code" }],
+                    "request_too_large"
+                );
+                assert!(error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("32 MiB"));
+            }
+            let response = http
+                .post(&url)
+                .bearer_auth(&key)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body("{")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = response.json::<Value>().await.unwrap();
+            assert_eq!(error["error"]["message"], "请求 JSON 无效");
+            let response = http
+                .post(&url)
+                .bearer_auth(&key)
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert!(response.json::<Value>().await.unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("application/json"));
+        }
+        assert!(manager.provider.test_chat_calls().is_empty());
+        gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_images_reach_the_provider_in_user_messages_and_tool_results() {
+        for platform in [Platform::Workbuddy, Platform::Traework, Platform::Qoder] {
+            let manager = routed_test_manager_for(platform, CreditRegion::Cn);
+            let requested = format!("{}/glm-5.3", platform.key());
+            for _ in 0..2 {
+                manager.provider.queue_test_chat(
+                    "first",
+                    fixture_chunks(vec![
+                        json!({"choices":[{"delta":{"content":"image reply"},"finish_reason":"stop"}]}),
+                    ]),
+                );
+            }
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let http = local_http();
+            let key = manager.gateway_key().unwrap();
+            let image = json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"aW1hZ2U="}});
+            for (stream, messages) in [false, true].into_iter().zip([
+                json!([{"role":"user","content":[{"type":"text","text":"check this image"},image.clone()]}]),
+                json!([
+                    {"role":"user","content":"read the file"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"path":"image.jpg"}}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[image]}]},
+                ]),
+            ]) {
+                let response = http
+                    .post(format!("{}/messages", status.base_url))
+                    .header("x-api-key", &key)
+                    .json(&json!({"model":requested,"max_tokens":128000,"messages":messages,"thinking":{"type":"enabled"},"output_config":{"effort":"max"},"stream":stream}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                if stream {
+                    let events = sse_events(&response.text().await.unwrap());
+                    assert_eq!(events.last().unwrap()["type"], "message_stop");
+                    assert!(events.iter().any(|event| event["delta"]["text"] == "image reply"));
+                } else {
+                    let message = response.json::<Value>().await.unwrap();
+                    assert_eq!(message["content"][0]["text"], "image reply");
+                }
+            }
+            assert_eq!(manager.provider.test_chat_calls(), vec!["first", "first"]);
+            let bodies = manager.provider.test_chat_bodies();
+            let expected =
+                json!({"type":"image_url","image_url":{"url":"data:image/jpeg;base64,aW1hZ2U="}});
+            assert_eq!(bodies[0]["messages"][0]["content"][1], expected);
+            assert_eq!(bodies[1]["messages"][2]["content"][0], expected);
+            assert_eq!(bodies[1]["messages"][2]["tool_call_id"], "call_1");
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_http_auth_validation_and_sdk_base_url_alias() {
+        let manager = routed_test_manager();
+        manager.provider.queue_test_chat("first", fixture_chunks(vec![json!({"choices":[{"delta":{"content":"Messages reply","reasoning_content":"provider-only reasoning"},"finish_reason":"length"}],"usage":{"prompt_tokens":12,"completion_tokens":7}})]));
+        manager.provider.queue_test_chat(
+            "first",
+            fixture_chunks(vec![
+                json!({"choices":[{"delta":{"content":"Bearer reply"},"finish_reason":"stop"}]} ),
+            ]),
+        );
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let http = local_http();
+        let key = manager.gateway_key().unwrap();
+        let url = format!("{}/messages", status.base_url);
+        let malformed = http
+            .post(&url)
+            .header("x-api-key", &key)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            malformed.json::<Value>().await.unwrap()["error"]["type"],
+            "invalid_request_error"
+        );
+        let unauthorized = http
+            .post(&url)
+            .header("x-api-key", "wrong")
+            .json(&messages_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthorized.json::<Value>().await.unwrap()["error"]["type"],
+            "authentication_error"
+        );
+        let mut invalid = messages_body(false);
+        for (field, value) in [
+            ("top_k", json!(5)),
+            ("stop_sequences", json!(["END"])),
+        ] {
+            invalid[field] = value;
+            let response = http
+                .post(&url)
+                .header("x-api-key", &key)
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = response.json::<Value>().await.unwrap();
+            assert_eq!(error["type"], "error");
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            invalid.as_object_mut().unwrap().remove(field);
+        }
+        invalid["messages"][0]["content"] =
+            json!([{"type":"image","source":{"type":"url","url":"file:///tmp/a.png"}}]);
+        let response = http
+            .post(&url)
+            .header("x-api-key", &key)
+            .json(&invalid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(manager.provider.test_chat_calls().is_empty());
+        let response = http
+            .post(format!("{}/v1/messages", status.base_url))
+            .header("x-api-key", &key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&messages_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let message = response.json::<Value>().await.unwrap();
+        assert_eq!(message["type"], "message");
+        assert!(message["id"].as_str().unwrap().starts_with("msg_"));
+        assert_eq!(message["model"], "workbuddy/glm-5.3");
+        assert_eq!(
+            message["content"],
+            json!([{"type":"text","text":"Messages reply"}])
+        );
+        assert_eq!(message["stop_reason"], "max_tokens");
+        assert_eq!(
+            message["usage"],
+            json!({"input_tokens":12,"output_tokens":7})
+        );
+        let response = http
+            .post(&url)
+            .bearer_auth(&key)
+            .json(&messages_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["content"][0]["text"],
+            "Bearer reply"
+        );
+        // Claude-Code-style clients always send a reasoning configuration; the
+        // hint must be accepted (and dropped) instead of failing the request.
+        manager.provider.queue_test_chat("first", fixture_chunks(vec![json!({"choices":[{"delta":{"content":"thinking reply"},"finish_reason":"stop"}]})]));
+        let response = http
+            .post(&url)
+            .header("x-api-key", &key)
+            .json(&json!({"model":"workbuddy/glm-5.3","max_tokens":64,"messages":[{"role":"user","content":"hello"}],"thinking":{"type":"enabled"},"output_config":{"effort":"max"}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["content"][0]["text"],
+            "thinking reply"
+        );
+        // Existing OpenAI callers continue to authenticate with Bearer only.
+        let response = http.post(format!("{}/chat/completions", status.base_url)).header("x-api-key", &key).json(&json!({"model":"workbuddy/glm-5.3","messages":[{"role":"user","content":"hello"}]})).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_http_tool_roundtrip_and_sse_event_contract() {
+        let manager = routed_test_manager();
+        let chunks = vec![
+            json!({"choices":[{"delta":{"content":"I will check. "}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_","arguments":"{\"path\":"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"file","arguments":"\"a.txt\"}"}}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":6}}),
+        ];
+        manager
+            .provider
+            .queue_test_chat("first", fixture_chunks(chunks.clone()));
+        manager.provider.queue_test_chat("first", fixture_chunks(vec![json!({"choices":[{"delta":{"content":"after tool result"},"finish_reason":"stop"}]} )]));
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let http = local_http();
+        let key = manager.gateway_key().unwrap();
+        let url = format!("{}/messages", status.base_url);
+        let mut body = messages_body(true);
+        body["tools"] = json!([{"name":"read_file","input_schema":{"type":"object","properties":{"path":{"type":"string"}}},"cache_control":{"type":"ephemeral"}}]);
+        let response = http
+            .post(&url)
+            .header("x-api-key", &key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let stream = response.text().await.unwrap();
+        assert!(!stream.contains("[DONE]"));
+        assert!(!stream.contains("signature"));
+        let events = sse_events(&stream);
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            events[2]["delta"],
+            json!({"type":"text_delta","text":"I will check. "})
+        );
+        assert_eq!(events[4]["index"], 1);
+        assert_eq!(
+            events[4]["content_block"],
+            json!({"type":"tool_use","id":"call_1","name":"read_file","input":{}})
+        );
+        let input: Value =
+            serde_json::from_str(events[5]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(input, json!({"path":"a.txt"}));
+        assert_eq!(events[7]["delta"]["stop_reason"], "tool_use");
+        assert_eq!(
+            events[7]["usage"],
+            json!({"input_tokens":10,"output_tokens":6})
+        );
+        body["stream"] = json!(false);
+        body["messages"] = json!([
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":[{"type":"text","text":"I will check. "},{"type":"tool_use","id":"call_1","name":"read_file","input":input}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"file contents"}]},
+        ]);
+        let response = http
+            .post(&url)
+            .bearer_auth(&key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["stop_reason"],
+            "end_turn"
+        );
+        manager
+            .provider
+            .queue_test_chat("first", fixture_chunks(chunks));
+        body["messages"] = messages_body(false)["messages"].clone();
+        let response = http
+            .post(&url)
+            .header("x-api-key", &key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let message = response.json::<Value>().await.unwrap();
+        assert_eq!(message["stop_reason"], "tool_use");
+        assert_eq!(
+            message["content"][1],
+            json!({"type":"tool_use","id":"call_1","name":"read_file","input":{"path":"a.txt"}})
+        );
+        gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_stream_errors_do_not_finish_or_retry_committed_content() {
+        let manager = routed_test_manager();
+        let mut chunks = fixture_chunks(vec![json!({"choices":[{"delta":{"content":"partial"}}]})]);
+        chunks.push(Err(ProviderError {
+            status: 429,
+            message: "fixture-only error".into(),
+            rejected: true,
+            retry_after_ms: None,
+            pause_auto: false,
+            ..ProviderError::new(502, "")
+        }));
+        manager.provider.queue_test_chat("first", chunks);
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let response = local_http()
+            .post(format!("{}/messages", status.base_url))
+            .header("x-api-key", manager.gateway_key().unwrap())
+            .json(&messages_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = sse_events(&response.text().await.unwrap());
+        assert_eq!(events.last().unwrap()["type"], "error");
+        assert_eq!(events.last().unwrap()["error"]["type"], "api_error");
+        assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+        assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
+        gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_preserves_safe_first_frame_failover_and_model_identity_check() {
+        for (rejected, wrong_model) in [(true, false), (false, false), (false, true)] {
+            let manager = routed_test_manager();
+            let chunks = if wrong_model {
+                vec![Ok(super::super::providers::ChatChunk {
+                    data: json!({"choices":[{"delta":{"content":"wrong-model-content"}}]}),
+                    upstream_model: Some("glm-5.2".into()),
+                })]
+            } else {
+                vec![Err(ProviderError {
+                    status: 429,
+                    message: "test".into(),
+                    rejected,
+                    retry_after_ms: None,
+                    pause_auto: false,
+                    ..ProviderError::new(502, "")
+                })]
+            };
+            manager.provider.queue_test_chat("first", chunks);
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let response = local_http()
+                .post(format!("{}/messages", status.base_url))
+                .header("x-api-key", manager.gateway_key().unwrap())
+                .json(&messages_body(true))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if wrong_model {
+                    StatusCode::BAD_GATEWAY
+                } else if rejected {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+            let body = response.text().await.unwrap();
+            assert!(!body.contains("wrong-model-content"));
+            assert_eq!(
+                manager.provider.test_chat_calls(),
+                if rejected {
+                    vec!["first", "second"]
+                } else {
+                    vec!["first"]
+                }
+            );
+            if !rejected {
+                let error: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(error["type"], "error");
+            }
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_invalid_tool_arguments_return_an_error_in_both_modes() {
+        let manager = routed_test_manager();
+        for _ in 0..2 {
+            manager.provider.queue_test_chat("first", fixture_chunks(vec![json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{invalid"}}]},"finish_reason":"stop"}]} )]));
+        }
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        for stream in [false, true] {
+            let response = local_http()
+                .post(format!("{}/messages", status.base_url))
+                .header("x-api-key", manager.gateway_key().unwrap())
+                .json(&messages_body(stream))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if stream {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            let body = response.text().await.unwrap();
+            if stream {
+                let events = sse_events(&body);
+                assert_eq!(events.last().unwrap()["type"], "error");
+                assert!(!events.iter().any(|event| event["type"] == "message_stop"
+                    || event["type"] == "content_block_start"));
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["error"]["type"],
+                    "api_error"
+                );
+            }
+        }
+        assert!(manager
+            .store
+            .requests()
+            .unwrap()
+            .iter()
+            .all(|row| row.status == "error"));
+        gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn messages_gateway_cancellation_sends_error_and_releases_account() {
+        let context = test_context();
+        let entries = candidates(
+            vec![account("first", "glm-5.3", now_ms() + 10000)],
+            "glm-5.3",
+            false,
+            now_ms(),
+        );
+        let (candidate, mut guard) = select_candidate(&context, &entries, None).unwrap_ready();
+        guard.context = Some(context.clone());
+        guard.model = "glm-5.3".into();
+        let response = stream_response_for(
+            context.clone(),
+            candidate.model,
+            ProviderChat {
+                stream: Box::pin(futures::stream::pending()),
+            },
+            guard,
+            Protocol::Messages,
+        );
+        context.cancellation.cancel();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let events = sse_events(std::str::from_utf8(&bytes).unwrap());
+        assert_eq!(events.last().unwrap()["type"], "error");
+        assert!(!events.iter().any(|event| event["type"] == "message_stop"));
+        assert_eq!(context.routing.lock().loads["first"], 0);
+    }
+
+    #[tokio::test]
+    async fn fresh_catalog_model_is_listed_and_can_be_called_by_platform_id() {
+        let manager = routed_test_manager();
+        for mut account in manager.accounts().unwrap() {
+            account.snapshot.as_mut().unwrap().models[0].verified = false;
+            manager.store.save_account(&account).unwrap();
+        }
+        manager.provider.queue_test_chat("first", vec![Ok(super::super::providers::ChatChunk {
+            data: json!({"choices":[{"delta":{"content":"catalog model reply"},"finish_reason":"stop"}]}),
+            upstream_model: Some("glm-5.3".into()),
+        })]);
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let key = manager.gateway_key().unwrap();
+        let models = http
+            .get(format!("{}/models", status.base_url))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let ids: Vec<_> = models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["workbuddy/glm-5.3"]);
+        let body = json!({"model":"workbuddy/glm-5.3","messages":[{"role":"user","content":"hello"}],"stream":false});
+        let response = http
+            .post(format!("{}/chat/completions", status.base_url))
+            .bearer_auth(&key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+            "catalog model reply"
+        );
+        assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
+        let mut alias = body;
+        alias["model"] = json!("glm-5.3");
+        let response = http
+            .post(format!("{}/chat/completions", status.base_url))
+            .bearer_auth(&key)
+            .json(&alias)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
+        gateway.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_frame_rejection_fails_over_but_ambiguous_failure_does_not() {
+        for rejected in [true, false] {
+            let manager = routed_test_manager();
+            manager.provider.queue_test_chat(
+                "first",
+                vec![Err(ProviderError {
+                    status: 429,
+                    message: "fixture rejection".into(),
+                    rejected,
+                    retry_after_ms: None,
+                    pause_auto: false,
+                    ..ProviderError::new(502, "")
+                })],
+            );
+            let gateway = GatewayManager::new();
+            let status = gateway.start(manager.clone(), 0).await.unwrap();
+            let response = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(3)).build().unwrap()
+                .post(format!("{}/chat/completions", status.base_url)).bearer_auth(manager.gateway_key().unwrap())
+                .json(&json!({"model": "glm-5.3", "messages": [{"role": "user", "content": "hello"}], "stream": false})).send().await.unwrap();
+            assert_eq!(
+                response.status(),
+                if rejected {
+                    StatusCode::OK
+                } else {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+            );
+            let body = response.text().await.unwrap();
+            assert!(!body.contains("fixture-secret"));
+            assert_eq!(body.contains("fallback reply"), rejected);
+            assert_eq!(
+                manager.provider.test_chat_calls(),
+                if rejected {
+                    vec!["first", "second"]
+                } else {
+                    vec!["first"]
+                }
+            );
+            if rejected {
+                let history = manager.store.requests().unwrap();
+                let success = history.iter().find(|row| row.status == "success").unwrap();
+                assert_eq!(success.account_id, "second");
+                assert_eq!(success.input_tokens, Some(10));
+                assert_eq!(success.output_tokens, Some(3));
+            }
+            gateway.stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn never_switches_accounts_after_content_has_been_committed() {
+        let manager = routed_test_manager();
+        manager.provider.queue_test_chat(
+            "first",
+            vec![
+                Ok(super::super::providers::ChatChunk {
+                    data: json!({"choices": [{"delta": {"content": "first account reply"}}]}),
+                    upstream_model: Some("glm-5.3".into()),
+                }),
+                Err(ProviderError {
+                    status: 429,
+                    message: "late rejection".into(),
+                    rejected: true,
+                    retry_after_ms: None,
+                    pause_auto: false,
+                    ..ProviderError::new(502, "")
+                }),
+            ],
+        );
+        let gateway = GatewayManager::new();
+        let status = gateway.start(manager.clone(), 0).await.unwrap();
+        let response = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(3)).build().unwrap()
+            .post(format!("{}/chat/completions", status.base_url)).bearer_auth(manager.gateway_key().unwrap())
+            .json(&json!({"model": "glm-5.3", "messages": [{"role": "user", "content": "hello"}], "stream": true})).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("first account reply"));
+        assert!(body.contains("upstream_stream_error"));
+        assert!(!body.contains("fallback reply"));
+        assert!(!body.contains("[DONE]"));
+        assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
+        gateway.stop().await.unwrap();
+    }
+}

@@ -1,0 +1,176 @@
+# 积分与模型代理
+
+AI-Toolkit 的「积分与代理」页面管理 WorkBuddy、TRAE、Qoder、MiniMax Code 账号。当前版本包含 MiniMax Code 账号、签到与模型代理，并延续国际版实验性适配；区域、路由及验证边界见 [国际版适配状态](credits-international.md)。TRAE 国际模型协议仍待完整验证，当前未开放其模型目录与代理。账号积分保留在来源平台；本地网关转发模型请求并消耗对应账号的额度。
+
+当前说明对应 **v2.2.2**：`/v1/models` 返回已知的上下文与最大输出容量，多账号路由取共同最小值，缺失字段保持未知。继续支持 MiniMax Code 登录、余额、签到与双协议代理，以及账号区域隔离、无签名思考、工具定义预检、受限诊断、后台刷新和历史数据保留；两种代理协议支持 32 MiB 请求正文、图片与工具调用历史的转换。完整变更见 [更新记录](../CHANGELOG.md)。
+
+下图为 macOS v2.0.0 实际窗口截图，昵称和账号 ID 已打码。余额、领取状态和模型数量仅代表截图时的账户状态。
+
+![账户与积分面板，身份信息已打码](../assets/screenshots/credits-panel.png)
+
+## 添加账号与领取
+
+选择平台后使用网页登录授权，或导入自己的访问凭据。手动导入支持单个访问 Token 或包含 `accessToken`、`refreshToken`、`userId`、`deviceId`、`expiresAt`、`extra` 的 JSON；`expiresAt` 使用 Unix 毫秒。凭据存入系统钥匙串／凭据管理器，数据库只保存账号与积分元数据。
+
+TRAE CN「一键导入本机凭据」优先读取新版桌面应用的个人登录态，未找到桌面登录态时兼容 CLI 钥匙串凭据。桌面应用与旧企业 CLI 的登录态独立，旧 CLI 凭据过期不代表桌面账号已退出。导入后会验证身份并同步积分；同步失败时保留弹窗并显示实际原因。
+
+刷新余额会查询实时模型目录与领取资格。WorkBuddy 和 TRAE CN 查询签到奖励；Qoder 查询活动积分。兑换券单独显示，不能计为积分。TRAE 签到返回的每日奖励金额不能作为可消费余额。未知额度显示未知，失败时保留并标记旧快照。
+
+TRAE CN 的签到状态与领取使用官方客户端独立的 UG 网关 `https://api.trae.cn`，不随 OAuth 账号域名切换；`.com.cn` 账号同样通过该网关签到。身份验证、Token 刷新与账单查询继续使用账号所属域名。
+
+TRAE CN 签到金额仅使用平台返回的 `credits`，不重复累加会员奖励提示 `extra_credits`；缺少金额时保持未知。账号是否已签到以 `checked_in` 为准，`did_checked_in` 表示设备领取限制，不能据此确认当前账号已领取。设备受限时不可领取；已签到账号再次操作不会重复提交或累计奖励。
+
+Qoder CN 的[每日 100 Credits 活动](https://docs.qoder.cn/events/100credits)每天北京时间 10:00 开放新一轮领取，奖励领取后 30 天有效。刷新账户后，账户卡片的“领取积分”和顶部“一键领取积分”均直接调用官方活动接口，在 AI Toolkit 内完成领取并记录结果。活动 ID、名称、金额和领取资格来自当前账号的实时活动列表，不能用固定 ID 或活动入口链接推断领取资格。
+
+Qoder 活动请求携带已保存的设备身份及官方活动客户端请求头。本机已安装国内客户端或国内 CLI 的设备校验助手时，领取前通过该助手读取当前账号的设备凭据，无需启动 Qoder 界面；不伪造设备令牌，也不轮换设备身份。上游拒绝校验时保留失败原因。领取超时或返回待确认时只回查奖励和活动状态，不自动重复提交。
+
+Qoder 账户卡片与 TRAE 一样仅显示积分任务、金额及领取状态，不展示活动说明、规则入口、平台网页活动或优惠券。只有平台明确返回 `CLAIM_BENEFIT` 和 `CREDITS` 的任务才会由“一键领取积分”处理；兑换码、优惠券和查看详情活动不会被当作积分领取。
+
+MiniMax Code 支持国内、国际独立账号，可使用官方设备授权流程登录，或读取本机桌面端／`mcode` CLI 共用的 OAuth 凭据。默认路径为 `~/.minimax/auth/prod/{cn,en}/mcode-public/auth.json`，遵循 `MINIMAX_DATA_DIR`／`MAVIS_DATA_DIR`。本机导入只读取访问凭据，过期后重新读取官方客户端的有效登录态，不消耗其轮换刷新令牌；也可直接在 AI Toolkit 使用网页登录独立授权。
+
+MiniMax Code 的个人工作区余额来自会员账单汇总；每日签到通过官方 `signin/status` 与 `signin/claim` 接口在工具内完成，接入单账号、批量和定时领取。金额与资格来自实时七日面板，`bonus_points` 已包含在 `points`，不重复累计；已领取时跳过，返回不明确时只回查状态。模型目录从官方 `/archon/api/v1/config` 实时查询，只展示当前账号返回的 MiniMax 路由。模型代理使用对应区域的官方 managed Messages 接口，支持 Chat Completions／Messages 的 JSON 与 SSE，以及文本、图片、思考和工具调用历史转换。
+
+MiniMax Code 的模型 ID 形如 `minimax-code/MiniMax-M3`；国际账号使用 `minimax-code-intl/` 前缀，两个区域不混用。上下文与可选档位、思考开关和推理等级来自当前账号目录；默认选择当前账号目录声明的最高上下文档位，M3 与 M3.1-Flash 均默认 1M（用量较高），512K 保留为可选档位。旧接口可能仅给 M3 返回 400K 且省略可选档位，此时依据官方共享目录补齐 512K／1M；接口明确返回的账号档位列表继续优先，未知型号不套用此规则。固定窗口模型沿用其已声明上限。未返回的输出上限保持未知；图片与工具能力参考官方共享目录的明确条目。M3 使用 `on`／`off`，M3.1-Flash 使用目录列出的 effort；Messages 的 `thinking` 与 `output_config.effort` 在 MiniMax 路由中保留。工具参数分片保留真实调用 ID，并区分工具索引与思考／文本块序号；缓存读写 Token 按上游原生用量计入输入 Token。
+
+MiniMax-M3.1-Flash 强制使用 adaptive 思考，不接受 `thinking.type=disabled` 或 `reasoning_effort=none`。ZCode 3.17.2 的连接测试会取模型支持列表的第一个推理档位；自定义模型未声明档位时会发送 `disabled`，造成参数冲突。该模型需配置 `low`、`medium`、`high`、`xhigh`、`max` 等有效档位；连接测试使用 `low`。代理保留关闭请求的明确校验错误，不擅自将关闭改成开启；界面也会提示思考不可关闭。此类本地校验返回 `invalid_request` 与 `validation` 阶段，不再误报成上游响应失败。
+
+「一键领取积分」逐账号处理当前符合条件的奖励。自动领取默认关闭；开启后仅在应用运行期间按北京时间每日 10:30 检查并领取，10:30 前启动会等待到点，当天 10:30 后启动会补做检查，从托盘退出应用后停止。同一账号的任务串行执行，超时或状态不明确时先查询，不盲目重复领取。
+
+## 自动刷新
+
+各平台默认开启余额自动刷新，可在「同步与领取设置」关闭。自动刷新与自动领取分别控制，开启余额刷新不会自动领取积分。
+
+| 场景 | 同步策略 |
+| --- | --- |
+| 启动应用 | 先显示缓存；上次同步超过 1 分钟或没有缓存时，延迟约 5 秒并错开账户刷新 |
+| 正在查看积分与代理 | 余额每 5 分钟同步 |
+| 切换页面、窗口失去焦点或收起托盘 | 余额每 15 分钟同步 |
+| 返回页面、恢复窗口 | 上次成功同步超过 1 分钟时补刷余额 |
+| 本地代理请求结束 | 约 5 秒后补刷该账户，连续请求合并，普通自动查询间隔至少 60 秒 |
+| 登录、导入账户或手动刷新 | 同步余额、领取资格及模型目录 |
+| 领取积分后 | 同步全部信息；结果待确认或余额尚未变化时，15 秒后额外补查一次余额 |
+
+领取资格每 15 分钟、模型目录每 30 分钟独立同步；首次启动的过期缓存会一并更新。三个查询分别记录成功时间，单项失败保留该项旧数据，余额更新不会改变目录的更新时间。模型目录查询失败不会清空已保存的模型。
+
+后台调度在 Rust 中运行，关闭主窗口后继续；退出应用后停止。页面通过后台事件更新，并每 30 秒读取本地状态兜底，此轮询不会查询平台。睡眠唤醒和网络恢复只补做一次到期查询，不累计补发错过的任务。
+
+同一账户只执行一个刷新任务，同时最多刷新三个账户。手动操作复用正在进行的查询，并补齐尚未查询的内容。网络和平台异常按 1、2、5、15、30 分钟退避；限流遵守 `Retry-After`，手动操作也不能提前绕过。确认认证失败或凭据不可访问时暂停该账户自动查询，由主动刷新或重新登录恢复。所有后台操作保持系统凭据静默访问，不请求钥匙串交互。
+
+账户卡片显示上次成功同步时间、同步中和历史余额状态。实际余额到账时间以平台为准，客户端 Token 用量不会被换算成积分余额。
+
+## 选择目录模型与开启代理
+
+切换到「本地代理」可查看运行状态、Base URL、支持的协议与 API Key 复制入口；界面不显示实际密钥。
+
+![本地模型代理连接参数](../assets/screenshots/proxy-panel.png)
+
+连接账号并刷新模型目录后，在「本地代理」复制带平台前缀的模型 ID，例如 `workbuddy/glm-5.3-flash`。该 ID 指定来源平台及其目录中的模型，上游返回不同型号时代理会拒绝响应。目录发现不等同于推理或工具能力已经实测；普通调用会消耗来源平台额度。
+
+在账户的「可用模型」和代理的「查看模型」列表中，悬浮、聚焦或点击任意模型可展开信息卡，查看该账号通道的上下文窗口、最大输出 Token、图片输入、工具调用与思考输出标注。浮层会避开窗口边缘；按 Escape 或点击外部可关闭。数据来自账户模型目录，旧快照或平台未提供的字段显示“未知”，刷新账户后更新；不会把上下文窗口当作最大输出，也不按模型名称套用固定参数。视频与 PDF 当前显示“代理未开放”，避免与模型自身能力混淆。
+
+信息卡还展示「推理等级」及目录默认值，保留 `low`、`high`、`max`、`light`、`extra_high` 等通道原始名称并配中文说明。档位分别读取 WorkBuddy 的 `reasoning.supportedEfforts`、TRAE 的 `reasoning_effort_config.options` 和 Qoder 的 `thinking_config.enabled.efforts`；仅有思考输出标记或默认值时，不据此补出支持列表。此处展示通道目录能力，不修改客户端请求或代理的推理参数。
+
+各平台默认选择当前账号目录声明的最高上下文档位。WorkBuddy 国内、国际版与 MiniMax Code 从账号可选档位和已声明窗口中取最大值；不使用其他账号或固定猜测的档位。Qoder 优先从 `context_config` 或 `available_context_windows` 读取可选档位，选取最大值，并通过原生请求的 `parameters.context_length` 实际启用；不再仅使用旧的 `max_input_tokens` 输入预算。WorkBuddy 优先读取完整上下文字段，TRAE 优先读取 `context_window_tokens.max`。只有固定窗口的通道使用其已声明上限；没有目录数据时仍显示“未知”。更新应用后刷新账户目录，模型信息卡和代理请求使用同一份最大窗口配置。上下文选择不改变客户端的输出 Token 预算。
+
+模型信息卡分别展示带平台前缀的代理 ID、实际提交给平台的「调用 ID」和平台目录声明的「底层模型 ID」。目录提供具体型号或版本 ID 时完整展示，支持换行选中复制；未公开时标注「通道未公开具体版本 ID」。仅接受目录明确声明的底层版本，包括 TRAE 目录提供的 `__dev`／`__max` 变体；不会把路由键或 `ep-` 部署编号当作具体模型版本，也不根据显示名称拼接日期后缀。底层 ID 不改变调用路由；身份校验接受目录明确声明的版本 ID。
+
+开启代理后默认地址为 `http://127.0.0.1:17860/v1`。接口包括 `GET /health`、`GET /v1/models`、OpenAI Chat Completions 的 `POST /v1/chat/completions` 和 Anthropic Messages 的 `POST /v1/messages`。使用网关生成的 API Key：OpenAI 接口使用 `Authorization: Bearer <key>`；Messages 接口支持 `x-api-key` 或 Bearer。修改端口前停止代理；轮换密钥后更新客户端中的密钥。
+
+`GET /v1/models` 的每个路由可包含 `context_window` 与 `max_output_tokens` 扩展字段，分别表示上下文和最大输出 Token。仅返回所有可用账号都明确声明的正数容量，并取最小值；任一账号缺失时省略对应字段。平台前缀路由和已验证通用别名遵循同一规则，供客户端配置预算，不改写调用方指定的输出预算或真实截断原因。
+
+`workbuddy/<实际模型ID>`、`traework/<实际模型ID>`、`qoder/<实际模型ID>` 固定来源平台及国内区域；国际版使用对应的 `-intl/` 前缀，详见国际适配状态。准确的 `glm-<版本>` 别名在已验证支持同一型号的国内账号间调度，优先使用即将到期的积分。不同 GLM 版本不会合并。只有确认未执行的认证、限流或额度错误可以切换账号；开始返回内容后不重试。网络超时不会被当作尚未执行。
+
+请求记录保存来源账号、模型、结果、耗时与上游报告的 Token 数；失败时另存 HTTP 状态、失败阶段、上游业务错误码及上游提供的请求 ID。仅提取限定字段中的短标识符，不保存上游原始错误正文、请求正文、授权令牌或 API Key。Token 数不能直接换算为平台积分扣减。
+
+「最近请求」中的「错误详情」可展开查看上述诊断及代理请求 ID。上游失败的 JSON 响应和 SSE 错误事件也包含相同诊断，客户端只展示 `message` 时仍能看到错误码与请求 ID；`x-request-id` / `request-id` 响应头可关联本地记录。上游未提供的标识不补造，旧记录没有诊断时保持原有展示。错误阶段区分发送请求、接收上游响应和读取响应流；未知错误仍不自动重试，流已开始后的错误保持终止事件，不能当作完整成功回复。
+
+## 通用客户端配置
+
+1. 连接账号、刷新模型目录并开启代理。
+2. 在「本地代理」复制实际 Base URL、代理密钥和目录模型 ID。
+3. 在客户端的模型设置中添加自定义提供商，选择 OpenAI Chat Completions 或 Anthropic Messages，填写上述参数，再添加模型并启用。
+4. 先测试普通对话，再测试读取文件、修改文件及返回结果的工具调用任务。
+
+两种协议均使用上述带 `/v1` 的 Base URL；客户端分别请求 `/chat/completions` 或 `/messages`。代理支持文本、图片和工具调用；图片能否被模型理解取决于所选来源模型。不支持的内容或参数会返回明确错误。代理地址是模型服务地址，应填写到提供商的 Base URL 字段。
+
+Chat Completions 接口兼容 DeepSeek Harness 等客户端自动发送的 `store: false`，在本地消费该字段后再转发请求，无需修改客户端的兼容设置。代理不提供响应存储，`store: true` 或非布尔值会返回明确错误。
+
+两种协议均在转发前检查工具名称重复、指定工具缺失、强制工具调用时的空工具列表，以及常见 JSON Schema 关键字的结构和类型。错误会指出原协议字段位置，例如 `tools[0].input_schema.properties.query.type`，并在调用平台前返回 HTTP 400。校验参考 [JSON Schema Validation](https://json-schema.org/draft/2020-12/json-schema-validation) 与 [Core](https://json-schema.org/draft/2020-12/json-schema-core)，保留合法组合类型、布尔子 Schema、旧版 tuple items、`$ref` 和通道扩展；不请求引用 URL、不静默删除或改写定义，也不把历史工具参数套用到当前工具定义。这是结构预检，不等同于平台全部能力验证或完整的 Schema 语义验证。
+
+Qoder 通道会将 Chat Completions 的 `developer` 消息转为上游支持的 `system` 消息，并纳入原生请求的系统指令集合；消息正文、顺序和工具调用历史保持不变。Messages 客户端使用顶层 `system`，不经过 `developer` 角色路径。
+
+WorkBuddy 适配器对两段已实测触发通道拒绝的固定 DeepSeek Harness 系统模板做定点措辞调整：身份首句由 `powered by` 改为 `running on`，Web GUI 固定句中的 `the DeepSeek Harness Web GUI` 改为 `the Web GUI`。Harness 名称、运行时 URL 引用和其余系统指令保留，消息继续使用 `system` 优先级；用户消息、助手历史、工具定义与工具结果保持原样。这两处兼容只作用于 WorkBuddy 国内版的系统文本，覆盖字符串和文本块数组；社区定位见 [身份首句 PR #280](https://github.com/magpie-community/plugins/pull/280) 与 [Web GUI 模板 PR #293](https://github.com/magpie-community/plugins/pull/293)。
+
+其他 WorkBuddy 请求返回 HTTP 400、代码 `11128` 且明确说明 `Illegal API invocation from an unapproved channel` 或国际网关的 `request illegal` 时，代理返回 `upstream_channel_rejected` 并提示通道校验未通过，不自动重试或轮换账号。此时应使用官方客户端或平台授权的接口，也可自行选择其他可用通道。`11128` 的其他请求格式错误仍按普通上游错误处理，不将全部同码错误视为通道限制。国际网关返回 `11158` 时提示当前账号类型不支持该模型，可选择其他可用模型。
+
+### ZCode 图片与工具截图
+
+GLM-5.3-Flash 支持图像理解，见 [Qoder 官方模型目录](https://docs.qoder.cn/qoder/model-selector)。使用该模型时可以保留 ZCode 的图片输入能力。之前的 HTTP 400 来自代理未转换图片内容，不能据此判断模型没有视觉能力。
+
+Messages 接口接受用户附件和 `tool_result.content` 中的图片，将标准 `base64` 或 HTTP(S) URL 图片源转为 `image_url` 内容块，保留文本顺序、工具调用 ID 和错误标记。这套转换同时适用于 WorkBuddy、TRAE 和 Qoder。支持 JPEG、PNG、GIF 和 WebP，两种协议的请求正文总大小上限为 32 MiB，包含 base64 图片、工具定义和历史消息；视频与 PDF 输入不在本次图片兼容范围内。在 ZCode 中为所选视觉模型开启图片输入能力，例如 `workbuddy/glm-5.3-flash`、`traework/glm-5.3-flash` 和 `qoder/glm-5.3-flash`。
+
+超过正文上限时返回 HTTP 413 `request_too_large`，提示压缩图片或精简历史；JSON 格式无效返回 HTTP 400，未使用 `Content-Type: application/json` 返回 HTTP 415。这些入口错误发生在模型推理之前，不能据此判断模型是否支持图片。
+
+ZCode 历史中的无签名或空签名 `assistant.thinking` 块转换为独立的 `reasoning_content`，按原顺序保留思考文本，同时保留正文与工具调用。GLM 的历史思考字段见 [官方思考模式说明](https://docs.z.ai/guides/capabilities/thinking-mode)。带非空签名或加密的 Anthropic 思考块仍显式拒绝，不把它们当作普通文本或静默丢弃。
+
+Messages 请求设置 `thinking.type` 为 `enabled` 或 `adaptive`，且未设置 `thinking.display: omitted` 时，可在 JSON 或 SSE 响应中返回上游无签名思考块。空签名仅用于兼容无签名内容的往返，不代表 Anthropic 签名证明；默认请求不输出思考。流式响应先结束思考块，再输出正文和工具块；最终文本开始后又出现思考内容时明确报错。
+
+| 来源 | 图片与工具结果的上游格式 |
+| --- | --- |
+| WorkBuddy | 保留 OpenAI `image_url` 内容数组，用户附件与工具截图均保留图片和调用 ID。 |
+| TRAE | 文本字符串转为文本块，图片数组完整保留；工具调用转换为原生 `function_call`，同时保留工具结果的图片与调用 ID。 |
+| Qoder | 保留多模态 `content`/`contents`，并设置 `model_config.is_vl`。 |
+
+TRAE 工具流的后续分片带有空字符串或 `null` 的 `id` 时，代理将其视为该分片未提供 ID，保留先前的真实 ID；不会生成替代 ID。工具调用全程缺少 ID 或参数无效时仍返回明确错误。
+
+## 实现依据与验证边界
+
+协议参考固定为 [cpa-multi-plugins 208a4194](https://github.com/mmqz/cpa-multi-plugins/tree/208a4194e41cf4e6a3a92529fda8f3517df5ae44)。平台适配器直接请求官方来源，许可声明见 `src-tauri/src/credits/providers/NOTICE.md`。
+
+离线测试验证解析、签名、模型隔离、SSE、工具参数、数据库和本地网关。三平台真实账号的登录、领取、余额、GLM 选择与客户端编程闭环仍需通过应用授权实测；通过离线测试不能证明当前账号拥有 GLM 权限。无法直连或准确确认型号的路线必须保持未验证，不能宣称三平台 GLM 已全部可用。
+
+TRAE CN 3.4.2 的 macOS 桌面凭据读取、真实账号身份和积分余额查询已通过只读实测；该验证未执行领取或模型推理。
+
+Qoder 每日活动的请求与返回契约已核对官方活动页脚本及本机 Qoder CN 0.4.4 的活动日志。本机官方设备校验助手的无界面读取已通过实测；领取接口通过本地 HTTP 回归测试验证。当前 AI Toolkit 保存的 Qoder 账号存在钥匙串读取错误，尚未完成真实账号领取到账验证。
+
+本次修复已用本机 WorkBuddy 账号的 `workbuddy/glm-5.3-flash` 完成一次短文本 Messages 请求实测，返回 HTTP 200 和正常文本。网关状态、代理测试密钥和请求记录使用独立内存存储，未修改本机账号数据库；这不代表其他模型或三平台工具能力均已实测。
+
+Qoder 的 `qoder/glm-5.3-flash` 已通过当前运行代理的原生 `contents` 图片实测：用户附件和工具结果两种消息均返回 HTTP 200，准确识别了仅出现在图片中的随机五位数字。新的标准 Messages 图片转换、工具结果和 SSE 经过离线回归；仍需重新构建应用后验收 ZCode 完整会话，不能将这两次原生协议测试等同于新安装包的端到端验证。
+
+三平台的网关回归均检查实际交给适配器的图片内容、工具调用 ID、JSON 回复和 SSE 结束事件；WorkBuddy/TRAE 的适配器回归还覆盖纯图片、图文混排、远程图片和带错误标记的工具截图。WorkBuddy 本轮真实账号检查在读取系统钥匙串时被拒绝，未发出推理请求；WorkBuddy 与 TRAE 的实际图片理解仍需在重新构建应用并授权后验收。
+
+2026-10-22 已重放 DeepSeek Harness 的完整文本请求，保留 `developer` 角色、14 条消息和 44 个工具定义，修复后的 `qoder/deepseek-flash` 返回 HTTP 200 并正常结束 SSE；测试未执行模型工具。
+
+同日已用本机 `workbuddy/deepseek-v4.1-flash` 完成受控对照：原始 Harness 请求返回 `400/11128`，单独调整身份首句或 Web GUI 固定句仍被拒，两处同时调整后返回 HTTP 200，再换回原文恢复 `400/11128`。兼容加入适配器后，客户端原样提交相同的 14 条消息和 44 个工具定义，返回正常正文、思考内容与 SSE 结束事件；验证将最大输出限制为 512 Token。Harness 桌面端的实际请求也已完成，返回“WorkBuddy 已恢复”。
+
+WorkBuddy 工具闭环验证保留原有 44 个工具定义，追加一个只返回本地固定结果的验证工具，模型正常发起调用，回传对应工具结果后继续生成正确回复；两次请求均返回 HTTP 200，未执行用户项目的文件操作或命令。回归测试另覆盖系统文本字符串和文本块数组、系统优先级、历史思考、图片、工具调用 ID、原始内容保留与重复转换幂等性。这些验证针对当前本机账号、模型和已确认模板，不代表其他通道限制均已消除。
+
+长会话回归覆盖三平台、两种协议中大于 4 MiB 的 35 张历史图片及无签名思考块；超过 32 MiB 的固定长度和分块请求均返回协议对应的 HTTP 413 错误。2026-10-16 的 ZCode 失败请求保留原消息结构、以等长有效 base64 替换日志中脱敏图片后，共 5,190,794 字节、35 张图片、14 段无签名思考块，本地模拟上游重放返回 HTTP 200 并完成 SSE；这验证了入口和协议转换，不代表真实上游模型已经接受该完整历史。
+
+2026-10-16 已用真实 `traework/glm-5.3-flash` 的短工具生成请求复现：首片带完整 ID，后续参数片带空 ID。该真实响应经修复后的 JSON 与 Messages SSE 转换，均保留原 ID 和完整参数，SSE 正常结束；未执行工具或修改用户项目。这不等同于 ZCode 原完整任务已经运行通过。
+
+macOS 使用 Keychain，Windows 使用 Credential Manager，Linux 使用 Secret Service；凭据库不可用时返回明确错误，不退回明文文件。构建与测试命令：`pnpm check`、`cargo test --manifest-path src-tauri/Cargo.toml`、`pnpm tauri build`。Windows 安装包由现有 Windows CI 构建验证，本机 macOS 无法完成 Windows 运行验收。
+
+2026-11-05：MiniMax Code 国内账号的本机凭据读取、服务端身份、个人工作区积分余额和签到状态通过 Rust 适配器只读实测；未执行真实签到或推理。领取成功、已领取及结果不明确的回查路径经过本地 HTTP 回归，国内／国际账号的前端单项和批量领取经过组件测试。网页登录完整流程、国际真实账号与真实领取到账尚未实测。
+
+2026-11-05：MiniMax Code 当前国内账号的实时目录返回 MiniMax-M3.1-Flash（512K，可选 1M）与 MiniMax-M3（旧接口返回 400K、缺少档位；官方共享目录为 512K／1M，适配器已补齐并默认选择 1M）。在独立内存数据库、临时本地代理端口与测试密钥下，M3 已通过 Chat Completions JSON 工具调用及 Messages SSE 工具结果续写；M3.1-Flash 已通过 Messages JSON、低档推理请求。验证仅使用返回固定文本的工具描述，未执行外部工具或领取积分，未改写用户账号数据库。国际真实账号及图片理解仍未实测；图片内容转换、双协议 JSON／SSE 和国内／国际路由隔离经过离线回归。
+
+2026-11-05：通过 ZCode 3.17.2 随附 CLI 的官方 `provider/testModelConnectivity` 流程，用独立临时配置复现其原始 `thinking=disabled`／1 Token 探针。将该模型推理档位声明为 `low`、`medium`、`high`、`xhigh`、`max` 后，同一流程发送 `adaptive + low`，经当前本地代理返回 HTTP 200 和 `success=true`。原有 ZCode 配置已单独备份；此次调整仅作用于对应 MiniMax 模型的推理档位。
+
+2026-11-05：`GET /v1/models` 增加 `context_window` 与 `max_output_tokens` 扩展字段，分别反映当前路由的上下文和最大输出。相同路由包含多个可用账号时，只返回所有账号都明确声明的容量，并取最小值；任一账号缺失的容量保持未知。供 Harness 等客户端按实际目录配置预算，避免 1M 模型被客户端当作 32K 后将输出预算压到 1 Token。此扩展不改变调用方明确指定的输出预算或真实截断的结束原因。
+
+## 系统凭据授权弹窗
+
+凭据首次读取成功后只缓存在 Rust 后端内存中，退出应用后释放；macOS 共享凭据条目只读取、解码一次。启动、后台刷新、自动领取和代理请求均禁止钥匙串交互，需要授权时返回明确错误。只有点击“刷新”、登录等主动操作，才允许为共享条目请求一次授权。
+
+旧版本的账号凭据可能被拆成多条钥匙串记录，macOS 对每条记录分别授权，“始终允许”某一条不等于授权其余记录。旧条目现在只进行静默迁移，任何一块需要授权时，立即停止该账号的迁移并提示重新登录；不会逐块弹窗，也不会阻止已迁移账号使用。重新登录直接更新共享条目，不先读取旧分块；数据库保存失败时保留原凭据。
+
+本地代理 API Key 不属于平台账号。点击“一键开启代理”“复制 API Key”或“检测连接”时，只针对该密钥授权并迁移旧版记录；拒绝或取消后，可再次点击同一按钮重试。授权或写入失败时保留原密钥，不自动轮换，不要求重新登录平台账号，也不会读取其他账号的旧分块。迁移完成后复用内存缓存，后台请求仍禁止钥匙串交互。
+
+Token 更新使用 SecItemAdd/Update，删除通过元数据查询条目名称后调用 SecItemDelete，避免旧 keyring 实现更新／删除前先读取秘密数据而再次触发授权。静默访问使用 macOS 原生交互开关，进程内所有钥匙串调用串行化，结束后恢复开关，避免影响主动导入 TRAE CLI 凭据。Windows/Linux 保持原有系统凭据后端与分块布局。
+
+共享凭据库不可用或用户拒绝授权后，本次运行暂停系统凭据访问，直到下一次主动操作才重试。回归测试覆盖启动零授权请求、共享条目单次授权、旧分块失败隔离、重新登录及回滚、删除时不读取旧秘密数据；本机原生测试使用独立测试钥匙串验证锁定后连续 8 次读取直接返回权限错误，并检查交互开关及错误退出后的恢复。缓存不写入数据库或明文文件。这些修改需要重新构建的应用或更新安装包才会生效。
+
+macOS 的“始终允许”与应用的代码签名身份有关。已检查的本机开发程序和现装应用均使用 ad-hoc 签名，重新编译或更换安装包后仍可能需要首次授权；要让正式版本升级后继续被识别为同一应用，应使用稳定的 Developer ID Application 身份签名。`TAURI_SIGNING_PRIVATE_KEY` 只负责更新包校验，不能代替 macOS 应用签名；正式构建时安装相应证书并设置 `APPLE_SIGNING_IDENTITY`。见 [Apple 代码身份说明](https://developer.apple.com/library/archive/documentation/Security/Conceptual/CodeSigningGuide/AboutCS/AboutCS.html)和 [Tauri macOS 签名配置](https://v2.tauri.app/distribute/sign/macos/)。
+
+Windows 通过 [CredRead](https://learn.microsoft.com/windows/win32/api/wincred/nf-wincred-credreadw) 读取当前登录会话的凭据，正常读取不使用 macOS 的逐应用授权机制。Linux 的 Secret Service 在密钥环锁定时[可以弹出解锁窗口](https://specifications.freedesktop.org/secret-service/latest/unlocking.html)，是否自动解锁取决于桌面环境和登录配置。此处验证了缓存与失败暂停逻辑，没有在 Windows/Linux 实机验证系统弹窗行为。

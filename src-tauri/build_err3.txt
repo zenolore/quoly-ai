@@ -1,0 +1,22 @@
+   Compiling AiToolkit v2.2.2 (C:\Users\MyPC\ai-toolkit-src\AI-Toolkit-main\src-tauri)
+warning: unused variable: `run`
+   --> src\credits\oauth.rs:639:9
+    |
+639 |     let run = |cmd: &str, args: &[&str]| -> Option<String> {
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_run`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `next_retry_at` is never read
+   --> src\credits\mod.rs:498:29
+    |
+498 | ...                   next_retry_at = None;
+    |                       ^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+505 | ...                   next_retry_at = Some(now + retry_delays_ms[0]);
+    |                       ---------------------------------------------- `next_retry_at` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `AiToolkit` (lib) generated 2 warnings (run `cargo fix --lib -p AiToolkit` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 1m 20s

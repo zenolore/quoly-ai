@@ -1,0 +1,228 @@
+   Compiling AiToolkit v2.2.2-patch29 (C:\Users\MyPC\ai-toolkit-src\AI-Toolkit-main\src-tauri)
+error: prefix `nothing` is unknown
+  --> src\credits\store.rs:53:64
+   |
+53 |             -- and the daily report needs to tell "ran and got nothing" apart from
+   |                                                                ^^^^^^^ unknown prefix
+   |
+   = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+   |
+53 |             -- and the daily report needs to tell "ran and got nothing " apart from
+   |                                                                       +
+
+error: prefix `ran` is unknown
+  --> src\credits\store.rs:54:23
+   |
+54 |             -- "never ran".
+   |                       ^^^ unknown prefix
+   |
+   = note: prefixed identifiers and literals are reserved since Rust 2021
+help: consider inserting whitespace here
+   |
+54 |             -- "never ran ".
+   |                          +
+
+error: `and` is not a logical operator
+  --> src\credits\store.rs:53:56
+   |
+53 |             -- and the daily report needs to tell "ran and got nothing" apart from
+   |                                                        ^^^
+   |
+   = note: unlike in e.g., Python and PHP, `&&` and `||` are used for logical operators
+help: use `&&` to perform logical conjunction
+   |
+53 -             -- and the daily report needs to tell "ran and got nothing" apart from
+53 +             -- and the daily report needs to tell "ran && got nothing" apart from
+   |
+
+error: expected one of `!`, `)`, `,`, `.`, `::`, `?`, `{`, or an operator, found `nothing`
+  --> src\credits\store.rs:53:64
+   |
+53 |             -- and the daily report needs to tell "ran and got nothing" apart from
+   |                                                               -^^^^^^^ expected one of 8 possible tokens
+   |                                                               |
+   |                                                               help: missing `,`
+
+error: expected one of `!`, `)`, `,`, `.`, `::`, `?`, `{`, or an operator, found `" apart from
+                   -- "never`
+  --> src\credits\store.rs:53:71
+   |
+53 |               -- and the daily report needs to tell "ran and got nothing" apart from
+   |                                                                         ^
+   |                                                                         |
+   |                                                                         expected one of 8 possible tokens
+   |  _______________________________________________________________________help: missing `,`
+   | |
+54 | |             -- "never ran".
+   | |_____________________^ unexpected token
+
+error: expected one of `)`, `,`, `.`, `?`, or an operator, found `ran`
+  --> src\credits\store.rs:54:23
+   |
+54 |             -- "never ran".
+   |                      -^^^ expected one of `)`, `,`, `.`, `?`, or an operator
+   |                      |
+   |                      help: missing `,`
+
+error: expected one of `!`, `)`, `,`, `.`, `::`, `?`, `{`, or an operator, found `".
+                   CREATE TABLE IF NOT EXISTS credit_growth_runs (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       account_id TEXT NOT NULL,
+                       outcome TEXT NOT NULL,
+                       credits INTEGER NOT NULL DEFAULT 0,
+                       created_at INTEGER NOT NULL
+                   );
+                   CREATE INDEX IF NOT EXISTS credit_growth_runs_at
+                       ON credit_growth_runs(created_at);
+               "`
+  --> src\credits\store.rs:54:26
+   |
+54 |               -- "never ran".
+   |                            ^
+   |                            |
+   |                            expected one of 8 possible tokens
+   |  __________________________help: missing `,`
+   | |
+55 | |             CREATE TABLE IF NOT EXISTS credit_growth_runs (
+56 | |                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+57 | |                 account_id TEXT NOT NULL,
+...  |
+63 | |                 ON credit_growth_runs(created_at);
+64 | |         ",
+   | |_________^ unexpected token
+
+error[E0425]: cannot find value `got` in this scope
+  --> src\credits\store.rs:53:60
+   |
+53 |             -- and the daily report needs to tell "ran and got nothing" apart from
+   |                                                            ^^^ not found in this scope
+
+error[E0425]: cannot find value `nothing` in this scope
+  --> src\credits\store.rs:53:64
+   |
+53 |             -- and the daily report needs to tell "ran and got nothing" apart from
+   |                                                                ^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `ran` in this scope
+  --> src\credits\store.rs:54:23
+   |
+54 |             -- "never ran".
+   |                       ^^^ not found in this scope
+
+error: suffixes on string literals are invalid
+  --> src\credits\store.rs:31:17
+   |
+31 | /                 "
+32 | |             CREATE TABLE IF NOT EXISTS credit_accounts (
+33 | |                 id TEXT PRIMARY KEY, platform TEXT NOT NULL, region TEXT NOT NULL DEFAULT 'cn',
+34 | |                 user_id TEXT NOT NULL, metadata TEXT NOT NULL, UNIQUE(platform, region, user_id)
+...  |
+52 | |             -- claimed, tasks accepted, boxes opened) that are not a single reward,
+53 | |             -- and the daily report needs to tell "ran and got nothing" apart from
+   | |______________________________________________________^ invalid suffix `ran`
+
+error: suffixes on string literals are invalid
+  --> src\credits\store.rs:53:71
+   |
+53 |               -- and the daily report needs to tell "ran and got nothing" apart from
+   |  _______________________________________________________________________^
+54 | |             -- "never ran".
+   | |_____________________^ invalid suffix `never`
+
+error[E0061]: this method takes 1 argument but 5 arguments were supplied
+   --> src\credits\store.rs:30:14
+    |
+ 30 |                .execute_batch(
+    |                 ^^^^^^^^^^^^^
+ 31 | /                  "
+ 32 | |              CREATE TABLE IF NOT EXISTS credit_accounts (
+ 33 | |                  id TEXT PRIMARY KEY, platform TEXT NOT NULL, region TEXT NOT NULL DEFAULT 'cn',
+ 34 | |                  user_id TEXT NOT NULL, metadata TEXT NOT NULL, UNIQUE(platform, region, user_id)
+...   |
+ 52 | |              -- claimed, tasks accepted, boxes opened) that are not a single reward,
+ 53 | |              -- and the daily report needs to tell "ran and got nothing" apart from
+    | | ______________________________________________________________-_--------
+    | ||                                                              | |
+    | ||______________________________________________________________| unexpected argument #2
+    |  |                                                              unexpected argument #1 of type `bool`
+ 54 |  |             -- "never ran".
+    |  |                     - --- unexpected argument #4
+    |  |_____________________|
+    |                        unexpected argument #3
+    |
+note: method defined here
+   --> C:\Users\MyPC\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\rusqlite-0.32.1\src\lib.rs:555:12
+    |
+555 |     pub fn execute_batch(&self, sql: &str) -> Result<()> {
+    |            ^^^^^^^^^^^^^
+help: remove the extra arguments
+    |
+ 31 -                 "
+ 32 -             CREATE TABLE IF NOT EXISTS credit_accounts (
+ 33 -                 id TEXT PRIMARY KEY, platform TEXT NOT NULL, region TEXT NOT NULL DEFAULT 'cn',
+ 34 -                 user_id TEXT NOT NULL, metadata TEXT NOT NULL, UNIQUE(platform, region, user_id)
+ 35 -             );
+ 36 -             CREATE TABLE IF NOT EXISTS credit_snapshots (
+ 37 -                 account_id TEXT PRIMARY KEY, snapshot TEXT NOT NULL, updated_at INTEGER NOT NULL
+ 38 -             );
+ 39 -             CREATE TABLE IF NOT EXISTS credit_rewards (
+ 40 -                 id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL,
+ 41 -                 outcome TEXT NOT NULL, created_at INTEGER NOT NULL
+ 42 -             );
+ 43 -             CREATE TABLE IF NOT EXISTS credit_proxy_settings (
+ 44 -                 id INTEGER PRIMARY KEY CHECK(id=1), settings TEXT NOT NULL
+ 45 -             );
+ 46 -             CREATE TABLE IF NOT EXISTS credit_requests (
+ 47 -                 id TEXT PRIMARY KEY, account_id TEXT NOT NULL, summary TEXT NOT NULL,
+ 48 -                 created_at INTEGER NOT NULL
+ 49 -             );
+ 50 -             -- One row per growth-center pass per account. Kept separate from
+ 51 -             -- credit_rewards because a growth pass reports many things (travel
+ 52 -             -- claimed, tasks accepted, boxes opened) that are not a single reward,
+ 53 -             -- and the daily report needs to tell "ran and got nothing" apart from
+ 54 -             -- "never ran".
+ 31 +                 ".
+    |
+
+warning: variable does not need to be mutable
+   --> src\credits\gateway.rs:623:13
+    |
+623 |         let mut apply = |acc: &mut Acc| {
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src\credits\gateway.rs:651:9
+    |
+651 |     let mut finish = |mut acc: Acc| {
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused variable: `run`
+   --> src\credits\oauth.rs:639:9
+    |
+639 |     let run = |cmd: &str, args: &[&str]| -> Option<String> {
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_run`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `next_retry_at` is never read
+   --> src\credits\mod.rs:720:29
+    |
+720 | ...                   next_retry_at = None;
+    |                       ^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+744 | ...                   next_retry_at = Some(now + retry_delays_ms[0]);
+    |                       ---------------------------------------------- `next_retry_at` is overwritten here before the previous value is read
+    |
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+Some errors have detailed explanations: E0061, E0425.
+For more information about an error, try `rustc --explain E0061`.
+warning: `AiToolkit` (lib) generated 4 warnings
+error: could not compile `AiToolkit` (lib) due to 13 previous errors; 4 warnings emitted
