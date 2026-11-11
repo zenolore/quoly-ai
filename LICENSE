@@ -1,6 +1,10 @@
 MIT License
 
-Copyright (c) 2026 吴磊 (whyfail)
+Copyright (c) 2026 吴磊 (whyfail)   — 上游项目 AI Toolkit
+Copyright (c) 2026 zenolore        — Quoly AI 的修改与新增部分
+
+本软件包含两部分著作权：上游项目 AI Toolkit 与 Quoly AI 在其基础上的修改。
+两部分均以下列 MIT 条款授权。
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
