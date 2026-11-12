@@ -1566,7 +1566,19 @@ async fn messages(
 /// 16 MiB is still ~2000x the deepest JSON nesting a chat request reaches (a
 /// tool schema nests maybe 20 levels) and 16x the default stack, while costing
 /// an eighth of the reservation.
-const BODY_PARSE_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// 2026-11-13：仍是 0xc0000409。
+///
+/// 崩溃发生在「多个长请求并发」时（5 并发 × 200 秒必崩，2 并发 × 100 秒不崩），
+/// 异常码 0xc0000409 是 STATUS_STACK_BUFFER_OVERRUN，由栈守卫触发进程自杀。
+/// 16 MiB 的栈预留本身不是错误，但它是「每个大 body 一个 OS 线程」，
+/// 多线程叠加时 Windows 的提交上限（commit limit）会被顶穿，
+/// 表现就是整个进程瞬间消失、没有任何日志。
+///
+/// 降到 4 MiB：仍是默认栈的 8 倍，仍远高于真实 JSON 嵌套深度
+/// （聊天请求里 tool schema 最多 20 层，4 MiB 可容纳约 8000 层），
+/// 但把最坏情况的预留从 32 MiB 压到 8 MiB，且线程创建失败时能回退到
+/// 当前线程直接解析，而不是把整个请求判死。
+const BODY_PARSE_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Parsing threads are bounded: a burst of big bodies must not turn into a burst
 /// of 16 MiB stacks plus a burst of parsed `Value` trees (each ~15x its JSON).
@@ -1576,7 +1588,7 @@ const BODY_PARSE_STACK_BYTES: usize = 16 * 1024 * 1024;
 static BIG_BODY_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
 
 fn big_body_slots() -> &'static tokio::sync::Semaphore {
-    BIG_BODY_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(2))
+    BIG_BODY_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(3))
 }
 
 fn parse_json_on_big_stack(raw: &[u8]) -> Result<Value, String> {
@@ -1586,10 +1598,15 @@ fn parse_json_on_big_stack(raw: &[u8]) -> Result<Value, String> {
         return serde_json::from_slice(raw).map_err(|e| e.to_string());
     }
     let owned = raw.to_vec();
-    let handle = std::thread::Builder::new()
+    // 线程创建失败（内存/线程数受限）时不要判死整个请求：
+    // 直接在当前线程解析。body 已经没有更深的选择，但能解析出来就比 500 好。
+    let handle = match std::thread::Builder::new()
         .stack_size(BODY_PARSE_STACK_BYTES)
         .spawn(move || serde_json::from_slice::<Value>(&owned).map_err(|e| e.to_string()))
-        .map_err(|e| format!("无法创建解析线程: {e}"))?;
+    {
+        Ok(h) => h,
+        Err(_) => return serde_json::from_slice(raw).map_err(|e| e.to_string()),
+    };
     handle
         .join()
         .map_err(|_| "请求解析线程异常退出".to_string())?
