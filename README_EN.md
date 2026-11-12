@@ -14,7 +14,7 @@
 
 [简体中文](README.md) · **English**
 
-[Website](https://luforge.com) · [Download](https://github.com/zenolore/quoly-ai/releases) · [Issues](https://github.com/zenolore/quoly-ai/issues) · [Changelog](CHANGELOG.md)
+[Website](https://quoly-ai.luforge.com) · [Download](https://github.com/zenolore/quoly-ai/releases) · [Issues](https://github.com/zenolore/quoly-ai/issues) · [Changelog](CHANGELOG.md)
 
 **The author uses this every day. Last 7 days: 55,671 requests, 9.9 billion tokens —
 every feature here was ground out of real use, not a demo.**

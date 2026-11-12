@@ -39,7 +39,7 @@ import { shellApi } from '@/lib/api/shell';
  */
 
 const GITHUB_REPO_URL = 'https://github.com/zenolore/quoly-ai';
-const OFFICIAL_WEBSITE_URL = 'https://luforge.com';
+const OFFICIAL_WEBSITE_URL = 'https://quoly-ai.luforge.com';
 
 const copyText = async (text: string) => {
   try {
@@ -288,7 +288,7 @@ export function SettingsPanel({ theme }: SettingsPanelProps) {
                 onClick={() => void open(OFFICIAL_WEBSITE_URL)}
                 className="flex items-center gap-1 rounded-lg border border-slate-200/80 bg-white/70 px-2.5 py-1 text-[11px] font-medium text-slate-600 transition hover:bg-white dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300"
               >
-                luforge.com
+                quoly-ai.luforge.com
                 <ExternalLink size={10} />
               </Pressable>
             </Row>

@@ -35,7 +35,7 @@ type Tab = "home" | "mcp" | "skills" | "credits" | "changelog" | "settings" | "a
 const CreditsPanel = lazy(() => import("@/components/credits/CreditsPanel"));
 const ChangelogPanel = lazy(() => import("@/components/changelog/ChangelogPanel"));
 const GITHUB_REPO_URL = "https://github.com/zenolore/quoly-ai";
-const OFFICIAL_WEBSITE_URL = "https://luforge.com";
+const OFFICIAL_WEBSITE_URL = "https://quoly-ai.luforge.com";
 let startupUpdateCheckStarted = false;
 
 
@@ -352,7 +352,7 @@ const AboutTab: React.FC = () => {
                 onClick={() => open(OFFICIAL_WEBSITE_URL)}
                 className="glass-pill inline-flex items-center gap-1"
               >
-                官网 luforge.com
+                官网 quoly-ai.luforge.com
                 <ExternalLink size={10} />
               </Pressable>
               <Pressable
