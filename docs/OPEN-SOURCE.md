@@ -225,7 +225,7 @@ MIT 允许你卖这个软件，但有两个现实问题：
 
 1. **不要开公开 Issue**（会放大影响面）
 2. 通过 [GitHub Security Advisory](../../security/advisories/new) 私下报告
-3. 或者在官网 [luforge.com](https://luforge.com) 留言说明
+3. 或者在官网 [quoly-ai.luforge.com](https://quoly-ai.luforge.com) 留言说明
 
 确认后会在 `CHANGELOG.md` 记录修复，并按你的意愿署名致谢。
 
@@ -233,6 +233,6 @@ MIT 允许你卖这个软件，但有两个现实问题：
 
 <div align="center">
 
-[返回 README](../README.md) · [官网](https://luforge.com) · [问题反馈](../../issues)
+[返回 README](../README.md) · [官网](https://quoly-ai.luforge.com) · [问题反馈](../../issues)
 
 </div>

@@ -14,7 +14,7 @@
 
 **简体中文** · [English](README_EN.md)
 
-[官网](https://luforge.com) · [下载](https://github.com/zenolore/quoly-ai/releases) · [问题反馈](https://github.com/zenolore/quoly-ai/issues) · [更新日志](CHANGELOG.md)
+[官网](https://quoly-ai.luforge.com) · [下载](https://github.com/zenolore/quoly-ai/releases) · [问题反馈](https://github.com/zenolore/quoly-ai/issues) · [更新日志](CHANGELOG.md)
 
 **作者本人每天都在用。最近 7 天跑了 5.5 万次请求、消耗 99 亿 token ——
 这个项目的每个功能都是从真实使用里磨出来的。**
