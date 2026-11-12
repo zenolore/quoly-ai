@@ -364,6 +364,8 @@ fn parse_packs(v: &Value) -> Vec<CreditPack> {
                 remaining: num(p, &["remaining"]),
                 expires_at: p.get("expiresAt").or_else(|| p.get("expires_at")).and_then(epoch)
                     .or_else(|| (key == "userQuota").then(|| d.get("expiresAt").or_else(|| d.get("expires_at")).and_then(epoch)).flatten()),
+                total: num(p, &["total", "size", "capacity"]).map(|n| n.max(0.0)),
+                created_at: p.get("createdAt").or_else(|| p.get("created_at")).and_then(epoch),
             });
         }
     }
@@ -375,6 +377,8 @@ fn parse_packs(v: &Value) -> Vec<CreditPack> {
                 name: text(p, &["name"]).unwrap_or("赠送积分包".into()),
                 remaining: num(p, &["remaining"]),
                 expires_at: p.get("expiresAt").or_else(|| p.get("expires_at")).and_then(epoch),
+                total: num(p, &["total", "size", "capacity"]).map(|n| n.max(0.0)),
+                created_at: p.get("createdAt").or_else(|| p.get("created_at")).and_then(epoch),
             });
         }
     }

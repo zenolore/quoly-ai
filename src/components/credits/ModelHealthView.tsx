@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, AlertTriangle, CheckCircle2, Clock, Loader2, PauseCircle, RefreshCw, ShieldAlert,
 } from "lucide-react";
@@ -14,7 +14,10 @@ import { creditsApi, type ModelHealthReport } from "@/lib/api/credits";
  * the user's own workload experienced rather than an artificial probe.
  */
 
-const REFRESH_MS = 5000;
+// 5 秒对一张 60+ 行的表来说太快了：每次刷新都要重建所有行节点，WebView2
+// 的合成层在高频请求期间还要同时处理流式输出，两者叠在一起会把渲染线程压垮。
+// 15 秒既不影响「看一眼哪个模型在掉链子」，也给渲染留出喘息。
+const REFRESH_MS = 15_000;
 
 const platformLabel: Record<string, string> = {
   workbuddy: "WorkBuddy",
@@ -201,8 +204,15 @@ export function ModelHealthView({ proxyRunning }: { proxyRunning: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  // 卡住上一次刷新：后端在压测/重路由时 modelHealth() 可能要好几秒才回来，
+  // 而 setInterval 不管前一次有没有结束。5 秒一次、每次 8 秒的堆积会同时
+  // 挂住十几个未完成的 Promise，WebView2 的合成层跟着连着重排，
+  // 实测在 40+ 连续请求后整窗崩溃（0xc0000409 栈溢出）。
+  const inFlight = useRef(false);
 
   const load = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     try {
       const next = await creditsApi.modelHealth();
       setRows(next);
@@ -211,6 +221,7 @@ export function ModelHealthView({ proxyRunning }: { proxyRunning: boolean }) {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      inFlight.current = false;
       setLoading(false);
     }
   }, []);

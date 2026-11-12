@@ -337,7 +337,13 @@ export interface UsageStats {
   /** How many of today's requests reported a credit value (TRAE/Qoder do not). */
   todayCreditCoverage: number;
   monthSpentCredits: number;
+  /** 本程序今天领到的奖励合计（只含经它自己之手领取的）。 */
   todayClaimedCredits: number;
+  /**
+   * 今天新发放资源包的总额，不区分领取者。
+   * 和 todayClaimedCredits 的差额就是「别的客户端领的 / 任务发的整包」。
+   */
+  todayNewPackCredits: number;
   todayClaimingAccounts: number;
   todayPendingClaims: number;
   todaySucceeded: number;

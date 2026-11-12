@@ -104,16 +104,21 @@ export function UsageTrend({ className }: Props) {
   }, [series]);
 
   const stacked = series.map((d) => d.cachedTokens + d.newPromptTokens + d.completionTokens + d.unmeasuredPromptTokens);
-  const maxTokens = Math.max(1, ...stacked);
-  const maxRequests = Math.max(1, ...series.map((d) => d.requests));
+  // 给峰值留 8% 头顶空间：niceTicks 取到的最大刻度可能正好等于峰值，柱子
+  // 就会贴死绘图区上沿，峰值本身也读不出"还有多少余量"。
+  const maxTokens = Math.max(1, ...stacked) * 1.08;
+  const maxRequests = Math.max(1, ...series.map((d) => d.requests)) * 1.08;
   const tokenTicks = niceTicks(maxTokens);
   const requestTicks = niceTicks(maxRequests);
   const tokenMax = tokenTicks[tokenTicks.length - 1] || 1;
   const requestMax = requestTicks[requestTicks.length - 1] || 1;
 
   const W = 720;
-  const H = 240;
-  const PAD = { top: 12, right: 46, bottom: 24, left: 52 };
+  const H = 248;
+  // top 从 12 提到 26：柱子按 tokenMax 归一化，峰值那天正好顶到绘图区上沿，
+  // 而顶部刻度文字也画在同一条线上，两者叠在一起看着像"被裁掉了"。
+  // 留出 26px 后最高柱子上方还有一圈空白，读数线也不会压在柱顶上。
+  const PAD = { top: 26, right: 46, bottom: 24, left: 52 };
   const plotW = W - PAD.left - PAD.right;
   const plotH = H - PAD.top - PAD.bottom;
 

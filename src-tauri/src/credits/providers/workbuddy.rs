@@ -202,6 +202,11 @@ async fn packs(client: &ProviderClient, c: &Credentials) -> Result<Vec<CreditPac
                     .get("CycleEndTime")
                     .or_else(|| p.get("PackageEndTime"))
                     .and_then(epoch),
+                // 这两个字段是"今天新进多少分"的依据：包的大小 + 包的发放时刻。
+                // 平台对每个包都给，缺了就当未知，不拿 0 顶替（否则会把今天的
+                // 进账算少）。
+                total: num(p, &["CycleCapacitySize", "CapacitySize"]).map(|n| n.max(0.0)),
+                created_at: p.get("CreateTime").and_then(epoch),
             });
         }
         if rows.len() < 100 || num(d, &["TotalCount"]).is_some_and(|n| out.len() as f64 >= n) {
@@ -313,6 +318,11 @@ fn international_packs(paid: &[Value], free: &[Value]) -> Result<Vec<CreditPack>
                 unit: "credits".into(),
                 remaining,
                 expires_at: ["DeductionEndTime", "ExpiredTime", "CycleEndTime"]
+                    .iter()
+                    .find_map(|key| epoch(&row[*key])),
+                total: num(row, &["CycleCapacitySize", "CapacitySize", "CycleRemainCapacity"])
+                    .map(|n| n.max(0.0)),
+                created_at: ["CreateTime", "DeductionStartTime"]
                     .iter()
                     .find_map(|key| epoch(&row[*key])),
             }))

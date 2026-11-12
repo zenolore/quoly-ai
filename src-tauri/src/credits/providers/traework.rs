@@ -783,6 +783,10 @@ fn parse_packs(v: &Value) -> (Vec<CreditPack>, Option<String>) {
                         .map(|(n, u)| (n - u).max(0.0).round()),
                     expires_at: b.get("end_time").and_then(epoch),
                     unit: "credits".into(),
+                    // TRAE 的额度是"上限 - 已用"，没有单独的包大小字段；
+                    // 上限本身就是包的容量，起始时间取 begin_time。
+                    total: limit.map(|n| n.max(0.0)),
+                    created_at: b.get("begin_time").or_else(|| b.get("start_time")).and_then(epoch),
                 });
             }
             if let Some(l) = num(q, &["premium_model_fast_request_limit"]) {
@@ -861,6 +865,8 @@ fn parse_international_packs(v: &Value) -> (Vec<CreditPack>, Option<String>) {
                     .zip(used)
                     .map(|(l, u)| (l - u).max(0.0)),
                 expires_at: base.get("end_time").and_then(epoch),
+                total: (limit >= 0.0).then_some(limit),
+                created_at: base.get("begin_time").or_else(|| base.get("start_time")).and_then(epoch),
             });
             if limit < 0.0 {
                 notes.push(format!("{label}：不限"));

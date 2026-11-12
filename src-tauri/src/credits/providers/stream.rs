@@ -23,9 +23,15 @@ pub(super) async fn response(
     r: RequestBuilder,
     p: Platform,
 ) -> Result<ProviderChat, ProviderError> {
-    let r = tokio::time::timeout(std::time::Duration::from_secs(60), r.send())
+    // 这个超时只覆盖「连接 + 等平台把响应头吐出来」，不包括后面的流式读取
+    // （读取另有 180 秒的帧级超时）。原来是 60 秒，但推理模型首字延迟经常
+    // 突破一分钟：kimi-k3.1-pro、GLM-5.3-Thinking、DeepSeek-V4-Pro 在长
+    // 思考时 60-120 秒才发响应头，60 秒会把它当成上游失败直接掐掉，用户看到
+    // 的就是「对话久一点就断」。放宽到 180 秒与读取超时对齐，卡死时仍然会
+    // 在 3 分钟内报错，不会无限挂住。
+    let r = tokio::time::timeout(std::time::Duration::from_secs(180), r.send())
         .await
-        .map_err(|_| ProviderError::new(504, "等待平台响应超时"))?
+        .map_err(|_| ProviderError::new(504, "等待平台响应超时（180 秒）"))?
         .map_err(ProviderError::transport)?;
     if !r.status().is_success() {
         let status = r.status();

@@ -69,6 +69,14 @@ pub struct CreditPack {
     pub name: String,
     pub remaining: Option<f64>,
     pub expires_at: Option<i64>,
+    /// 平台发的这个包有多大（`CycleCapacitySize`）。没有它就算不出"今天新
+    /// 进了多少分"——剩余量只能说明还有多少，说不清是本来就有还是刚发的。
+    #[serde(default)]
+    pub total: Option<f64>,
+    /// 包的发放时间（`CreateTime`）。按北京时间自然日跟今天比，落在今天之后
+    /// 的包就是今天的进账，不管是我们领的还是别的客户端领的。
+    #[serde(default)]
+    pub created_at: Option<i64>,
 }
 fn credits_unit() -> String { "credits".into() }
 
@@ -499,7 +507,18 @@ pub struct UsageStats {
     /// Credits spent over the rolling 30-day window.
     pub month_spent_credits: f64,
     /// Credits actually claimed today, summed over every claim.
+    ///
+    /// 只统计**本程序**经手的签到与任务奖励。页面上原来把这个数字当成
+    /// 「今日已领」，但它漏掉了两件事：一是别的客户端（比如账号切换工具）
+    /// 领到的分，二是任务发放的整包积分。想看得准请配合
+    /// `today_new_pack_credits` 一起看，两个数加起来才是当天真正到账的量。
     pub today_claimed_credits: f64,
+    /// 今天新发放资源包的总额（按包的发放时间落在今天统计）。
+    ///
+    /// 这个数不区分是谁领的：平台今天给账号发了多少分，就是多少分。
+    /// 它和 `today_claimed_credits` 的差额就是「别的程序领的 / 任务发的整包」
+    /// 那部分，用户一眼能看出是不是有第二个工具在跑。
+    pub today_new_pack_credits: f64,
     /// How many distinct accounts claimed something today.
     pub today_claiming_accounts: u64,
     /// Rewards seen today that are claimable but not yet taken.
