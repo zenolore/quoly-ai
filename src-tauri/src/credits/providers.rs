@@ -447,10 +447,51 @@ fn upstream_body_error(status: u16, text: &str) -> ProviderError {
     if let Some((code, message)) = detail.as_ref().and_then(upstream_error_detail) {
         error.message = format!("平台拒绝（代码 {code}）：{message}");
     }
+    // 6004「您的使用量已超出频率限制，将在 2026-11-12 17:53:50 UTC+8 重置」
+    //
+    // 平台把这个账号下次能用该模型的具体时刻直接写在消息里。以前只按固定
+    // 4 秒退避，等于假装没看到——同一个账号会被反复挑选、反复拿到 6004，
+    // 把整轮选号的时间全浪费在这上面。解析出这个时刻并填进 `retry_after_ms`，
+    // 选号时就能跳过它直到真正恢复，把机会让给其他账号。
+    if let Some(msg) = detail.as_ref().and_then(|v| v["msg"].as_str()) {
+        if let Some(until) = parse_reset_at(msg) {
+            let wait = (until - typenum_now_ms()).max(1_000);
+            // 上限 24 小时：真出现离谱的时间戳时不要永久废掉一个账号。
+            error.retry_after_ms = Some(wait.min(86_400_000));
+        }
+    }
     if let Some(detail) = &detail {
         error = error.with_upstream_details(detail, None);
     }
     error
+}
+
+/// 从平台文案里取出「重置」时刻（毫秒时间戳）。
+///
+/// 形如 `您的使用量已超出频率限制，将在 2026-11-12 17:53:50 UTC+8 重置`。
+/// 只认带年份和时分的完整日期时间，避免把消息里的其他数字当时间。解析失败
+/// 返回 None，交给调用方用默认退避——不能因为文案微调就把限流当成功放过。
+fn parse_reset_at(message: &str) -> Option<i64> {
+    use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+    let at = message.find('在')? + '在'.len_utf8();
+    let rest = message.get(at..)?;
+    let end = rest.find('重')?;
+    let stamp = rest.get(..end)?.trim();
+    // 去掉时区后缀，统一按北京时间解读：平台返回的就是 UTC+8。
+    let stamp = stamp.split("UTC").next().unwrap_or(stamp).trim();
+    let naive = NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M"))
+        .ok()?;
+    let offset = FixedOffset::east_opt(8 * 3600)?;
+    Some(offset.from_local_datetime(&naive).single()?.timestamp_millis())
+}
+
+fn typenum_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 pub(super) fn http_error(status: u16) -> ProviderError {
     ProviderError {

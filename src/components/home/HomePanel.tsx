@@ -4,7 +4,6 @@ import {
   ChevronDown,
   ChevronRight,
   Coins,
-  Database,
   Gauge,
   LayoutDashboard,
   RefreshCw,
@@ -168,6 +167,10 @@ export default function HomePanel() {
     // Claimed credits come from the server rollup: it sums every claim in the
     // window, while the local `rewards` list only holds the newest 100 rows.
     const todayCredits = usage ? Number(usage.todayClaimedCredits) : 0;
+    // 今天平台实际发出的资源包总额，不管是谁领的。用户装了第二个签到工具时
+    // 这个数会明显大于 todayCredits，差额就是那个工具领的——见数值下面的注脚。
+    const todayNewPacks = usage ? Number(usage.todayNewPackCredits) : 0;
+    const otherClients = Math.max(0, todayNewPacks - todayCredits);
     const todayClaimed = usage ? Number(usage.todayClaimingAccounts) : 0;
     const todayPending = usage ? Number(usage.todayPendingClaims) : 0;
 
@@ -201,6 +204,8 @@ export default function HomePanel() {
       failed: usage ? Number(usage.todayFailed) : requests.length - succeeded,
       avgLatency,
       todayCredits,
+      todayNewPacks,
+      otherClients,
       todayClaimed,
       todayPending,
       totalBalance,
@@ -369,9 +374,11 @@ export default function HomePanel() {
             label="今日已领积分"
             value={formatInt(stats.todayCredits)}
             note={
-              stats.todayPending > 0
-                ? `${stats.todayClaimed} 个账号已领 · ${stats.todayPending} 待补领`
-                : `${stats.todayClaimed} 个账号已领 · 明细见下方`
+              stats.otherClients > 0
+                ? `另有 ${formatInt(stats.otherClients)} 分由其他客户端领到（平台今日共发出 ${formatInt(stats.todayNewPacks)} 分）`
+                : stats.todayPending > 0
+                  ? `${stats.todayClaimed} 个账号已领 · ${stats.todayPending} 待补领`
+                  : `${stats.todayClaimed} 个账号已领 · 明细见下方`
             }
             tone={stats.todayPending > 0 ? 'amber' : 'green'}
           />
@@ -422,13 +429,6 @@ export default function HomePanel() {
             value={stats.avgLatency != null ? `${formatInt(stats.avgLatency)}ms` : '—'}
             note={`成功 ${formatInt(stats.succeeded)} · 失败 ${formatInt(stats.failed)}`}
             tone={stats.failed > stats.succeeded ? 'amber' : 'green'}
-          />
-          <StatCard
-            icon={<Database size={12} />}
-            label="可领账号"
-            value={formatInt(stats.claimableAccounts)}
-            note={`共 ${stats.accounts.length} 个账号`}
-            tone={stats.claimableAccounts > 0 ? 'amber' : 'green'}
           />
         </div>
 

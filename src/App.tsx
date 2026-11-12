@@ -295,13 +295,12 @@ const AboutTab: React.FC = () => {
   const appVersion = useAppVersion();
 
   const features = [
-    "MCP 服务器统一管理，支持一键启用/禁用",
-    "Skills 技能同步到多个 AI 编程工具",
-    "WorkBuddy / TRAE / Qoder / MiniMax 多账号积分池",
-    "本地模型网关：所有账号汇聚成一个 OpenAI 兼容端点",
-    "自动扫描并导入现有工具配置",
-    "跨平台支持（macOS、Windows、Linux）",
-    "本地 SQLite 数据库存储，开箱即用",
+    "四个平台 101 个账号，额度合成一个端点，写完代码不会因为额度中断",
+    "早上自动领完签到与任务积分，任务接取与领取一并完成",
+    "73 个模型分布在四个平台上，账号限流自动换下一个并记住恢复时刻",
+    "推理模型的长思考完整等待 180 秒，不会因为生成慢被中途掐断",
+    "MCP 与 Skills 一键写入 25 种 AI 编程工具，不用改 JSON",
+    "每次请求的 token、耗时、积分消耗都记在本地，凭据加密存系统钥匙串",
   ];
 
   return (
@@ -340,11 +339,14 @@ const AboutTab: React.FC = () => {
               </Pressable>
             </div>
             <p className="text-sm leading-relaxed text-slate-500 dark:text-slate-400">
-              一款基于 Tauri 2 构建的跨平台桌面应用。把散落在 WorkBuddy、TRAE、Qoder、MiniMax
-              里的账号与额度集中到一处，自动领取每日积分，并通过本地网关把它们汇聚成
-              一个 OpenAI 兼容端点，任何 AI 编程工具都能直接调用。同时管理 25 种工具的
-              MCP 服务器与 Skills 技能。
+              把散落在 WorkBuddy、TRAE、Qoder、MiniMax 里的账号与额度集中到一处：
+              自动领取每日积分，通过本地网关汇聚成一个 OpenAI 兼容端点，任何 AI 编程工具都能直接调用。
+              某个账号额度耗尽时自动切换到下一个，写代码不会再被额度打断。
             </p>
+            <div className="mt-4 rounded-lg bg-emerald-500/8 px-3 py-2.5 text-xs leading-relaxed text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">
+              作者本人每天都在用：最近一周 5.5 万次请求、消耗 99 亿 token。
+              这个程序的每个功能都是从真实使用里磨出来的，每天还在改。
+            </div>
             <div className="mt-4 flex flex-wrap gap-2">
               <Pressable
                 onClick={() => open(OFFICIAL_WEBSITE_URL)}

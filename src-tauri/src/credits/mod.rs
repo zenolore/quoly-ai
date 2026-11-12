@@ -1324,6 +1324,31 @@ impl CreditManager {
         }
         stats.today_claiming_accounts = claiming_accounts.len() as u64;
 
+        // 今天新发放的资源包总额——不管是谁领的。
+        //
+        // 为什么需要这个：`today_claimed_credits` 只统计本程序经手的奖励，
+        // 用户装了第二个签到工具时那个工具领的分完全看不见，界面上就会
+        // 显得「怎么才这么点」。平台的包里带着发放时间，按自然日一筛就能
+        // 拿到"今天到账多少"，作为交叉验证的真值。
+        for account in self.store.accounts().unwrap_or_default() {
+            let Some(snapshot) = account.snapshot.as_ref() else {
+                continue;
+            };
+            for pack in &snapshot.packs {
+                let Some(created) = pack.created_at else {
+                    continue;
+                };
+                if created < day_start || created >= day_end {
+                    continue;
+                }
+                // 只认"新发出的包"：额度上限为 0 或缺失的不计，避免把平台
+                // 返回的占位条目算成进账。
+                if let Some(total) = pack.total.filter(|n| *n > 0.0) {
+                    stats.today_new_pack_credits += total;
+                }
+            }
+        }
+
         // Rates over the cache-reporting subset, plus the coverage that says how
         // much of today's traffic that subset represents. Together they replace
         // the old total-hits / total-prompt figure, which mixed measured and

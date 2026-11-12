@@ -77,9 +77,10 @@ function rateTone(rate: number | null): string {
 }
 
 function PlatformBlock({ data }: { data: PlatformClaims }) {
-  // Open by default when something needs attention.
-  const needsAction = data.claimed < data.accounts - data.alreadyClaimed;
-  const [open, setOpen] = useState(needsAction);
+  // 默认全部折叠。之前按「有没有未处理的账号」决定初始展开状态，结果 TRAE
+  // 那种大面积「无权益」的账号会让它自动展开成一张长列表，把下面三个平台
+  // 全顶到屏幕外。折叠着看四个平台一行一个，点开才是明细，这样更好扫。
+  const [open, setOpen] = useState(false);
 
   const segments = [
     { key: "claimed", count: data.claimed, label: "已领" },

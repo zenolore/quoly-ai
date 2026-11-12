@@ -186,16 +186,23 @@ struct RoutingState {
     /// hitting the account that already holds the upstream prompt cache. Value
     /// is `(account_id, expires_at)`.
     sticky: HashMap<String, (String, i64)>,
+    /// 每个账号最近一次被派上用场的时刻（毫秒）。
+    ///
+    /// 光看「当前并发数」不够：一个刚跑完长请求的账号并发已经归零，但它在
+    /// 上游的令牌桶刚被抽干，立刻再塞请求最容易换来 429。把「上次使用时刻」
+    /// 加进排序键，选号会优先挑闲得最久的那个，同一个模型的请求自然被摊到
+    /// 不同账号上，也顺带把单账号的频率压下来。
+    last_used: HashMap<String, i64>,
     sequence: u64,
 }
 
 /// Requests allowed to run simultaneously against one account. Upstreams meter
 /// per account, so a handful of parallel calls is enough to start earning 429s
 /// while adding nothing to perceived speed.
-const MAX_IN_FLIGHT_PER_ACCOUNT: usize = 3;
+const MAX_IN_FLIGHT_PER_ACCOUNT: usize = 2;
 /// Global ceiling across all accounts. Prevents a burst from occupying every
 /// account at once and starving the rest of the pool.
-const MAX_IN_FLIGHT_TOTAL: usize = 8;
+const MAX_IN_FLIGHT_TOTAL: usize = 16;
 /// How long a conversation stays bound to one account.
 const STICKY_TTL_MS: i64 = 30 * 60 * 1000;
 
@@ -1073,6 +1080,11 @@ fn select_candidate(
     // which keeps the upstream prompt cache warm and avoids re-billing the same
     // context on every turn. Cleared on failure so a dead account is not stuck
     // to the session.
+    //
+    // 亲和只在「这个号还接得住」时生效：一旦它并发满了、或者正在冷却，就
+    // 直接走下面的通用选号，把这一轮派给别的账号。原来的写法是满就跳过、
+    // 但粘性记录还留着，于是后续每一轮都在同一个号上撞墙；用户看到的是
+    // 「明明有 56 个号，却一直报并发已满」。宁可用一次冷缓存，也不要卡住。
     if let Some(key) = sticky_key {
         if let Some((account_id, until)) = routing.sticky.get(key) {
             if *until > now {
@@ -1088,27 +1100,36 @@ fn select_candidate(
                             .unwrap_or(0)
                             <= now
                     })
+                    .filter(|c| {
+                        routing.loads.get(&c.account.id).copied().unwrap_or(0)
+                            < MAX_IN_FLIGHT_PER_ACCOUNT
+                    })
                     .min_by_key(|c| c.expiry)
                 {
                     let candidate = candidate.clone();
-                    let load = routing.loads.entry(candidate.account.id.clone()).or_default();
-                    if *load < MAX_IN_FLIGHT_PER_ACCOUNT {
-                        *load += 1;
-                        routing.sequence += 1;
-                        let sequence = routing.sequence;
-                        routing
-                            .assigned
-                            .insert(candidate.account.id.clone(), sequence);
-                        drop(routing);
-                        return Selection::Ready(Box::new((
-                            candidate.clone(),
-                            RequestGuard::new(candidate.account),
-                        )));
-                    }
+                    *routing.loads.entry(candidate.account.id.clone()).or_default() += 1;
+                    routing
+                        .last_used
+                        .insert(candidate.account.id.clone(), now);
+                    routing.sequence += 1;
+                    let sequence = routing.sequence;
+                    routing
+                        .assigned
+                        .insert(candidate.account.id.clone(), sequence);
+                    drop(routing);
+                    return Selection::Ready(Box::new((
+                        candidate.clone(),
+                        RequestGuard::new(candidate.account),
+                    )));
                 }
+                // 粘着的号这一刻接不住，就换一个：清掉绑定，让下面的通用
+                // 选号重新挑。模型目录可能已经变了，留着旧绑定反而会一直
+                // 撞在同一个失败点。
+                routing.sticky.remove(key);
+            } else {
+                // Expired: forget the binding and fall through.
+                routing.sticky.remove(key);
             }
-            // Expired or unusable: forget the binding and fall through.
-            routing.sticky.remove(key);
         }
     }
 
@@ -1141,6 +1162,10 @@ fn select_candidate(
             (
                 c.expiry,
                 routing.loads.get(&c.account.id).copied().unwrap_or(0),
+                // 上次使用时刻：越小（越久没用）越优先。同一个模型的并发请求
+                // 因此会被推给不同的账号，而不是全砸在同一个号上把它的频率
+                // 打满。这也让「换个号再试」变成默认行为，而不是被动等超时。
+                routing.last_used.get(&c.account.id).copied().unwrap_or(0),
                 routing.assigned.get(&c.account.id).copied().unwrap_or(0),
             )
         })
@@ -1153,6 +1178,9 @@ fn select_candidate(
         .loads
         .entry(candidate.account.id.clone())
         .or_default() += 1;
+    routing
+        .last_used
+        .insert(candidate.account.id.clone(), now);
     routing.sequence += 1;
     let sequence = routing.sequence;
     routing
@@ -1731,7 +1759,10 @@ async fn protocol_request(
     // Waiting for a concurrency slot is bounded: after this many attempts the
     // request is answered with 429 + Retry-After so the client can back off
     // itself instead of hanging.
-    const MAX_SLOT_WAITS: u32 = 40;
+    // 40 × 250ms = 10 秒，对推理模型完全不够：一个 kimi-k3.1-pro 长请求
+    // 可能跑两分钟，这期间所有号都占着，10 秒等不到就直接 429。
+    // 240 × 250ms = 60 秒，让请求多等一会儿而不是立刻失败。
+    const MAX_SLOT_WAITS: u32 = 240;
     let mut slot_waits: u32 = 0;
     loop {
         let (candidate, guard) = match select_candidate(&context, &remaining, Some(&sticky_key)) {
@@ -1887,9 +1918,14 @@ async fn protocol_request(
                         Some("6004") | Some("1005") | Some("4008")
                     );
                     if model_limited {
+                        // 6004 的文案里带着「将在 X 重置」的具体时刻，上游把
+                        // 它当成 retry_after_ms 传下来。照着这个时间退避，别再
+                        // 用固定的 4 秒——4 秒后同一个号还是被拒，白白浪费一
+                        // 轮选号。拿不到时刻（文案变了）才退回 4 秒。
+                        let wait = error.retry_after_ms.filter(|ms| *ms > 0).unwrap_or(4_000);
                         context.routing.lock().model_backoff.insert(
                             (candidate.account.id.clone(), candidate.model.id.clone()),
-                            now_ms() + 4_000,
+                            now_ms() + wait,
                         );
                         continue;
                     }
