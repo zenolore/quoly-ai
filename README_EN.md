@@ -1,81 +1,151 @@
 <div align="center">
 
+<img src="assets/brand/icon-1024-transparent.png" width="128" alt="Quoly AI">
+
 # Quoly AI
 
-**One local gateway for every AI coding subscription you own**
+**Four AI platforms' quotas behind one endpoint — stop running out mid-task**
 
-MCP servers · Skills · Multi-account credits · Local model proxy
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
+[![Built with](https://img.shields.io/badge/built%20with-Tauri%202-orange)](https://tauri.app/)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Version](https://img.shields.io/badge/version-2.3.0-brightgreen)](https://github.com/zenolore/quoly-ai/releases)
+[![Stars](https://img.shields.io/github/stars/zenolore/quoly-ai?style=social)](https://github.com/zenolore/quoly-ai/stargazers)
+
+[简体中文](README.md) · **English**
+
+[Website](https://luforge.com) · [Download](https://github.com/zenolore/quoly-ai/releases) · [Issues](https://github.com/zenolore/quoly-ai/issues) · [Changelog](CHANGELOG.md)
+
+**The author uses this every day. Last 7 days: 55,671 requests, 9.9 billion tokens —
+every feature here was ground out of real use, not a demo.**
 
 </div>
 
 ---
 
-## What it is
+## What it solves
 
-Quoly AI is a desktop manager that pulls the credits, config and skills scattered
-across your AI coding tools into one place:
+If you pay for WorkBuddy, TRAE, Qoder and MiniMax at the same time, you've probably hit these:
 
-- **Multi-account credit pools** for WorkBuddy, TRAE, Qoder and MiniMax, with automatic daily claims
-- **Local model gateway** that merges every account into a single OpenAI-compatible endpoint
-- **MCP / Skills management** for 25 AI coding tools
-- **Usage tracking** — tokens, latency and credit spend logged locally per request
+- You run out of quota mid-refactor and have to stop until tomorrow
+- Four platforms, dozens of accounts, and you click claim buttons by hand every day
+- Every client needs its own API config; switching tools means starting over
+- No idea where your quota went, or how many tokens you actually burned
 
-## Supported platforms
+**Quoly AI puts all of it into one desktop app.**
 
-| Platform | Credit claims | Models |
-|---|---|---|
-| WorkBuddy | check-in + tasks + streaks | 38 |
-| TRAE | daily check-in | 22 |
-| Qoder | daily check-in | 11 |
-| MiniMax | daily check-in | 2 |
+## What it feels like
 
-## Quick start
+**With the local gateway running, any client needs exactly one config:**
 
-Start the local proxy, then point any OpenAI-compatible client at it:
-
-```
+```bash
 Base URL:  http://127.0.0.1:17860/v1
-API Key:   copy it from the Credits & Proxy page
-Model:     platform/model, e.g. workbuddy/deepseek-v4.1-flash
+API Key:   copy from the "Credits & Proxy" page
+Model:     workbuddy/deepseek-v4.1-flash
 ```
 
-Requests rotate across accounts by remaining balance.
+**That gives you 73 models** spread across 101 accounts. When an account runs out or gets rate-limited, the request rolls to the next one — and the reset time the platform reports in its limit response is remembered, so that account is skipped until it actually recovers.
 
-## Credits
+**Every morning** it claims the daily check-in and task credits on every platform. You don't touch it.
 
-Quoly AI is derived from [whyfail/AI-Toolkit](https://github.com/whyfail/AI-Toolkit) (MIT)
-and references protocol work from:
+## Real numbers from production
 
-- [smart-open/TraeWorkAssistant](https://github.com/smart-open/TraeWorkAssistant) (MIT)
-- cpa-multi-plugins (MIT, Copyright 2026 mmqz)
+One week on the author's own machine:
 
-Full attribution lives in [NOTICE.md](NOTICE.md). Upstream copyright notices are
-preserved in [LICENSE](LICENSE) as the MIT license requires.
+| Metric | Value |
+|---|---|
+| Requests (7d) | **55,671** |
+| Tokens (7d) | **9.9 billion** (~1.4B/day) |
+| Peak day | 3.0B tokens / 16,889 requests (2026-11-09) |
+| Accounts | **101** (WorkBuddy 56 / Qoder 21 / TRAE 18 / MiniMax 6) |
+| Models | **73** |
+| TRAE check-in | **5/18 succeed** (28%; the rest have no check-in activity on the platform side) |
 
-## Changes from upstream
+These change daily, because the project is still used and changed daily.
 
-- New brand identity and icons
-- TRAE check-in fix: lowercase `x-device-id` plus the full device header set
-- TRAE device-id rotation on 9074 (up to four rounds)
-- Built-in MiniMax model list when the live catalog is unavailable
-- "Today's claims" panel expanded by default
-- Updater and repository links point at this project
+## Four platforms, one entry point
+
+| Platform | Accounts | Credit claiming | Models |
+|---|---|---|---|
+| WorkBuddy | 56 | check-in + task accept/claim + streak + makeup + lottery + travel | 38 |
+| Qoder | 21 | daily check-in | 11 |
+| TRAE | 18 | daily check-in | 22 |
+| MiniMax | 6 | daily check-in | 2 |
+
+## Also included
+
+- **MCP & Skills management** — write configs for 25 AI coding tools in one click, no hand-editing JSON
+- **Usage ledger** — every request's tokens, latency and credit cost in local SQLite, full history
+- **Account rotation** — 2 concurrent per account, 16 pool-wide; rate-limited accounts cool down until the exact time the platform gave
+- **Long requests survive** — waits up to 180s for the first byte, so reasoning models don't get cut off mid-thought
+- **Zero upload** — credentials live in the OS keychain, never sent anywhere
+- **Cross-platform** — Windows / macOS / Linux, one Tauri 2 core
+
+## Download
+
+Grab the latest from [Releases](https://github.com/zenolore/quoly-ai/releases):
+
+- **Windows**: `Quoly AI_2.3.0_x64-setup.exe` (10.2 MB)
+- **macOS**: `.dmg` (Apple Silicon / Intel)
+- **Linux**: `.AppImage` / `.deb`
+
+Install over the previous version to upgrade — accounts and data live in `%USERPROFILE%\.ai-toolkit\` and are preserved.
+
+Or build from source; see below.
 
 ## Development
 
 ```bash
 pnpm install
-pnpm tauri dev      # develop
-pnpm tauri build    # package
+pnpm tauri dev      # dev mode
+pnpm tauri build    # build installers
 ```
 
-Requires Node 20+, Rust 1.77+, and the Tauri 2 system dependencies.
+Requires Node 20+, Rust 1.77+, and Tauri 2's system dependencies.
+
+## Data & security
+
+This app has to read your account credentials to work, so where it stores them and where it sends requests is documented in the open:
+
+- **Credentials live in the OS keychain** (Windows Credential Manager / macOS Keychain / Linux Secret Service), never plaintext files
+- **The gateway binds `127.0.0.1` only** — not the LAN, not the internet
+- **No telemetry endpoints at all** — nothing is sent back to the author
+
+Full details in **[docs/OPEN-SOURCE.md](docs/OPEN-SOURCE.md)**: what's open, what isn't, where keys live, and notes for forking.
+
+## Credits
+
+Quoly AI is a fork of [whyfail/AI-Toolkit](https://github.com/whyfail/AI-Toolkit) (MIT) and references protocol work from:
+
+- [smart-open/TraeWorkAssistant](https://github.com/smart-open/TraeWorkAssistant) (MIT)
+- [L0NE-6/Trae-AutoCheckin](https://github.com/L0NE-6/Trae-AutoCheckin) (MIT) — empirical findings on TRAE device-ID semantics
+- cpa-multi-plugins (MIT, Copyright 2026 mmqz)
+
+Full attribution in [NOTICE.md](NOTICE.md). The upstream copyright notice is preserved in [LICENSE](LICENSE), as MIT requires.
+
+### Changes relative to upstream
+
+- New brand identity and icon (transparent rounded corners)
+- **TRAE check-in fixed**: lowercase `x-device-id` header plus the full device header set, ending the long-running 9074 failures; per-`uid` derived device IDs take 18 accounts from 0 to 5 reliably claimable
+- **Full WorkBuddy activity coverage**: check-in, task accept, task claim, streak, makeup cards, lottery, travel claim
+- **Rate-limit rotation**: parses the reset time out of the platform's `6004` response and skips that account until it recovers
+- **Long-request timeout**: header wait 60 → 180s so reasoning models aren't cut off
+- Claim detail folds by default; overview page trimmed
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
 
 ## Disclaimer
 
-Not affiliated with WorkBuddy, TRAE, Qoder or MiniMax. Multi-account automation
-must comply with each platform's terms of service.
+A personal tool, unaffiliated with WorkBuddy, TRAE, Qoder or MiniMax. Multi-account automation may violate those platforms' terms of service — use at your own risk.
+
+---
+
+<div align="center">
+
+**If this helped you, a ⭐ Star keeps it maintained**
+
+[![Star History Chart](https://api.star-history.com/svg?repos=zenolore/quoly-ai&type=Date)](https://star-history.com/#zenolore/quoly-ai&Date)
+
+</div>
