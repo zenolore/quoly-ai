@@ -294,11 +294,17 @@ pub(super) async fn run(
     // 2. Travel gift: only claimable once the buddy is back.
     claim_travel(client, c, &mut out).await;
 
-    // 3. Task rewards for work already finished.
-    claim_task_rewards(client, c, &mut out).await;
-
-    // 4. Accept newly opened tasks so progress starts counting.
+    // 3. Accept newly opened tasks BEFORE claiming.
+    //
+    // 顺序不能反。原先是"先领后接"，等于先检查有没有能领的、再去接新任务，
+    // 刚接上的任务这一轮永远轮不到领取。而且不是每个任务都能随手接 ——
+    // 有前置依赖（实测：想接 playbook_prompt 提示 prerequisite not met:
+    // first_buddy），所以接取本身还要挑顺序。先接完再统一领，一轮内就能
+    // 把"接取即完成"的那批领掉。
     accept_tasks(client, c, &mut out).await;
+
+    // 4. Task rewards for work already finished.
+    claim_task_rewards(client, c, &mut out).await;
 
     // 5. Streak: fill a gap if a makeup card is available, then redeem tiers.
     // This is the second-largest source of credits after tasks — the 28-day tier
@@ -477,18 +483,77 @@ async fn accept_tasks(client: &ProviderClient, c: &Credentials, out: &mut Growth
     if codes.is_empty() {
         return;
     }
-    // Batched at 20: the endpoint rejects larger arrays.
-    for chunk in codes.chunks(20) {
-        let body = json!({ "task_codes": chunk });
-        if call(client, c, "POST", &format!("{GROWTH}/tasks/accept"), Some(body))
-            .await
-            .is_ok()
-        {
-            out.tasks_accepted += chunk.len();
+    // 先接前置任务，再接依赖它们的任务。
+    //
+    // 实测：想接 playbook_prompt / Library_read / Buddy_App 都会返回
+    // "prerequisite not met: first_buddy"。这类依赖关系平台不会提前告知，
+    // 只知道失败了、原因的文本里带着被依赖的任务码。
+    //
+    // 处理办法：把 first_buddy 这类"根任务"排到最前面先接，剩下的用
+    // 失败重试兜底 —— 第一轮有任务接不上，等根任务接完再试一次。
+    // 两轮足够覆盖现有的单层依赖，不做通用拓扑排序：任务表会变，
+    // 猜依赖图不如直接重试来得稳。
+    let mut ordered = codes.clone();
+    ordered.sort_by_key(|code| if code == "first_buddy" { 0 } else { 1 });
+
+    let mut accepted = Vec::new();
+    let mut blocked: Vec<(String, String)> = Vec::new();
+    for pass in 0..2 {
+        if ordered.is_empty() {
+            break;
         }
+        // Batched at 20: the endpoint rejects larger arrays.
+        let mut retry: Vec<String> = Vec::new();
+        for chunk in ordered.chunks(20) {
+            let body = json!({ "task_codes": chunk });
+            let Ok(resp) = call(client, c, "POST", &format!("{GROWTH}/tasks/accept"), Some(body)).await
+            else {
+                continue;
+            };
+            // 逐个看 results，不能只看 HTTP 状态。
+            //
+            // 2026-11-13 修：这个接口有个坑 —— 哪怕全部任务都接取失败，它也返回
+            // HTTP 200 且 {code: 0, msg: "OK"}，真实结果藏在 data.results 里：
+            //   {"task_code":"playbook_prompt","status":"error",
+            //    "message":"prerequisite not met: first_buddy"}
+            // 原逻辑只看 is_ok()，于是把"全失败"记成"接取 N 个新任务"，
+            // 日志看起来一切正常，实际一个都没接上 —— 这是任务积分长期为 0 的
+            // 第三个原因，也是最难查的一个。
+            let results = data(&resp)
+                .get("results")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if results.is_empty() {
+                // 老版本接口可能直接返回成功，没有 results 字段；按整批成功处理
+                accepted.extend(chunk.iter().cloned());
+                continue;
+            }
+            for item in results {
+                let code = text(&item, "task_code");
+                let status = text(&item, "status");
+                if matches!(status.as_str(), "ok" | "success" | "accepted" | "already_accepted") {
+                    accepted.push(code);
+                } else {
+                    // 前置依赖类的失败值得再试一轮（依赖的任务刚被接上）
+                    let reason = text(&item, "message");
+                    if pass == 0 && reason.contains("prerequisite") {
+                        retry.push(code);
+                    } else {
+                        blocked.push((code, reason));
+                    }
+                }
+            }
+        }
+        ordered = retry;
     }
-    if out.tasks_accepted > 0 {
-        out.step(format!("任务：接取 {} 个新任务", out.tasks_accepted));
+
+    out.tasks_accepted += accepted.len();
+    if !accepted.is_empty() {
+        out.step(format!("任务：接取 {} 个新任务", accepted.len()));
+    }
+    for (code, reason) in blocked {
+        out.step(format!("任务：{code} 无法接取（{reason}）"));
     }
 }
 

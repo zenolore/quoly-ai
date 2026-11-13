@@ -8,6 +8,7 @@ import workbuddy from "@/assets/agents/workbuddy.svg";
 import zcode from "@/assets/agents/zcode.png";
 import kimiCode from "@/assets/agents/kimi-code.png";
 import minimaxCode from "@/assets/agents/minimax-code.png";
+import doubao from "@/assets/agents/doubao.png";
 import deepseekHarness from "@/assets/agents/deepseek-harness.svg";
 import { normalizeToolId } from "@/lib/tools";
 
@@ -24,6 +25,7 @@ const icons: Partial<Record<string, { src: string; darkSrc?: string }>> = {
   zcode: { src: zcode },
   "kimi-code": { src: kimiCode },
   "minimax-code": { src: minimaxCode },
+  doubao: { src: doubao },
   "deepseek-harness": { src: deepseekHarness },
 };
 

@@ -13,6 +13,7 @@
 | ZCode | `zcode.png` | [ZCode 官网](https://zcode.z.ai/en)引用的 [图标](https://zcode.z.ai/favicon-192x192.png?v=20260707-transparent) |
 | Kimi Code | `kimi-code.png` | 本机官方 `Kimi Code.app` 1.0.4 随附的 `Contents/Resources/icon.icns`，提取原始 128 × 128 图层 |
 | MiniMax Code | `minimax-code.png` | 本机官方 `MiniMax Code.app` 3.1.1 随附的 `Contents/Resources/icon.icns`，提取原始 128 × 128 图层 |
+| 豆包 | `doubao.png` | [豆包官网](https://www.doubao.com/)引用的 [官方图标](https://lf-flow-web-cdn.doubao.com/obj/flow-doubao/favicon/new-doubao/128x128.png)，128 × 128 |
 | DeepSeek Harness | `deepseek-harness.svg` | [官方站点的蓝色鲸鱼 SVG](https://github.com/deepseek-ai/deepseek-harness/blob/master/website/public/favicon.svg)，原始纯矢量路径，无阴影与像素化边缘设置，适配小尺寸与高 DPI 显示；核对日期 2026-10-22 |
 
-来源核对日期：2026-10-15。各图标归对应品牌所有。
+来源核对日期：2026-10-15（豆包图标核对于 2026-11-13）。各图标归对应品牌所有。
