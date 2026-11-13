@@ -24,8 +24,28 @@ use tokio_util::sync::CancellationToken;
 mod anthropic;
 #[path = "tool_validation.rs"]
 mod tool_validation;
+#[path = "memory_budget.rs"]
+mod memory_budget;
 
-const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+/// Absolute ceiling on request bodies. `memory_budget` decides the *effective*
+/// limit per request (shrinking it as the machine runs low on commit charge) and
+/// owns the user-facing rejection message.
+///
+/// The transport layer's `DefaultBodyLimit` is set higher than this on purpose:
+/// it must let a body through to the handler so the handler can produce a proper
+/// error, rather than letting axum answer with its own
+/// "Failed to buffer the request body: length limit exceeded". That raw English
+/// string is what a client saw when a 35 MB body arrived, and it says nothing
+/// about why or what to do. Transport is therefore a backstop against absurd
+/// bodies (which would otherwise be buffered whole before any check runs), while
+/// the semantics live in `memory_budget`.
+const MAX_REQUEST_BYTES: usize = memory_budget::MAX_REQUEST_BYTES;
+
+/// What axum is allowed to buffer, before `memory_budget` judges it. Twice the
+/// hard ceiling: enough slack that a legitimately-rejected body still reaches the
+/// handler and gets the explanatory error, while a runaway upload is cut off
+/// before it can pin more than this much memory.
+const TRANSPORT_BODY_LIMIT: usize = MAX_REQUEST_BYTES * 2;
 
 #[derive(Clone, Copy)]
 enum Protocol {
@@ -373,7 +393,7 @@ impl GatewayManager {
             // Anthropic SDKs append /v1/messages to the configured base URL.
             // Accept the app's shared /v1 base URL without arbitrary path rewriting.
             .route("/v1/v1/messages", post(messages))
-            .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+            .layer(DefaultBodyLimit::max(TRANSPORT_BODY_LIMIT))
             .with_state(context.clone());
         let shutdown = cancellation.clone();
         let last_error = self.last_error.clone();
@@ -1633,6 +1653,33 @@ async fn protocol_request(
     }
     if body.is_empty() {
         return protocol.error(StatusCode::BAD_REQUEST, "invalid_json", "请求 JSON 无效");
+    }
+    // Second, memory-aware gate. `DefaultBodyLimit` already rejected anything over
+    // 32 MiB at the transport layer; that is a fixed ceiling. This one shrinks with
+    // the machine's free commit charge, because a body that is fine on an idle
+    // machine is what kills the process on a loaded one — parsing costs ~10-15x the
+    // JSON size, and an allocation failure aborts the whole process (0xc0000409
+    // with parameter 7) with nothing logged. See `memory_budget`.
+    //
+    // Checked before taking a parse slot so an oversized body never waits on the
+    // semaphore first.
+    let limit = memory_budget::current_request_limit();
+    if body.len() > limit {
+        let free = memory_budget::available_commit_bytes();
+        let detail = match free {
+            Some(free) => format!(
+                "请求体 {} MiB 超过当前上限 {} MiB（系统可用提交内存 {} MiB，内存紧张时会自动收紧）",
+                body.len() / (1024 * 1024),
+                limit / (1024 * 1024),
+                free / (1024 * 1024),
+            ),
+            None => format!(
+                "请求体 {} MiB 超过当前上限 {} MiB",
+                body.len() / (1024 * 1024),
+                limit / (1024 * 1024),
+            ),
+        };
+        return protocol.error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large", &detail);
     }
     // Parsed off the async runtime: 100k-700k token bodies recurse deeply enough
     // that the default stack overruns (0xc0000409). See parse_json_on_big_stack.
