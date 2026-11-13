@@ -407,15 +407,42 @@ async fn claim_task_rewards(client: &ProviderClient, c: &Credentials, out: &mut 
     let Some(list) = data(&v).get("tasks").and_then(Value::as_array) else {
         return;
     };
+    // 判断"可领取"的依据是进度，不是状态码。
+    //
+    // 2026-11-13 修：这里原本写 `accept_status == "completed"`，但接口根本不返回
+    // completed 这个值 —— 实测 19 个任务只出现 accepted 和 claimed 两种。
+    // 于是过滤器永远为空，任务一个都领不到，而且不报错、不告警：
+    // 3309 次运行记录里 tasksClaimed 全是 0，功能从上线起就没生效过。
+    //
+    // 真实判据在 progress 里：
+    //   accepted + progress.current >= target  → 已完成，可领
+    //   accepted + 进度没满                     → 还在做，领了会失败
+    //   claimed                                 → 已领过，跳过
+    //
+    // 顺带把 claimed 也排除，避免对着已领的任务重复 POST（403 虽然被吞掉，
+    // 但每个号每次白白多打十几个请求，平台风控会记账）。
     let done: Vec<(String, i64)> = list
         .iter()
-        .filter(|t| text(t, "accept_status") == "completed")
-        .map(|t| (text(t, "task_code"), num(t, "reward_credit")))
+        .filter(|t| {
+            let status = text(t, "accept_status");
+            if status == "claimed" {
+                return false;
+            }
+            let progress = t.get("progress");
+            let current = progress.map(|p| num(p, "current")).unwrap_or(0);
+            // target 缺失时按 1 处理：这类任务是"看一眼/点一下"型，没有进度概念，
+            // 接取即视为完成。target 为 0 同理（除零会得到自信的错误答案）。
+            let target = progress.map(|p| num(p, "target")).unwrap_or(1).max(1);
+            current >= target
+        })
+        .filter_map(|t| {
+            let code = text(t, "task_code");
+            if code.is_empty() {
+                return None;
+            }
+            Some((code, num(t, "reward_credit")))        })
         .collect();
     for (code, credit) in done {
-        if code.is_empty() {
-            continue;
-        }
         let path = format!("{GROWTH}/tasks/{code}/claim");
         match call(client, c, "POST", &path, Some(json!({}))).await {
             Ok(_) => {
