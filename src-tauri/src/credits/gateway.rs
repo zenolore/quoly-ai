@@ -2119,13 +2119,58 @@ fn stream_response_for(
         .into_response()
 }
 
+/// One in-progress tool call. Kept as plain `String`s so fragments can be
+/// appended with `push_str` (amortised O(1) per chunk).
+///
+/// 2026-11-13: this used to be a `serde_json::Value` rebuilt on every chunk with
+/// `format!("{current}{part}")`. That is O(n²) *allocation*: every fragment
+/// reallocated and copied the whole accumulated string. A 16 MiB tool-call
+/// payload arriving in ~1000 chunks therefore churned ~8 GiB of transient
+/// allocations. When the machine's commit charge was already near its limit
+/// (Windows reports 47 GiB limit / 2-3 GiB free on this box), the allocation
+/// inside Rust's global allocator failed and the runtime called `abort()` —
+/// which surfaces as 0xc0000409 with parameter 7 (FAST_FAIL_FATAL_APP_EXIT),
+/// exactly what the crash log showed. Weighted by request length, it also
+/// explains why 5 concurrent 200s streams died while 2 concurrent 100s streams
+/// survived: only the long ones accumulate enough chunks.
+#[derive(Default)]
+pub(super) struct ToolCall {
+    pub(super) id: String,
+    pub(super) kind: String,
+    pub(super) name: String,
+    pub(super) arguments: String,
+}
+
+impl ToolCall {
+    fn into_value(self) -> Value {
+        json!({
+            "id": self.id,
+            "type": if self.kind.is_empty() { "function".to_string() } else { self.kind },
+            "function": {"name": self.name, "arguments": self.arguments},
+        })
+    }
+}
+
+/// Hard ceiling for one non-streamed response body accumulated in memory.
+///
+/// This is the *sum* of every fragment we have copied into `Completion`, so it
+/// bounds the live heap, not the wire size. Kept well under the old 16 MiB
+/// JSON-text check because the accumulation now also holds a parsed `Value`
+/// per chunk transiently.
+const MAX_COMPLETION_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Default)]
 struct Completion {
     content: String,
     reasoning: String,
-    tools: std::collections::BTreeMap<u64, Value>,
+    tools: std::collections::BTreeMap<u64, ToolCall>,
     finish: Option<Value>,
     usage: Option<Value>,
+    /// Live bytes held by the three accumulating fields above.
+    bytes: usize,
+    /// Set once the ceiling is crossed; the caller turns this into a 502
+    /// instead of letting the allocator fail.
+    overflowed: bool,
 }
 
 impl Completion {
@@ -2147,34 +2192,47 @@ impl Completion {
             return;
         };
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            self.bytes += text.len();
             self.content.push_str(text);
         }
         if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+            self.bytes += text.len();
             self.reasoning.push_str(text);
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-                let target = self.tools.entry(index).or_insert_with(|| json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}));
+                let target = self.tools.entry(index).or_default();
                 for field in ["id", "type"] {
-                    if let Some(value) = call.get(field) {
+                    if let Some(value) = call.get(field).and_then(Value::as_str) {
                         // TRAE continuation chunks can explicitly carry an empty ID.
                         // It omits metadata for this fragment, not the existing call ID.
-                        if field == "id" && (value.is_null() || value.as_str() == Some("")) {
+                        if field == "id" && value.is_empty() {
                             continue;
                         }
-                        target[field] = value.clone();
+                        let slot = if field == "id" { &mut target.id } else { &mut target.kind };
+                        self.bytes += value.len();
+                        slot.clear();
+                        slot.push_str(value);
                     }
                 }
                 if let Some(function) = call.get("function") {
-                    for field in ["name", "arguments"] {
-                        if let Some(part) = function.get(field).and_then(Value::as_str) {
-                            let current = target["function"][field].as_str().unwrap_or("");
-                            target["function"][field] = Value::String(format!("{current}{part}"));
-                        }
+                    if let Some(part) = function.get("name").and_then(Value::as_str) {
+                        self.bytes += part.len();
+                        target.name.clear();
+                        target.name.push_str(part);
+                    }
+                    // Arguments are the one field that really arrives in pieces;
+                    // appending is the whole point of this rewrite.
+                    if let Some(part) = function.get("arguments").and_then(Value::as_str) {
+                        self.bytes += part.len();
+                        target.arguments.push_str(part);
                     }
                 }
             }
+        }
+        if self.bytes > MAX_COMPLETION_BYTES {
+            self.overflowed = true;
         }
     }
 
@@ -2195,7 +2253,7 @@ impl Completion {
         if !self.tools.is_empty() {
             message.insert(
                 "tool_calls".into(),
-                json!(self.tools.into_values().collect::<Vec<_>>()),
+                Value::Array(self.tools.into_values().map(ToolCall::into_value).collect()),
             );
         }
         let mut response = json!({"id": guard.id, "object": "chat.completion", "created": guard.created_at / 1000, "model": guard.model, "choices": [{"index": 0, "message": message, "finish_reason": self.finish.unwrap_or_else(|| json!("stop"))}]});
@@ -2243,10 +2301,23 @@ async fn collect_response_for(
                 }
                 guard.observe(&chunk.data);
                 // Breadcrumb around the accumulate step: Completion::push merges
-                // streamed deltas into one growing Value, and a fault here would
+                // streamed deltas into one growing buffer, and a fault here would
                 // explain a crash on light traffic that request-volume stats miss.
                 crate::credits::trail::mark("completion.push");
                 completion.push(&chunk.data);
+                // Check the live heap we are holding, not just the wire bytes:
+                // a tool-call payload repeats its JSON framing in every chunk, so
+                // the accumulated text can be several times `received_bytes`.
+                // Returning a 502 here is enormously better than letting the
+                // allocator fail and taking the whole process down with abort().
+                if completion.overflowed {
+                    guard.set_status("error");
+                    return protocol.error(
+                        StatusCode::BAD_GATEWAY,
+                        "response_too_large",
+                        "上游非流式响应累积超过内存保护上限",
+                    );
+                }
             }
             Some(Ok(chunk)) => {
                 if !matching_upstream(&model, chunk.upstream_model.as_deref(), guard.account.platform) {

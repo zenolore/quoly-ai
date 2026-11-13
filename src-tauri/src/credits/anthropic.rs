@@ -544,19 +544,14 @@ fn tools(completion: &Completion) -> Result<Vec<Value>, &'static str> {
         .tools
         .values()
         .map(|call| {
-            let id = call["id"]
-                .as_str()
+            let id = Some(call.id.as_str())
                 .filter(|id| !id.is_empty())
                 .ok_or("上游工具调用缺少 id")?;
-            let name = call["function"]["name"]
-                .as_str()
+            let name = Some(call.name.as_str())
                 .filter(|name| !name.is_empty())
                 .ok_or("上游工具调用缺少 name")?;
-            let arguments = call["function"]["arguments"]
-                .as_str()
-                .ok_or("上游工具参数无效")?;
             let input: Value =
-                serde_json::from_str(arguments).map_err(|_| "上游工具参数不是有效 JSON")?;
+                serde_json::from_str(&call.arguments).map_err(|_| "上游工具参数不是有效 JSON")?;
             if !input.is_object() {
                 return Err("上游工具参数必须是 JSON 对象");
             }
