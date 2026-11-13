@@ -157,6 +157,26 @@ pub struct ProviderSnapshot {
     pub diagnostic: Option<String>,
     #[serde(default)]
     pub sync: SnapshotSync,
+    /// 转发型平台的内部账号（目前只有豆包用）。
+    ///
+    /// 豆包一个"账号"其实是一个网关，网关里养着多个豆包号。界面上要按
+    /// 用户习惯把它们像其他平台那样一张张叠起来展示，所以把内部清单一起带上去。
+    /// 直连平台保持空数组。
+    #[serde(default)]
+    pub sub_accounts: Vec<SubAccount>,
+}
+
+/// 转发型平台内部的一个账号（只读展示用）。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubAccount {
+    pub name: String,
+    /// 网关自己的状态词：ok / cooldown / expired / expiring_soon / disabled
+    pub state: String,
+    /// 网页版登录凭据的剩余毫秒数，None 表示算不出来
+    pub seconds_left: Option<i64>,
+    /// 已用调用次数，用于看出哪个号在被反复使用
+    pub calls: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -234,6 +254,11 @@ pub struct GatewayStatus {
     pub running: bool,
     pub port: u16,
     pub base_url: String,
+    /// 局域网访问地址（如 http://192.168.1.201:17860/v1）。
+    ///
+    /// 后端只监听 127.0.0.1 时这里是 None —— 别的设备本来就连不上，
+    /// 给一个假地址只会让人白试。能拿到时才填，避免误导。
+    pub lan_url: Option<String>,
     pub last_error: Option<String>,
 }
 

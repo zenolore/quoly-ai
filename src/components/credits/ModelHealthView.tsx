@@ -24,6 +24,7 @@ const platformLabel: Record<string, string> = {
   traework: "TRAE",
   qoder: "Qoder",
   "minimax-code": "MiniMax Code",
+  doubao: "豆包",
 };
 
 type Health = "good" | "warn" | "bad" | "idle";

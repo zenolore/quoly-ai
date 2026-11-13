@@ -527,9 +527,30 @@ impl GatewayManager {
             running: active.is_some(),
             port,
             base_url: format!("http://127.0.0.1:{port}/v1"),
+            lan_url: lan_base_url(port),
             last_error: self.last_error.lock().clone(),
         }
     }
+}
+
+/// 探测本机局域网地址，拼成 `http://{ip}:{port}/v1`。
+///
+/// 用 UDP "连接"一个外部地址再读本端 socket 的本地 IP —— 这是不产生任何
+/// 实际流量的标准做法（UDP connect 只设置默认对端，不发包）。比枚举网卡
+/// 可靠：枚举要过滤虚拟网卡、VPN、Docker 网桥，而那堆名字在各机器上都不一样，
+/// 很容易选到 172.x 的虚拟网段，用户拿去连发现不通。
+///
+/// 拿不到就返回 None，不要瞎编一个地址。
+fn lan_base_url(port: u16) -> Option<String> {
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // 连不通也没关系，这一句只是为了定出"出网会走哪块网卡"
+    socket.connect("223.5.5.5:80").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(format!("http://{ip}:{port}/v1"))
 }
 
 impl Drop for GatewayManager {

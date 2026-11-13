@@ -220,6 +220,29 @@ pub(super) async fn inspect(
         diagnostic = Some(format!("以下账号需要重新登录：{}", needs_relogin.join("、")));
     }
 
+    // 把网关内部的账号清单带上去，界面才能像其他平台一样叠起来展示
+    let sub_accounts = health_json
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let name = item.get("name").and_then(Value::as_str)?;
+                    Some(SubAccount {
+                        name: name.to_string(),
+                        state: item
+                            .get("state")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        seconds_left: item.get("seconds_left").and_then(Value::as_i64),
+                        calls: item.get("calls").and_then(Value::as_u64).unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(ProviderSnapshot {
         balance: Some(usable as f64),
         unit: "个可用账号".into(),
@@ -231,6 +254,7 @@ pub(super) async fn inspect(
         stale: false,
         diagnostic,
         sync: SnapshotSync::default(),
+        sub_accounts,
     })
 }
 

@@ -15,6 +15,7 @@ import { creditsQueryKey, useCreditsAction, useCreditsDashboard } from "@/hooks/
 import {
   creditsApi, type CreditAccount, type CreditDashboard,
   type CreditModel, type CreditPlatform, type CreditRegion,
+  type SubAccount,
   type GrowthAccountState, type GrowthDay, type ImportOutcome,
   type OAuthStart, type ParseReport, type RewardOutcome,
 } from "@/lib/api/credits";
@@ -194,6 +195,7 @@ function AccountCard({ account, onDelete, refreshing = false }: { account: Credi
     </div>
     <p role="status" className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">{refreshing || refresh.isPending ? "同步中 · " : ""}{snapshot?.fetchedAt ? `上次成功同步 ${time(snapshot.fetchedAt)}` : "余额待同步"}{snapshot?.stale ? account.lastError ? " · 同步失败，显示历史余额" : " · 余额待更新" : ""}{snapshot?.quota ? ` · ${snapshot.quota}` : ""}</p>
     {account.lastError || snapshot?.diagnostic ? <p className="mt-3 rounded-lg bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">{account.lastError || snapshot?.diagnostic}</p> : null}
+    {snapshot?.subAccounts?.length ? <DoubaoSubAccounts subs={snapshot.subAccounts} /> : null}
     <div className="mt-4 flex flex-wrap gap-2">
       {!automaticReward && !noDailyReward ? <Pressable type="button" className="glass-primary-button min-h-8 px-3 py-2 text-xs" disabled={busy || !isClaimable(account)} onClick={() => claim.mutate(undefined, { onSuccess: reportClaims })}>{claim.isPending ? <Loader2 size={13} className="animate-spin" /> : <Coins size={13} />}领取积分</Pressable> : null}
       <Pressable type="button" className="glass-secondary-button min-h-8 px-3 py-2 text-xs" disabled={busy} onClick={() => refresh.mutate(undefined)}><RefreshCw size={13} className={refresh.isPending || refreshing ? "animate-spin" : ""} />刷新</Pressable>
@@ -209,6 +211,49 @@ function AccountCard({ account, onDelete, refreshing = false }: { account: Credi
     <div className="mt-4 border-t border-slate-500/10 pt-3"><Pressable type="button" className="glass-secondary-button min-h-8 px-3 py-2 text-xs" onClick={() => setShowingModels(true)}>可用模型 · {models.length}</Pressable></div>
     {showingModels ? <ModelsModal title="可用模型" groups={[{ title: account.label || platformName(account.platform), entries: models.map((model) => ({ account, model })) }]} onClose={() => setShowingModels(false)} /> : null}
   </article>;
+}
+
+/**
+ * 豆包网关内部的账号清单。
+ *
+ * 豆包一个"账户"是一个网关，网关里养着多个豆包号。其他平台是一张卡片一个号，
+ * 豆包这里用一份紧凑列表把内部的号都列出来，状态、剩余有效期、被用了几次
+ * 都摆出来 —— 用户能一眼看出"我登了 7 个号，哪个在干活、哪个快过期了"。
+ *
+ * 不把它们渲染成独立卡片，是因为这些号没法单独启用/停用/删除（真删要回网关
+ * 操作），做成可点卡片会误导。
+ */
+function DoubaoSubAccounts({ subs }: { subs: SubAccount[] }) {
+  const stateMeta: Record<string, { label: string; className: string }> = {
+    ok: { label: "可用", className: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" },
+    expiring_soon: { label: "即将过期", className: "bg-amber-500/10 text-amber-700 dark:text-amber-300" },
+    cooldown: { label: "限流中", className: "bg-amber-500/10 text-amber-700 dark:text-amber-300" },
+    expired: { label: "需重登", className: "bg-rose-500/10 text-rose-700 dark:text-rose-300" },
+    disabled: { label: "已停用", className: "bg-slate-500/10 text-slate-500 dark:text-slate-400" },
+  };
+  return <div className="mt-4 border-t border-slate-500/10 pt-3" aria-label="网关内账号">
+    <p className="mb-2 text-xs font-medium">网关内账号 · {subs.length}</p>
+    <div className="space-y-1.5">
+      {subs.map((sub) => {
+        const meta = stateMeta[sub.state] ?? { label: sub.state, className: "bg-slate-500/10 text-slate-500" };
+        const left = sub.secondsLeft;
+        const leftText = left == null
+          ? ""
+          : left <= 0 ? "已过期"
+          : left < 86400 ? `${Math.max(1, Math.round(left / 3600000))} 小时后过期`
+          : `${Math.round(left / 86400000)} 天后过期`;
+        return <div key={sub.name} className="flex items-center gap-2 rounded-lg bg-slate-500/5 px-2.5 py-1.5 text-[11px]">
+          <span className="min-w-0 flex-1 truncate" title={sub.name}>{sub.name}</span>
+          <span className="shrink-0 tabular-nums text-slate-500 dark:text-slate-400">{leftText}</span>
+          {sub.calls > 0 ? <span className="shrink-0 tabular-nums text-slate-500 dark:text-slate-400">{sub.calls} 次</span> : null}
+          <span className={`shrink-0 rounded-full px-1.5 py-0.5 ${meta.className}`}>{meta.label}</span>
+        </div>;
+      })}
+    </div>
+    <p className="mt-2 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+      这些号由豆包网关轮换使用，增删和重新登录在网关面板操作。
+    </p>
+  </div>;
 }
 
 function AccountStack({ accounts, onDelete, refreshingAccountIds = [] }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; refreshingAccountIds?: string[] }) {
@@ -681,8 +726,12 @@ function AccountsView({ data, onAdd }: { data: CreditDashboard; onAdd: (platform
     <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-3">
       {platforms.map((platform) => {
         const accounts = data.accounts.filter((account) => account.platform === platform.id);
+        // 豆包这类转发型平台，一个账户背后是网关里的一堆号。
+        // 数量标签要显示真实号数（7 个），而不是 1 个网关 —— 否则用户会觉得"我的号呢"。
+        const subCount = accounts.reduce((sum, a) => sum + (a.snapshot?.subAccounts?.length ?? 0), 0);
+        const countLabel = subCount > 0 ? `${subCount} 个账号` : `${accounts.length} 个账户`;
         return <section key={platform.id} className="min-w-0 space-y-3">
-          <div className="flex items-center gap-2 px-1"><AgentIcon id={platform.id} name={platform.name} className="h-7 w-7" /><h2 className="text-sm font-semibold">{platform.name}</h2><span className="ml-auto text-xs text-slate-500 dark:text-slate-400">{accounts.length} 个账户</span></div>
+          <div className="flex items-center gap-2 px-1"><AgentIcon id={platform.id} name={platform.name} className="h-7 w-7" /><h2 className="text-sm font-semibold">{platform.name}</h2><span className="ml-auto text-xs text-slate-500 dark:text-slate-400">{countLabel}</span></div>
           {accounts.length ? <AccountStack accounts={accounts} onDelete={setDeleting} refreshingAccountIds={data.refreshingAccountIds} /> : <div className="glass-card flex min-h-[260px] flex-col items-center justify-center p-6 text-center"><KeyRound size={25} className="text-slate-400" /><p className="mt-4 text-sm font-medium">连接 {platform.name}</p><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">登录后查看余额、领取资格与模型目录。</p><Pressable type="button" className="glass-secondary-button mt-5 text-xs" onClick={() => onAdd(platform.id)}><Plus size={14} />添加账户</Pressable></div>}
         </section>;
       })}
@@ -761,7 +810,7 @@ function ProxyView({ data }: { data: CreditDashboard }) {
       <p className="mt-5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">在客户端的自定义提供商设置中填写下方连接参数，再添加一个目录模型 ID。保持 Quoly AI 与代理运行即可使用。</p>
       <div className="mt-5 grid gap-5 md:grid-cols-2"><CopyField label="提供商名称" value="Quoly AI" /><CopyField label="Base URL" value={data.gateway.baseUrl} /></div>
       <div className="mt-5 grid gap-5 md:grid-cols-2"><div className="space-y-2"><p className="text-xs font-medium text-slate-500 dark:text-slate-400">协议</p><div className="glass-code space-y-2 rounded-xl px-3 py-2.5 text-xs"><p>OpenAI Chat Completions <code className="block break-all text-[11px] text-slate-500 dark:text-slate-400">/v1/chat/completions</code></p><p>Anthropic Messages <code className="block break-all text-[11px] text-slate-500 dark:text-slate-400">/v1/messages</code></p></div><p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">两种协议使用同一 Base URL，在客户端选择对应协议。</p></div><div className="space-y-2"><p className="text-xs font-medium text-slate-500 dark:text-slate-400">API Key</p><div className="glass-code flex min-h-[44px] items-center justify-between gap-3 rounded-xl px-3 py-2.5"><span className="text-xs text-slate-500 dark:text-slate-400">使用本地代理密钥</span><CopyProxyKey /></div></div></div>
-      <div className="mt-4 flex flex-wrap gap-2"><Pressable type="button" className="glass-secondary-button text-xs" disabled={!data.gateway.running || probe.isPending} onClick={() => probe.mutate(undefined, { onSuccess: (message) => toast.success(message) })}>{probe.isPending ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}检测连接</Pressable></div>
+      <div className="mt-4 flex flex-wrap gap-2"><Pressable type="button" className="glass-secondary-button text-xs" disabled={!data.gateway.running || probe.isPending} onClick={() => probe.mutate(undefined, { onSuccess: (message) => toast.success(message) })}>{probe.isPending ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}检测连接</Pressable><CopyAllProxyConfig baseUrl={data.gateway.baseUrl} lanUrl={data.gateway.lanUrl} /></div>
     </section>
     <section className="glass-card p-6"><div className="flex flex-wrap items-start justify-between gap-4"><div className="min-w-0"><h2 className="text-sm font-semibold">目录模型 ID</h2><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">平台模型 ID 来自已连接账户的目录，可以指定对应平台调用；上游推理的可用性以实际请求结果为准。</p></div><Pressable type="button" className="glass-secondary-button shrink-0 text-xs" onClick={() => setShowingCatalog(true)}>查看模型 · {models.length}</Pressable></div><p className="mt-4 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">模型 ID 固定平台与区域，国际版使用 -intl 前缀；失败不会切换到国内账号。</p>{showingCatalog ? <ModelsModal title="目录模型 ID" groups={catalogGroups} onClose={() => setShowingCatalog(false)} /> : null}</section>
     <section className="glass-card p-6"><h2 className="text-sm font-semibold">最近请求</h2>{data.requests.length ? <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs"><thead className="text-[11px] text-slate-500 dark:text-slate-400"><tr><th className="py-2 pr-4 font-medium">模型 / 平台</th><th className="py-2 pr-4 font-medium">耗时</th><th className="py-2 pr-4 font-medium">Tokens 输入 / 输出</th><th className="py-2 pr-4 font-medium">状态</th><th className="py-2 font-medium">时间</th></tr></thead><tbody>{data.requests.slice(0, 15).map((request) => <tr key={request.id} className="border-t border-slate-500/10"><td className="max-w-[260px] py-3 pr-4"><p className="break-all font-medium">{request.model}</p><p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">{platformName(request.platform)} · {regionName(request.region)} · {data.accounts.find((account) => account.id === request.accountId)?.label || request.accountId}</p></td><td className="whitespace-nowrap py-3 pr-4 tabular-nums">{number(request.elapsedMs)} ms</td><td className="whitespace-nowrap py-3 pr-4 tabular-nums">{request.inputTokens == null ? "—" : number(request.inputTokens)} / {request.outputTokens == null ? "—" : number(request.outputTokens)}</td><td className="py-3 pr-4"><Badge success={["success", "completed"].includes(request.status)}>{labels[request.status] ?? request.status}</Badge>{request.diagnostic ? <details className="mt-2 min-w-[180px] max-w-[340px] text-[11px]"><summary className="cursor-pointer text-blue-600 dark:text-blue-300">错误详情</summary><p className="mt-2 break-words leading-relaxed text-slate-600 dark:text-slate-300">{request.diagnostic.message}</p><p className="mt-2 break-all text-slate-500 dark:text-slate-400">代理请求 ID：{request.id}</p></details> : null}</td><td className="whitespace-nowrap py-3 text-[11px] text-slate-500 dark:text-slate-400">{time(request.createdAt)}</td></tr>)}</tbody></table></div> : <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">开启代理并从客户端调用后，显示平台、耗时和用量。</p>}</section>
@@ -777,6 +826,44 @@ function CopyProxyKey() {
     finally { setCopying(false); }
   };
   return <Pressable type="button" className="glass-secondary-button min-h-7 shrink-0 px-2 py-1 text-xs" disabled={copying} onClick={() => void copy()}>{copying ? <Loader2 size={12} className="animate-spin" /> : <Copy size={12} />}复制 API Key</Pressable>;
+}
+
+/**
+ * 一键复制本地代理的整套连接参数。
+ *
+ * 为什么要它：手动配客户端时要抄三样东西（Base URL、协议、API Key），
+ * 还容易漏掉"局域网地址"这个变量。一次复制成一段可直接粘贴的文本更省事。
+ *
+ * 复制内容刻意做成"能直接读懂"的格式而不是 JSON：用户多半是往 Claude Code、
+ * Cline 这类工具的自定义提供商表单里填，边看边填比解析 JSON 顺手。
+ */
+function CopyAllProxyConfig({ baseUrl, lanUrl }: { baseUrl: string; lanUrl: string | null }) {
+  const [copying, setCopying] = useState(false);
+  const copy = async () => {
+    setCopying(true);
+    try {
+      const key = await creditsApi.proxyKey();
+      const lines = [
+        `提供商名称：Quoly AI`,
+        `Base URL：${baseUrl}`,
+        lanUrl ? `局域网地址：${lanUrl}` : `局域网地址：未开启（代理仅监听本机）`,
+        `协议：OpenAI Chat Completions（/v1/chat/completions）`,
+        `　　　Anthropic Messages（/v1/messages）`,
+        `API Key：${key}`,
+        ``,
+        `（两种协议共用同一 Base URL，在客户端选择对应协议即可）`,
+      ];
+      await copyValue(lines.join("\n"), "代理连接参数");
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setCopying(false);
+    }
+  };
+  return <Pressable type="button" className="glass-primary-button text-xs" disabled={copying} onClick={() => void copy()}>
+    {copying ? <Loader2 size={13} className="animate-spin" /> : <Copy size={13} />}
+    一键复制连接参数
+  </Pressable>;
 }
 
 export default function CreditsPanel() {

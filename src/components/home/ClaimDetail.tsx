@@ -15,6 +15,7 @@ const platformLabel: Record<string, string> = {
   traework: "TRAE",
   qoder: "Qoder",
   "minimax-code": "MiniMax Code",
+  doubao: "豆包",
 };
 
 const statusMeta: Record<string, { label: string; text: string; bg: string }> = {

@@ -83,6 +83,14 @@ export interface CreditSnapshot {
   fetchedAt: number;
   stale: boolean;
   diagnostic: string | null;
+  /**
+   * 转发型平台的内部账号（目前只有豆包）。
+   *
+   * 豆包的一个"账户"其实是一个网关，网关里养着多个豆包号。界面要把它们
+   * 像其他平台那样一张张叠起来，所以后端把内部清单一起带上来。
+   * 直连平台没有这个字段。
+   */
+  subAccounts?: SubAccount[];
   sync?: {
     rewardsFetchedAt: number | null;
     modelsFetchedAt: number | null;
@@ -101,6 +109,16 @@ export interface CreditAccount {
   status: string;
   lastError: string | null;
   snapshot: CreditSnapshot | null;
+}
+
+/** 转发型平台内部的一个账号（豆包网关里的号）。 */
+export interface SubAccount {
+  name: string;
+  /** 网关自己的状态词：ok / cooldown / expired / expiring_soon / disabled */
+  state: string;
+  /** 登录凭据剩余毫秒数，null 表示算不出来 */
+  secondsLeft: number | null;
+  calls: number;
 }
 
 export interface RewardOutcome {
@@ -253,6 +271,8 @@ export interface GatewayStatus {
   running: boolean;
   port: number;
   baseUrl: string;
+  /** 局域网访问地址；代理只监听 127.0.0.1 时为 null。 */
+  lanUrl: string | null;
   lastError: string | null;
 }
 

@@ -710,6 +710,9 @@ pub(super) fn snapshot(
         stale: false,
         diagnostic,
         sync: SnapshotSync::default(),
+        // 这是分步刷新后的合并结果，只用于直连平台。
+        // 豆包的子账号清单由它自己的 inspect 直接返回，不走这条合并路径。
+        sub_accounts: vec![],
     }
 }
 pub(super) fn model(id: String, name: String, context: Option<u64>) -> ModelInfo {
