@@ -2266,7 +2266,22 @@ impl Completion {
                 if let Some(function) = call.get("function") {
                     if let Some(part) = function.get("name").and_then(Value::as_str) {
                         self.bytes += part.len();
-                        target.name.clear();
+                        // 追加，不是覆盖。
+                        //
+                        // 2026-11-13 事故：改写这里时把 name 当成了"每片带完整值"，
+                        // 写成 clear() + push_str()，而上游（workbuddy 的
+                        // deepseek-v4.1-flash）实际是按字符分片下发工具名：
+                        // 片1 "list_"，片2 "files"。覆盖语义只留下最后一片，name
+                        // 变成 "files" 甚至空串，随后 anthropic 协议层报
+                        // “上游工具调用缺少 name”，整个对话失败。
+                        //
+                        // 原版（53cfd8c）对所有字段一律 format!("{current}{part}")，
+                        // 也就是追加，所以从来没有这个问题。改写成 push_str 时只有
+                        // arguments 保留了追加语义，name 被我误改成覆盖 —— 这是
+                        // 一次纯手工引入的回归，与 O(n²) 优化本身无关。
+                        //
+                        // 现在 name 和 arguments 都追加；id/type 保持覆盖，因为
+                        // 那两项上游只在首片下发一次，重复追加会拼出 "call_acall_a"。
                         target.name.push_str(part);
                     }
                     // Arguments are the one field that really arrives in pieces;
@@ -2612,6 +2627,39 @@ mod tests {
         );
         assert_eq!(response["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(response["usage"]["prompt_tokens"], 10);
+    }
+
+    #[test]
+    fn fragmented_tool_name_is_appended_not_overwritten() {
+        // 回归测试：2026-11-13 把 name 的拼接从追加改成覆盖，
+        // workbuddy 的 deepseek-v4.1-flash 按字符分片下发工具名，
+        // 结果 name 只剩最后一片，anthropic 协议层直接报
+        // “上游工具调用缺少 name”，整个会话失败。
+        //
+        // 上游的实际形状（实测抓帧）：
+        //   片1 {"function":{"name":"list_"}}
+        //   片2 {"function":{"name":"files"}}
+        // 期望得到 "list_files"，而不是 "files"。
+        let mut completion = Completion::default();
+        completion.push(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_x", "type": "function", "function": {"name": "list_", "arguments": ""}}
+        ]}}]}));
+        completion.push(&json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "files", "arguments": "{\"path\":\".\"}"}}
+        ]}}]}));
+
+        let mut guard = RequestGuard::new(account("first", "deepseek-v4.1-flash", now_ms()));
+        guard.model = "deepseek-v4.1-flash".into();
+        let response = completion.response(&guard);
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "list_files",
+            "分片的工具名必须拼起来，不能被后一片覆盖"
+        );
+        assert_eq!(
+            response["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\".\"}"
+        );
     }
 
     #[test]
