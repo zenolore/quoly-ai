@@ -2540,6 +2540,7 @@ mod tests {
                 stale: false,
                 diagnostic: None,
                 sync: super::super::types::SnapshotSync::default(),
+                sub_accounts: vec![],
             }),
         }
     }

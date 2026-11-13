@@ -233,6 +233,13 @@ pub struct ProxySettings {
     /// behavior LAN callers depend on.
     #[serde(default = "lan_share_default")]
     pub lan_share: bool,
+    /// 上次「一键复制连接参数」时勾选的模型 ID。
+    ///
+    /// 存在设置里而不是前端状态：用户的用途是"把配置发给别人"，
+    /// 这个清单是他的资产管理结果，重装/换机器后重建一遍很烦。
+    /// 空数组表示还没选过，复制时应当全选。
+    #[serde(default)]
+    pub shared_models: Vec<String>,
 }
 fn auto_refresh_default() -> bool { true }
 fn lan_share_default() -> bool { true }
@@ -244,6 +251,7 @@ impl Default for ProxySettings {
             auto_refresh: true,
             auto_growth: false,
             lan_share: true,
+            shared_models: Vec::new(),
         }
     }
 }

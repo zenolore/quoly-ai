@@ -764,6 +764,7 @@ mod tests {
             stale: false,
             diagnostic: None,
             sync: SnapshotSync::default(),
+            sub_accounts: vec![],
         });
         assert!(s.save_account(&changed).is_err());
         assert_eq!(s.account("one").unwrap().label, "测试");

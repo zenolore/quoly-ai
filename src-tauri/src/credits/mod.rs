@@ -1491,6 +1491,7 @@ mod tests {
                 stale: false,
                 diagnostic: None,
                 sync: SnapshotSync::default(),
+                sub_accounts: vec![],
             }),
         }
     }

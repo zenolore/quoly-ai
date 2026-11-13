@@ -385,6 +385,8 @@ async fn claim_travel(client: &ProviderClient, c: &Credentials, out: &mut Growth
     let d = data(&v);
     out.travel_state = text(d, "state");
     let record_id = num(d, "record_id");
+    // arrived 才是可领取的状态；别的状态（idle/traveling）没什么可领的，
+    // 安静跳过是合理的 —— 这不是错误。
     if out.travel_state != "arrived" || record_id == 0 {
         return;
     }
@@ -402,7 +404,13 @@ async fn claim_travel(client: &ProviderClient, c: &Credentials, out: &mut Growth
             out.travel_claimed = got;
             out.step(format!("旅行：领回礼物 {got} 积分"));
         }
-        Err(e) => out.step(format!("旅行：领礼失败（{}）", e.status)),
+        // 这里原本也是静默失败。领取失败要么是重复领、要么是记录过期，
+        // 都值得留一行痕迹，否则"旅行回来却没积分"永远查不出原因。
+        Err(e) => out.step(format!(
+            "旅行：领礼失败（{} {}）",
+            e.status,
+            e.message.chars().take(80).collect::<String>()
+        )),
     }
 }
 
@@ -429,24 +437,14 @@ async fn claim_task_rewards(client: &ProviderClient, c: &Credentials, out: &mut 
     // 但每个号每次白白多打十几个请求，平台风控会记账）。
     let done: Vec<(String, i64)> = list
         .iter()
-        .filter(|t| {
-            let status = text(t, "accept_status");
-            if status == "claimed" {
-                return false;
-            }
-            let progress = t.get("progress");
-            let current = progress.map(|p| num(p, "current")).unwrap_or(0);
-            // target 缺失时按 1 处理：这类任务是"看一眼/点一下"型，没有进度概念，
-            // 接取即视为完成。target 为 0 同理（除零会得到自信的错误答案）。
-            let target = progress.map(|p| num(p, "target")).unwrap_or(1).max(1);
-            current >= target
-        })
+        .filter(|t| task_claimable(t))
         .filter_map(|t| {
             let code = text(t, "task_code");
             if code.is_empty() {
                 return None;
             }
-            Some((code, num(t, "reward_credit")))        })
+            Some((code, num(t, "reward_credit")))
+        })
         .collect();
     for (code, credit) in done {
         let path = format!("{GROWTH}/tasks/{code}/claim");
@@ -711,11 +709,39 @@ async fn depart_travel(client: &ProviderClient, c: &Credentials, out: &mut Growt
         return;
     };
     let d = data(&v);
-    if text(d, "state") != "idle"
-        || d.get("daily_limit_reached").and_then(Value::as_bool).unwrap_or(false)
-    {
+    if text(d, "state") != "idle" {
+        // 还在路上或已到达，本轮无事可做（到达后由 claim_travel 领礼物）
         return;
     }
+    if d.get("daily_limit_reached").and_then(Value::as_bool).unwrap_or(false) {
+        return;
+    }
+
+    // 派发旅行要求账号先有 buddy。
+    //
+    // 2026-11-13 实测：没有 buddy 的账号调 depart 会返回
+    //   403 {"code":403,"msg":"no active buddy"}
+    // 原代码对 403 一律静默吞掉，所以既没派发、日志里也没痕迹 ——
+    // 用户只能看到"旅行状态一直是 idle"，查不出原因。
+    //
+    // 先查 buddy 列表，没有就直接给出可读的说明，跳过这个账号。
+    // 这一步很关键：首次使用的新账号全是"0 个 buddy + 0 能量"，
+    // 不做这个检查，会在每个新账号上白撞一次 403。
+    let has_buddy = call(client, c, "GET", &format!("{GROWTH}/buddy/list"), None)
+        .await
+        .ok()
+        .map(|b| {
+            data(&b)
+                .get("buddies")
+                .and_then(Value::as_array)
+                .is_some_and(|list| !list.is_empty())
+        })
+        .unwrap_or(false);
+    if !has_buddy {
+        out.step("旅行：跳过（账号还没有 Buddy，先在客户端领养一只）".to_string());
+        return;
+    }
+
     let Ok(cfg) = call(client, c, "GET", &format!("{GROWTH}/buddy/travel/config"), None).await else {
         return;
     };
@@ -741,9 +767,141 @@ async fn depart_travel(client: &ProviderClient, c: &Credentials, out: &mut Growt
     {
         Ok(_) => {
             out.travel_dispatched = true;
-            out.step(format!("旅行：已派出（{})", text(loc, "name")));
+            out.step(format!("旅行：已派出（{}）", text(loc, "name")));
         }
-        Err(e) if e.status == 403 => {}
-        Err(_) => {}
+        // 不再静默吞掉：403 往往是"没 buddy"或"今日次数用完"，
+        // 这两种都该让用户看见，否则下次还是同样的困惑。
+        Err(e) => out.step(format!(
+            "旅行：派出失败（{} {}）",
+            e.status,
+            e.message.chars().take(80).collect::<String>()
+        )),
+    }
+}
+
+/// 一个任务当前能不能领奖。
+///
+/// 抽成独立函数是为了能被单测钉住 —— 这段判断错过两次，两次都是
+/// "看起来合理但和接口实际不符"，不测就还会再错。
+///
+/// 判据（2026-11-13 用真实账号逐条核对）：
+///   accept_status == "claimed"           → 已领过，跳过
+///   没有 progress 字段                    → 从未开始，跳过
+///   progress.current >= progress.target  → 已完成，可领
+///   其余                                  → 没做完，领了接口会返回
+///                                         400 task not completed
+///
+/// 两个陷阱，都实测过：
+///
+/// 1. `claimed_button_text`（"已完成"）不可信。有任务是
+///    accepted + 0/1 + button_text="已完成"，真去 claim 却返回
+///    task not completed。只能看 progress。
+///
+/// 2. `progress == null` 不等于"无进度概念直接算完成"。实测三个账号：
+///    已正常领取 16 个任务的账号，没有一个 progress=null 的任务；
+///    而一个从未在客户端操作过的账号，17 个任务全是 progress=null
+///    且 status=not_accepted。所以 null 表示"这个任务还没被激活"，
+///    当它可领会对每个任务白打一次 400。
+fn task_claimable(task: &Value) -> bool {
+    if text(task, "accept_status") == "claimed" {
+        return false;
+    }
+    let Some(progress) = task.get("progress").filter(|p| !p.is_null()) else {
+        return false;
+    };
+    let current = num(progress, "current");
+    // target 为 0 或缺失时按 1 处理：这类任务没有进度刻度，
+    // 有 current 就说明已经被记过一次，视为完成。
+    let target = num(progress, "target").max(1);
+    current >= target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(status: &str, current: Option<i64>, target: Option<i64>, button: &str) -> Value {
+        let progress = match (current, target) {
+            (Some(c), Some(t)) => json!({ "current": c, "target": t }),
+            _ => Value::Null,
+        };
+        json!({
+            "task_code": "x",
+            "accept_status": status,
+            "progress": progress,
+            "claimed_button_text": button,
+            "reward_credit": 100,
+        })
+    }
+
+    /// 已领取的任务不能再领 —— 否则每个号每次白打十几个请求。
+    #[test]
+    fn claimed_tasks_are_skipped() {
+        assert!(!task_claimable(&task("claimed", Some(1), Some(1), "已完成")));
+        // 极端情况：claimed 但进度看着没满，也不能领
+        assert!(!task_claimable(&task("claimed", Some(0), Some(5), "已完成")));
+    }
+
+    /// 进度满了才能领。这是修复的核心。
+    #[test]
+    fn only_full_progress_is_claimable() {
+        assert!(task_claimable(&task("accepted", Some(1), Some(1), "已完成")));
+        assert!(task_claimable(&task("accepted", Some(5), Some(5), "已完成")));
+        assert!(task_claimable(&task("accepted", Some(3), Some(3), "-")));
+        // 没满，领了接口会 400
+        assert!(!task_claimable(&task("accepted", Some(0), Some(1), "已完成")));
+        assert!(!task_claimable(&task("accepted", Some(2), Some(5), "已完成")));
+    }
+
+    /// not_accepted（还没接）且没进度的，不该拿去领。
+    #[test]
+    fn unaccepted_tasks_without_progress_are_not_claimable() {
+        assert!(!task_claimable(&task("not_accepted", None, None, "已完成")));
+    }
+
+    /// progress 为 null 表示"任务从未被激活"，不是"已完成"。
+    ///
+    /// 这是第二次修正的结论，来自真实数据：已正常领完 16 个任务的账号里
+    /// 没有一个 progress=null 的任务；而一个从未在客户端操作过的账号，
+    /// 17 个任务全是 progress=null + not_accepted。
+    /// 若把 null 当可领，会对每个任务白打一次 400 task not completed。
+    #[test]
+    fn null_progress_means_never_started() {
+        assert!(!task_claimable(&task("accepted", None, None, "-")));
+        assert!(!task_claimable(&task("not_accepted", None, None, "已完成")));
+    }
+
+    /// target 缺失或为 0 时，有 current 就视为完成。
+    ///
+    /// 这类任务没有进度刻度（"点一下就算"），平台只记 1 次。
+    #[test]
+    fn zero_or_missing_target_uses_current_presence() {
+        let t = json!({
+            "accept_status": "accepted",
+            "progress": { "current": 1 },
+            "reward_credit": 100,
+        });
+        assert!(task_claimable(&t));
+
+        let t = json!({
+            "accept_status": "accepted",
+            "progress": { "current": 1, "target": 0 },
+            "reward_credit": 100,
+        });
+        assert!(task_claimable(&t));
+    }
+
+    /// `claimed_button_text` 是陷阱，不能当判据。
+    ///
+    /// 实测存在 button="已完成" 但 progress=0/1 的任务，
+    /// 调 claim 返回 400 task not completed。这条测试把它钉死：
+    /// 光看 button 会误判，必须看 progress。
+    #[test]
+    fn button_text_is_not_a_claim_signal() {
+        let misleading = task("accepted", Some(0), Some(1), "已完成");
+        assert!(
+            !task_claimable(&misleading),
+            "button_text=已完成 但进度 0/1，不该判为可领"
+        );
     }
 }
