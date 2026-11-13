@@ -9,6 +9,43 @@ use crate::{
 use serde_json::{json, Value};
 use tauri::{Manager, State};
 
+/// 添加一个豆包网关账号。
+///
+/// 豆包和其他平台不一样：它不需要 OAuth 登录，凭证就是"网关地址 + API Key"。
+/// 所以在账号面板上是一个独立表单，而不是走授权流程。
+///
+/// `gateway_url` 留空时用默认的 127.0.0.1:9091。这允许用户把网关跑在
+/// 别的机器或端口上（比如局域网里另一台机器），而不必改代码。
+#[tauri::command]
+pub async fn credits_add_doubao(
+    state: State<'_, AppState>,
+    gateway_url: Option<String>,
+    api_key: String,
+) -> Result<Account, String> {
+    let url = gateway_url
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:9091".to_string());
+    let key = api_key.trim().to_string();
+    if key.is_empty() {
+        return Err("请填写豆包网关的 API Key（在网关目录的 api_key.txt 里）".into());
+    }
+    state.credits.retry_secret_access()?;
+    let credentials = Credentials {
+        region: CreditRegion::Cn,
+        access_token: key,
+        refresh_token: None,
+        user_id: None,
+        device_id: None,
+        expires_at: None,
+        extra: json!({ "gateway_url": url }),
+    };
+    state
+        .credits
+        .add_account(Platform::Doubao, "豆包网关".into(), credentials)
+        .await
+}
+
 #[tauri::command]
 pub async fn credits_import_local(
     state: State<'_, AppState>,

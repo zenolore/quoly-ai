@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type CreditPlatform = "workbuddy" | "traework" | "qoder" | "minimax-code";
+export type CreditPlatform = "workbuddy" | "traework" | "qoder" | "minimax-code" | "doubao";
 export type CreditRegion = "cn" | "intl";
 
 export interface Credentials {
@@ -394,6 +394,17 @@ export const creditsApi = {
   networkRestored: () => invoke<void>("credits_network_restored"),
   importLocal: (platform: CreditPlatform, region: CreditRegion = "cn") =>
     invoke<CreditAccount>("credits_import_local", { platform, region }),
+  /**
+   * 添加豆包网关。
+   *
+   * 和别的平台不同，豆包不用 OAuth：凭证就是网关地址 + API Key。
+   * 地址留空则用默认的 127.0.0.1:9091。
+   */
+  addDoubao: (apiKey: string, gatewayUrl?: string) =>
+    invoke<CreditAccount>("credits_add_doubao", {
+      apiKey,
+      gatewayUrl: gatewayUrl?.trim() || null,
+    }),
   /** 解析账号文件，只回报内容，不写库。 */
   parseAccountFile: (content: string) =>
     invoke<ParseReport>("credits_parse_account_file", { content }),

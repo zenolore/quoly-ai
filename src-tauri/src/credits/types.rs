@@ -9,6 +9,13 @@ pub enum Platform {
     Qoder,
     #[serde(rename = "minimax-code")]
     MinimaxCode,
+    /// 豆包（本地网关转发）。
+    ///
+    /// 这个平台和其他四个有本质区别：它不直连上游，而是把请求转给本机
+    /// 的豆包网关（默认 127.0.0.1:9091），由那边管账号池、签到和 Cookie。
+    /// 之所以这么拆，是因为豆包签到必须靠 Playwright 驱动真实浏览器，
+    /// 塞进 Rust 后端不现实；而且豆包风控频繁，独立进程崩了不会带走主网关。
+    Doubao,
 }
 impl Platform {
     pub fn key(self) -> &'static str {
@@ -17,7 +24,16 @@ impl Platform {
             Self::Traework => "traework",
             Self::Qoder => "qoder",
             Self::MinimaxCode => "minimax-code",
+            Self::Doubao => "doubao",
         }
+    }
+
+    /// 本地转发型平台：账号池和协议细节都托管在外部进程里。
+    ///
+    /// 这类平台的隔离要求比直连型更高 —— 外部进程可能整个挂掉，
+    /// 不能让这种状态污染其他平台的路由、降级链或额度统计。
+    pub fn is_proxied(self) -> bool {
+        matches!(self, Self::Doubao)
     }
 
     pub fn route_key(self, region: CreditRegion) -> String {

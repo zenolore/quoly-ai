@@ -24,6 +24,7 @@ const platforms: Array<{ id: CreditPlatform; name: string }> = [
   { id: "traework", name: "TRAE" },
   { id: "qoder", name: "Qoder" },
   { id: "minimax-code", name: "MiniMax Code" },
+  { id: "doubao", name: "豆包" },
 ];
 const sections = [
   { id: "accounts", label: "账户与积分" },
@@ -354,7 +355,8 @@ function AddAccountModal({ platform: initialPlatform, onClose }: { platform: Cre
       <fieldset><legend className="mb-2 text-xs font-medium">账号区域</legend><div className="flex gap-2">{(["cn", "intl"] as const).map((value) => <Pressable key={value} type="button" aria-pressed={region === value} disabled={Boolean(flow) || authorizing || importing} className={region === value ? "glass-primary-button text-xs" : "glass-secondary-button text-xs"} onClick={() => { setRegion(value); setFlowError(""); setImportError(""); }}>{regionName(value)}</Pressable>)}</div></fieldset>
       {platform === "traework" && region === "intl" ? <p className="text-xs leading-relaxed text-slate-500 dark:text-slate-400">国际版支持身份与额度查询；模型目录和代理待新版协议验证后开放。</p> : null}
       {platform === "minimax-code" ? <p className="text-xs leading-relaxed text-slate-500 dark:text-slate-400">支持积分、每日签到与模型代理，模型和奖励资格以当前账号返回为准。</p> : null}
-      <div className="rounded-xl bg-blue-500/5 p-4"><p className="text-sm font-medium">在浏览器中完成授权</p><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">授权完成后自动连接账户。</p>{flow ? <div className="mt-4 flex flex-wrap items-center gap-3"><Loader2 size={16} className="animate-spin text-blue-500" /><span className="text-xs">等待授权 · {time(flow.expiresAt)} 到期</span><Pressable type="button" className="glass-secondary-button min-h-7 px-2 py-1 text-xs" onClick={() => { setFlow(null); setFlowError(""); }}>取消</Pressable></div> : <Pressable type="button" className="glass-primary-button mt-4 text-xs" onClick={() => void login()} disabled={authorizing}>{authorizing ? <Loader2 size={14} className="animate-spin" /> : <ExternalLink size={14} />}前往 {platformName(platform)} {regionName(region)} 登录</Pressable>}{flowError ? <p role="alert" className="mt-3 break-words text-xs text-amber-700 dark:text-amber-200">{flowError}</p> : null}</div>
+      {platform === "doubao" ? <DoubaoGatewayBlock onDone={onClose} /> : null}
+      {platform === "doubao" ? null : <div className="rounded-xl bg-blue-500/5 p-4"><p className="text-sm font-medium">在浏览器中完成授权</p><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">授权完成后自动连接账户。</p>{flow ? <div className="mt-4 flex flex-wrap items-center gap-3"><Loader2 size={16} className="animate-spin text-blue-500" /><span className="text-xs">等待授权 · {time(flow.expiresAt)} 到期</span><Pressable type="button" className="glass-secondary-button min-h-7 px-2 py-1 text-xs" onClick={() => { setFlow(null); setFlowError(""); }}>取消</Pressable></div> : <Pressable type="button" className="glass-primary-button mt-4 text-xs" onClick={() => void login()} disabled={authorizing}>{authorizing ? <Loader2 size={14} className="animate-spin" /> : <ExternalLink size={14} />}前往 {platformName(platform)} {regionName(region)} 登录</Pressable>}{flowError ? <p role="alert" className="mt-3 break-words text-xs text-amber-700 dark:text-amber-200">{flowError}</p> : null}</div>}
       {platform === "traework" || platform === "minimax-code" ? <div className="rounded-xl bg-blue-500/5 p-4"><p className="text-sm font-medium">从本机 {platformName(platform)} {regionName(region)} 应用一键导入</p><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">读取本机 {platformName(platform)} {regionName(region)}桌面登录信息{platform === "minimax-code" ? "，兼容 mcode CLI 凭据" : region === "cn" ? "，兼容国内 CLI 凭据" : ""}；无需复制 Token。</p><Pressable type="button" className="glass-secondary-button mt-4 text-xs" disabled={importing || authorizing || Boolean(flow)} onClick={() => void importLocal()}>{importing ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />}一键导入本机凭据</Pressable>{importError ? <p role="alert" className="mt-3 break-words text-xs text-amber-700 dark:text-amber-200">{importError}</p> : null}</div> : null}
       {platform === "workbuddy" ? <FileImportBlock onDone={onClose} /> : null}
     </div>
@@ -367,6 +369,79 @@ function AddAccountModal({ platform: initialPlatform, onClose }: { platform: Cre
  * 分两步：先选文件解析，把识别结果摆出来让人确认；点「确认导入」才真正写库。
  * 这样导错了能当场看见，不会像直接导入那样无声地写进去一堆无效账号。
  */
+/**
+ * 豆包网关接入表单。
+ *
+ * 豆包是这个面板里唯一不需要 OAuth 的平台 —— 它后面是本机的豆包网关
+ * （Python 进程），凭证就是"网关地址 + API Key"。所以这里给两个输入框，
+ * 而不是授权按钮。
+ *
+ * 地址默认填 127.0.0.1:9091，粘上 Key 就能用。之所以让地址可改，
+ * 是为了支持把网关跑在局域网另一台机器上。
+ */
+function DoubaoGatewayBlock({ onDone }: { onDone: () => void }) {
+  const queryClient = useQueryClient();
+  const [key, setKey] = useState("");
+  const [url, setUrl] = useState("http://127.0.0.1:9091");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async () => {
+    setError("");
+    if (!key.trim()) {
+      setError("请填写 API Key。它在网关目录的 api_key.txt 里。");
+      return;
+    }
+    setBusy(true);
+    try {
+      await creditsApi.addDoubao(key, url);
+      await queryClient.invalidateQueries({ queryKey: creditsQueryKey });
+      toast.success("豆包网关已接入");
+      onDone();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl bg-blue-500/5 p-4">
+      <p className="text-sm font-medium">接入本机豆包网关</p>
+      <p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+        豆包通过独立的本地网关运行（负责多账号轮换和每日签到），这里只需要填网关地址和密钥。
+        即使网关出问题，也不会影响其他平台的调用。
+      </p>
+      <label className="mt-4 block text-xs font-medium" htmlFor="doubao-gateway-url">网关地址</label>
+      <input
+        id="doubao-gateway-url"
+        className="glass-input mt-1 w-full text-xs"
+        value={url}
+        onChange={(e) => setUrl(e.target.value)}
+        placeholder="http://127.0.0.1:9091"
+        spellCheck={false}
+      />
+      <label className="mt-3 block text-xs font-medium" htmlFor="doubao-gateway-key">API Key</label>
+      <input
+        id="doubao-gateway-key"
+        className="glass-input mt-1 w-full text-xs"
+        value={key}
+        onChange={(e) => setKey(e.target.value)}
+        placeholder="dbt_..."
+        spellCheck={false}
+        type="password"
+      />
+      <p className="mt-2 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+        Key 在网关目录的 <code>api_key.txt</code> 里。网关没启动时这里会提示连不上，先把它运行起来即可。
+      </p>
+      {error ? <p role="alert" className="mt-3 break-words text-xs text-amber-700 dark:text-amber-200">{error}</p> : null}
+      <Pressable type="button" className="glass-primary-button mt-4 text-xs" disabled={busy} onClick={() => void submit()}>
+        {busy ? <Loader2 size={13} className="animate-spin" /> : <Server size={13} />}连接网关
+      </Pressable>
+    </div>
+  );
+}
+
 function FileImportBlock({ onDone }: { onDone: () => void }) {
   const queryClient = useQueryClient();
   const [report, setReport] = useState<ParseReport | null>(null);

@@ -206,6 +206,15 @@ impl ProviderClient {
                 ));
                 url
             }
+            Platform::Doubao => {
+                // 豆包没有 OAuth 流程：它是一个本地转发平台，凭证就是网关地址
+                // 加 API Key，不涉及浏览器授权往返。走到这里说明前端给了错误的
+                // 平台类型，直接拒绝，别让它静默生成一个无法使用的登录流程。
+                return Err(ProviderError::new(
+                    400,
+                    "豆包平台不需要 OAuth 登录，请直接在账号里填写网关地址和 API Key",
+                ));
+            }
         };
         let mut flows = self.flows.lock().await;
         flows.retain(|_, f| f.expires_at > now_ms());
@@ -575,6 +584,10 @@ impl ProviderClient {
                 }
                 Ok(Some(c))
             }
+            Platform::Doubao => Err(ProviderError::new(
+                400,
+                "豆包平台没有 OAuth 轮询流程",
+            )),
         }
     }
 }

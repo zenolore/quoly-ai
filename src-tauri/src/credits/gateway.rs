@@ -833,8 +833,24 @@ fn account_eligible(account: &Account) -> bool {
 }
 
 fn model_matches(account: &Account, model: &ModelInfo, requested: &str) -> bool {
-    requested == format!("{}/{}", account.platform.route_key(account.region), model.id)
-        || (account.region == super::types::CreditRegion::Cn && model.verified && model.canonical_id.as_deref() == Some(requested))
+    let prefixed = format!("{}/{}", account.platform.route_key(account.region), model.id);
+    if requested == prefixed {
+        return true;
+    }
+    // 裸模型名（不带平台前缀）可以匹配同一个 canonical 身份，但要排除转发型平台。
+    //
+    // 这里原本只判 `model.verified && canonical_id == requested`，不区分平台。
+    // 加豆包平台之后这会变成一个坑：豆包也有 glm-5.3、kimi-k3 这类同名模型，
+    // 用户写 `glm-5.3` 时可能被路由到豆包账号上，而豆包限流频繁 ——
+    // 表现就是"用 glm 时好时坏"，且豆包一挂连累这个裸名彻底不可用。
+    // 裸名是"哪家都行，给我个 glm 就行"的语义，转发型平台不该参与这种兜底，
+    // 除非用户明确写了 doubao/ 前缀。
+    if account.platform.is_proxied() {
+        return false;
+    }
+    account.region == super::types::CreditRegion::Cn
+        && model.verified
+        && model.canonical_id.as_deref() == Some(requested)
 }
 
 fn candidates(accounts: Vec<Account>, requested: &str, tools: bool, now: i64) -> Vec<Candidate> {
@@ -912,6 +928,34 @@ fn fallback_chain(requested: &str) -> Vec<String> {
         return Vec::new();
     };
     let name = model.to_ascii_lowercase();
+
+    // 豆包是本地转发型平台，**降级链只能在豆包内部**。
+    //
+    // 这是隔离的硬要求：豆包风控频繁，一次限流就会把整池账号打挂。如果这时
+    // 允许沿用下面那张跨模型的通用降级表，请求会涌向 glm-5.3 /
+    // deepseek-v4.1-flash 这些目标 —— 而它们在 workbuddy 等平台上是真的
+    // 会计费的。表现就是"豆包随便用，别家额度莫名其妙掉光"，用户完全查不到
+    // 原因。宁可让豆包请求明确失败，也不能悄悄换平台烧钱。
+    if platform == Platform::Doubao.key() {
+        // 豆包内部只做"同名家族内降级"，不做跨家族跳跃：
+        // 用户点的是豆包，就给他豆包的同档次模型。
+        const DOUBAO_CHAINS: &[(&str, &[&str])] = &[
+            ("doubao-2.1-pro", &["doubao-2.1-turbo", "doubao-quick"]),
+            ("doubao-2.1-turbo", &["doubao-2.1-lite", "doubao-quick"]),
+            ("doubao-2.1-lite", &["doubao-quick"]),
+            ("kimi-k3.1-pro-highspeed", &["kimi-k3.1-pro", "kimi-k3"]),
+            ("kimi-k3.1-pro", &["kimi-k3"]),
+        ];
+        let chain = DOUBAO_CHAINS
+            .iter()
+            .find(|(from, _)| name == from.to_ascii_lowercase())
+            .map(|(_, to)| *to)
+            .unwrap_or(&[]);
+        return chain
+            .iter()
+            .map(|candidate| format!("{platform}/{candidate}"))
+            .collect();
+    }
 
     // Strongest-first ordering shared by the chains below. `kimi-k3` is
     // deliberately omitted for `traework`: its free-credit pool cannot use
@@ -4231,5 +4275,56 @@ mod tests {
         assert!(!body.contains("[DONE]"));
         assert_eq!(manager.provider.test_chat_calls(), vec!["first"]);
         gateway.stop().await.unwrap();
+    }
+
+    /// 豆包平台必须和其余平台彻底隔离 —— 这是用户明确要求的第一原则：
+    /// "就算豆包有问题也不影响其他模型的调用"。
+    ///
+    /// 隔离靠三道闸，这个测试把三道都钉住：
+    ///  1. 带前缀点名豆包时，只能落到豆包账号上，不会借到别家
+    ///  2. 点名别家时，不会因为模型同而跑到豆包账号上
+    ///  3. 豆包账号全部不可用时，点名豆包的请求直接报错，
+    ///     **不会静默降级到其他平台**（这条最关键：悄悄换平台会烧掉别家额度，
+    ///     而且用户完全无感，以为还在用豆包）
+    #[test]
+    fn doubao_is_isolated_from_other_platforms_in_both_directions() {
+        let now = now_ms();
+        // 豆包和 workbuddy 都提供 glm-5.3，这是最容易串台的形状
+        let mut doubao = account("doubao-1", "glm-5.3", now + 10000);
+        doubao.platform = Platform::Doubao;
+        let mut wb = account("wb-1", "glm-5.3", now + 10000);
+        wb.platform = Platform::Workbuddy;
+
+        // 1) 点名豆包 → 只有豆包账号
+        let picked = candidates(vec![doubao.clone(), wb.clone()], "doubao/glm-5.3", false, now);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].account.platform, Platform::Doubao);
+
+        // 2) 点名 workbuddy → 只有 workbuddy 账号
+        let picked = candidates(vec![doubao.clone(), wb.clone()], "workbuddy/glm-5.3", false, now);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].account.platform, Platform::Workbuddy);
+
+        // 3) 豆包账号掉线时，点名豆包的请求不能借到 workbuddy
+        let mut dead = doubao.clone();
+        dead.status = "expired".into();
+        assert!(
+            candidates(vec![dead.clone(), wb.clone()], "doubao/glm-5.3", false, now).is_empty(),
+            "豆包全部失效时必须老实报错，不能降级到其他平台"
+        );
+
+        // 4) 降级链也不能跨平台：豆包模型的替代品必须在豆包内部找
+        for fallback in fallback_chain("doubao/glm-5.3") {
+            assert!(
+                fallback.starts_with("doubao/"),
+                "豆包模型的降级目标越界了：{fallback}"
+            );
+        }
+        for fallback in fallback_chain("doubao/doubao-quick") {
+            assert!(
+                fallback.starts_with("doubao/"),
+                "豆包模型的降级目标越界了：{fallback}"
+            );
+        }
     }
 }

@@ -278,6 +278,7 @@ pub fn run() {
             commands::credits::credits_set_view_active,
             commands::credits::credits_network_restored,
             commands::credits::credits_import_local,
+            commands::credits::credits_add_doubao,
             commands::credits::credits_parse_account_file,
             commands::credits::credits_import_accounts,
             commands::credits::credits_set_account_enabled,
