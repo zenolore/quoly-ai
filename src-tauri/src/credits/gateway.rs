@@ -2388,6 +2388,8 @@ mod tests {
                     name: "pack".into(),
                     remaining: Some(100.0),
                     expires_at: Some(expiry),
+                    total: Some(100.0),
+                    created_at: None,
                 }],
                 rewards: vec![],
                 models: vec![ModelInfo {
@@ -2579,10 +2581,10 @@ mod tests {
             {"index":0,"id":""}, {"index":1,"id":null}
         ]},"finish_reason":"tool_calls"}]}));
         assert_eq!(completion.tools.len(), 2);
-        assert_eq!(completion.tools[&0]["id"], "call_a");
-        assert_eq!(completion.tools[&1]["id"], "call_b");
-        assert_eq!(completion.tools[&0]["function"]["arguments"], "{}");
-        assert_eq!(completion.tools[&1]["function"]["arguments"], "{}");
+        assert_eq!(completion.tools[&0].id, "call_a");
+        assert_eq!(completion.tools[&1].id, "call_b");
+        assert_eq!(completion.tools[&0].arguments, "{}");
+        assert_eq!(completion.tools[&1].arguments, "{}");
     }
 
     fn test_context() -> Arc<GatewayContext> {

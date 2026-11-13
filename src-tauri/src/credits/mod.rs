@@ -20,6 +20,12 @@ use types::*;
 
 const GATEWAY_API_KEY_ID: &str = "gateway-api-key";
 
+/// How long request-usage rows are kept. 90 days covers every window the
+/// dashboard reports on (today / month / 30d) with room for month-over-month
+/// comparison, and caps the table at roughly 750k rows at this machine's
+/// measured ~8300 requests/day. See `CreditStore::prune_requests`.
+const REQUEST_HISTORY_DAYS: i64 = 90;
+
 pub struct CreditManager {
     pub store: store::CreditStore,
     pub provider: providers::ProviderClient,
@@ -761,6 +767,19 @@ impl CreditManager {
     pub fn record_request(&self, summary: RequestSummary) -> Result<(), String> {
         self.store.record_request(&summary)
     }
+    /// Keep `credit_requests` bounded; called once a day from the scheduler.
+    ///
+    /// Failure is ignored on purpose: pruning is housekeeping, and a locked or
+    /// busy database must not take down the scheduler tick that also drives
+    /// check-in and growth. The count is surfaced through `trail` so a long-lived
+    /// install can be checked for how much history is actually accumulating.
+    pub fn prune_request_history(&self) {
+        if let Ok(removed) = self.store.prune_requests(REQUEST_HISTORY_DAYS) {
+            if removed > 0 {
+                crate::credits::trail::mark(&format!("prune requests -{removed}"));
+            }
+        }
+    }
     pub async fn invalidate_model(
         &self,
         id: &str,
@@ -926,6 +945,11 @@ impl CreditManager {
             let mut retry_attempt: usize = 0;
             let retry_delays_ms = [600_000i64, 1_800_000, 3_600_000, 7_200_000, 14_400_000];
             let mut next_retry_at: Option<i64> = None;
+            // Retention pass. Runs on the first tick after startup and then once a
+            // day. It runs off the async runtime via `spawn_blocking` because the
+            // DELETE holds the store mutex and a large delete on a 45 MB database
+            // would otherwise stall every other request's bookkeeping write.
+            let mut last_prune_day: Option<i64> = None;
             // The first tick is immediate, so startup catch-up follows the same schedule.
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -934,6 +958,14 @@ impl CreditManager {
                     _ = manager.cancellation.cancelled() => break,
                     _ = interval.tick() => {
                         let now = now_ms();
+                        // Housekeeping first: it is cheap when there is nothing to
+                        // delete, and doing it before the claim pass means a huge
+                        // backlog of old rows is gone before the day's writes land.
+                        if last_prune_day != Some(now / 86_400_000) {
+                            last_prune_day = Some(now / 86_400_000);
+                            let housekeeper = manager.clone();
+                            tokio::task::spawn_blocking(move || housekeeper.prune_request_history());
+                        }
                         let (day, due) = claim_schedule(now);
                         if due && last_day != Some(day) && manager.store.settings().is_ok_and(|s| s.auto_claim) {
                             last_day = Some(day);

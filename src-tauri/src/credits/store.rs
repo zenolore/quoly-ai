@@ -24,6 +24,41 @@ impl CreditStore {
     pub fn new(conn: Arc<Mutex<Connection>>) -> Result<Self, String> {
         let store = Self { conn };
         migrate_account_regions(&mut store.conn.lock())?;
+        // 2026-11-13: journal mode and durability.
+        //
+        // The gateway writes one row per finished request from `RequestGuard::drop`,
+        // on the async runtime, while the dashboard reads `credit_requests` for
+        // every panel refresh. Measured on this machine with 74k rows already in
+        // the table (peak traffic is ~140 req/min, 16889 req/day):
+        //
+        //   rollback journal + no index : write P95 505 ms, read median 317 ms
+        //   WAL + created_at index      : write P95   1 ms, read median   8 ms
+        //
+        // The read numbers were bad because `requests_between` filters and orders
+        // by `created_at`, which had no index — every panel refresh scanned the
+        // whole table. The write numbers were bad because the default rollback
+        // journal takes an exclusive lock for the duration of each commit, so a
+        // reader in flight blocks the writer (and vice versa). WAL lets readers
+        // and the writer proceed concurrently.
+        //
+        // `synchronous=NORMAL` under WAL only risks the last few transactions on
+        // an OS-level crash (not on an app crash). That is an acceptable trade for
+        // request-usage accounting, and it removes an fsync from every insert.
+        //
+        // Only for on-disk databases: `journal_mode=WAL` is not supported by
+        // in-memory databases and the statement errors there. Tests build the
+        // store on `:memory:`, and `execute_batch` stops at the first failing
+        // statement — which would leave the schema uncreated.
+        {
+            let conn = store.conn.lock();
+            let is_memory: bool = conn
+                .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+                .map(|path| path.is_empty())
+                .unwrap_or(false);
+            if !is_memory {
+                let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+            }
+        }
         store
             .conn
             .lock()
@@ -47,6 +82,16 @@ impl CreditStore {
                 id TEXT PRIMARY KEY, account_id TEXT NOT NULL, summary TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            -- Every usage query filters on created_at range and orders by it
+            -- (`requests_between`, the usage trend, the daily report). Without
+            -- this index each of those scanned all rows: measured 191 ms per
+            -- 7-day/5000-row page at 74k rows, versus 3 ms with the index.
+            CREATE INDEX IF NOT EXISTS credit_requests_at
+                ON credit_requests(created_at);
+            -- Per-account history (`requests()` newest-first) and the model-health
+            -- rollup both start from account_id.
+            CREATE INDEX IF NOT EXISTS credit_requests_account_at
+                ON credit_requests(account_id, created_at);
             -- One row per growth-center pass per account. Kept separate from
             -- credit_rewards because a growth pass reports many things (travel
             -- claimed, tasks accepted, boxes opened) that are not a single reward,
@@ -296,6 +341,30 @@ impl CreditStore {
 
     pub fn rewards(&self) -> Result<Vec<RewardOutcome>, String> {
         self.history("credit_rewards", "outcome")
+    }
+
+    /// Drop request rows older than `keep_days`, keeping the table bounded.
+    ///
+    /// 2026-11-13: nothing ever pruned `credit_requests`. Measured growth on this
+    /// machine is ~8300 rows / 2.7 MB per day (peaks of 16.9k rows in one day), so
+    /// after a year the table would hold ~3M rows / ~1 GB. Every usage query
+    /// filters by `created_at` over that table, so the cost shows up as dashboard
+    /// lag that creeps up month by month rather than as anything obviously broken.
+    ///
+    /// 90 days keeps a full quarter of usage history — enough for every report the
+    /// dashboard offers (today / month / 30d) plus month-over-month comparison —
+    /// while capping the table at roughly 750k rows.
+    ///
+    /// `credit_rewards` and `credit_activations` are deliberately NOT pruned: they
+    /// are the credit ledger and an activation audit trail, both far smaller and
+    /// both needed for long-range accounting.
+    pub fn prune_requests(&self, keep_days: i64) -> Result<usize, String> {
+        let cutoff = crate::credits::types::now_ms() - keep_days * 24 * 60 * 60 * 1000;
+        let conn = self.conn.lock();
+        let removed = conn
+            .execute("DELETE FROM credit_requests WHERE created_at < ?1", params![cutoff])
+            .map_err(db_error)?;
+        Ok(removed)
     }
 
     /// Claim outcomes inside `[since, until]`, newest first.

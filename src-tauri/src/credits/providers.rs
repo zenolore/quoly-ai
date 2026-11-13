@@ -849,8 +849,8 @@ mod tests {
     #[test]
     fn native_units_are_never_combined_and_catalog_versions_are_recognized() {
         let packs = vec![
-            CreditPack { id: "usd".into(), name: "USD".into(), unit: "usd".into(), remaining: Some(0.00125), expires_at: None },
-            CreditPack { id: "requests".into(), name: "Requests".into(), unit: "requests".into(), remaining: Some(10.0), expires_at: None },
+            CreditPack { id: "usd".into(), name: "USD".into(), unit: "usd".into(), remaining: Some(0.00125), expires_at: None, total: None, created_at: None },
+            CreditPack { id: "requests".into(), name: "Requests".into(), unit: "requests".into(), remaining: Some(10.0), expires_at: None, total: Some(10.0), created_at: None },
         ];
         let usd = snapshot(vec![packs[0].clone()], vec![], vec![], None);
         assert_eq!(usd.balance, Some(0.00125)); assert_eq!(usd.unit, "usd");
