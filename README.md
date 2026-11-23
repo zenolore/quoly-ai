@@ -23,6 +23,19 @@
 
 ---
 
+<p align="center">
+  <img src="assets/screenshots/main-panel.png" width="100%" alt="总览：积分余额、代理状态、今日新领与调用趋势">
+</p>
+
+<p align="center">
+  <sub>一屏看完：各平台积分余额、代理是否在跑、今天新领了多少分、每个平台签到到账情况，以及 30 天的 Token 与调用趋势</sub>
+</p>
+
+**如果这个项目对你有用，点个 ⭐ Star 是让作者继续迭代下去最直接的动力** ——
+它也会让更多被额度打断的人找到这里。
+
+---
+
 ## 它解决什么问题
 
 如果你同时订了 WorkBuddy、TRAE、Qoder、MiniMax，大概率遇到过这些事：

@@ -23,6 +23,19 @@ every feature here was ground out of real use, not a demo.**
 
 ---
 
+<p align="center">
+  <img src="assets/screenshots/main-panel.png" width="100%" alt="Overview: credit balances, proxy status, today's claims and usage trend">
+</p>
+
+<p align="center">
+  <sub>One screen: balances per platform, whether the proxy is running, credits claimed today, per-platform check-in results, and 30 days of token / request trend</sub>
+</p>
+
+**If this saves you time, a ⭐ Star is the most direct way to keep it maintained** —
+it also helps the next person who keeps getting cut off by quota limits find it.
+
+---
+
 ## What it solves
 
 If you pay for WorkBuddy, TRAE, Qoder and MiniMax at the same time, you've probably hit these:
