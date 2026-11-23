@@ -28,7 +28,7 @@
     "active": true,
     "resources": ["src/credits/providers/NOTICE.md"],
     "targets": ["app", "dmg", "msi"],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
