@@ -13,6 +13,8 @@ const toast = Object.assign(() => {}, { error() {}, success() {} });
 const stubs = {
   sonner: { toast },
   "./ModelInfoPopover": { ModelInfoPopover: () => null },
+  // 账户卡片会渲染模型健康入口，测试里不需要它的真实实现。
+  "./ModelHealthView": { ModelHealthView: () => null },
   "@tauri-apps/plugin-shell": { open: async (url) => { state.opened.push(url); } },
   "@/components/ui/Modal": { Modal: () => null },
   "@/components/ui/AgentIcon": { AgentIcon: ({ name }) => createElement("span", { role: "img", "aria-label": name, title: name }) },

@@ -44,7 +44,7 @@ API Key:   copy from the "Credits & Proxy" page
 Model:     workbuddy/deepseek-v4.1-flash
 ```
 
-**That gives you 73 models** spread across 101 accounts. When an account runs out or gets rate-limited, the request rolls to the next one — and the reset time the platform reports in its limit response is remembered, so that account is skipped until it actually recovers.
+**That gives you 87 models** spread across 117 usable accounts. When an account runs out or gets rate-limited, the request rolls to the next one — and the reset time the platform reports in its limit response is remembered, so that account is skipped until it actually recovers.
 
 **Every morning** it claims the daily check-in and task credits on every platform. You don't touch it.
 
@@ -57,8 +57,8 @@ One week on the author's own machine:
 | Requests (7d) | **55,671** |
 | Tokens (7d) | **9.9 billion** (~1.4B/day) |
 | Peak day | 3.0B tokens / 16,889 requests (2026-11-09) |
-| Accounts | **101** (WorkBuddy 56 / Qoder 21 / TRAE 18 / MiniMax 6) |
-| Models | **73** |
+| Accounts | **117 usable** (WorkBuddy 57 / Qoder 26 / TRAE 23 / MiniMax 10 / Doubao 1) |
+| Models | **87** |
 | TRAE check-in | **5/18 succeed** (28%; the rest have no check-in activity on the platform side) |
 
 These change daily, because the project is still used and changed daily.

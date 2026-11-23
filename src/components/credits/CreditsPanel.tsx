@@ -4,7 +4,8 @@ import {
   ArrowUpRight, CheckCircle2, ChevronDown, ChevronRight, Coins, Copy, ExternalLink, KeyRound, Loader2,
   FileUp, Info, Plus, Power, RefreshCw, Server, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, X,
 } from "lucide-react";
-import { open } from "@tauri-apps/plugin-shell";
+// 别名导入：组件内部大量使用 `open` 作为展开状态，直接导入会触发 no-shadow。
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { toast } from "sonner";
 import { Modal } from "@/components/ui/Modal";
 import { Pressable } from "@/components/ui/Pressable";
@@ -244,8 +245,8 @@ const AccountCard = memo(function AccountCard({ account, onDeleteAccount, refres
     <div className="mt-4 border-t border-slate-500/10 pt-4">
       <p className="mb-2 text-xs font-medium">{automaticReward ? "奖励发放" : "积分领取"}</p>
       {credits.length ? <div className="space-y-2">{credits.map((reward) => <div key={reward.id} className="flex items-start justify-between gap-3 text-xs"><span className="min-w-0 flex-1 break-words">{reward.name}{reward.amount != null ? ` · ${number(reward.amount)}` : ""}</span><span className="shrink-0 whitespace-nowrap text-slate-500 dark:text-slate-400">{labels[reward.status] ?? reward.status}</span></div>)}</div> : <p className="text-xs text-slate-500 dark:text-slate-400">{automaticReward ? "符合条件的活跃奖励由平台自动发放，无需手动领取。" : noDailyReward ? "国际版未提供每日签到任务。" : snapshot ? "当前没有可领取的积分任务。" : "刷新后查看领取资格。"}</p>}
-      {account.platform !== "qoder" && activities.length ? <div className="mt-3 rounded-lg bg-sky-500/5 p-2.5"><p className="mb-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">平台活动</p>{activities.map((reward) => <div key={reward.id} className="flex flex-wrap items-center justify-between gap-1 py-0.5"><span className="min-w-0 flex-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">{reward.name} · {labels[reward.status] ?? reward.status}</span>{reward.actionUrl ? <Pressable type="button" className="glass-secondary-button min-h-6 shrink-0 px-2 py-0.5 text-[11px]" onClick={() => void open(reward.actionUrl!).catch(() => toast.error("无法打开活动页"))}>活动详情<ExternalLink size={11} /></Pressable> : null}</div>)}</div> : null}
-      {account.platform !== "qoder" && otherRewards.length ? <div className="mt-3 rounded-lg bg-slate-500/5 p-2.5"><p className="mb-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">优惠券及其他奖励</p>{otherRewards.map((reward) => <div key={reward.id} className="flex flex-wrap items-center justify-between gap-1 py-0.5"><span className="min-w-0 flex-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">{reward.name} · {labels[reward.status] ?? reward.status}</span>{reward.actionUrl ? <Pressable type="button" className="glass-secondary-button min-h-6 shrink-0 px-2 py-0.5 text-[11px]" onClick={() => void open(reward.actionUrl!).catch(() => toast.error("无法打开活动页"))}>打开活动页<ExternalLink size={11} /></Pressable> : null}</div>)}</div> : null}
+      {account.platform !== "qoder" && activities.length ? <div className="mt-3 rounded-lg bg-sky-500/5 p-2.5"><p className="mb-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">平台活动</p>{activities.map((reward) => <div key={reward.id} className="flex flex-wrap items-center justify-between gap-1 py-0.5"><span className="min-w-0 flex-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">{reward.name} · {labels[reward.status] ?? reward.status}</span>{reward.actionUrl ? <Pressable type="button" className="glass-secondary-button min-h-6 shrink-0 px-2 py-0.5 text-[11px]" onClick={() => void openExternal(reward.actionUrl!).catch(() => toast.error("无法打开活动页"))}>活动详情<ExternalLink size={11} /></Pressable> : null}</div>)}</div> : null}
+      {account.platform !== "qoder" && otherRewards.length ? <div className="mt-3 rounded-lg bg-slate-500/5 p-2.5"><p className="mb-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">优惠券及其他奖励</p>{otherRewards.map((reward) => <div key={reward.id} className="flex flex-wrap items-center justify-between gap-1 py-0.5"><span className="min-w-0 flex-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">{reward.name} · {labels[reward.status] ?? reward.status}</span>{reward.actionUrl ? <Pressable type="button" className="glass-secondary-button min-h-6 shrink-0 px-2 py-0.5 text-[11px]" onClick={() => void openExternal(reward.actionUrl!).catch(() => toast.error("无法打开活动页"))}>打开活动页<ExternalLink size={11} /></Pressable> : null}</div>)}</div> : null}
     </div>
     {account.region === "intl" && snapshot?.packs.length ? <div className="mt-4 space-y-2 border-t border-slate-500/10 pt-3" aria-label="额度明细">{snapshot.packs.map((pack) => <div key={pack.id} className="flex justify-between gap-3 text-xs"><span className="min-w-0 break-words text-slate-500 dark:text-slate-400">{pack.name}</span><span className="shrink-0 tabular-nums">{pack.remaining == null ? "未知" : amount(pack.remaining, pack.unit ?? snapshot.unit)} {unitName(pack.unit ?? snapshot.unit)}</span></div>)}</div> : null}
     <div className="mt-4 border-t border-slate-500/10 pt-3"><Pressable type="button" className="glass-secondary-button min-h-8 px-3 py-2 text-xs" onClick={() => setShowingModels(true)}>可用模型 · {models.length}</Pressable></div>
@@ -310,7 +311,7 @@ function DoubaoSubAccounts({ subs }: { subs: SubAccount[] }) {
  * 它们不参与网关路由 —— 网关的 account_eligible 只认 ready，
  * 而这里的状态是 signable，天然被排除。
  */
-function SignableAccountsGroup({ accounts, onDelete, platformName }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; platformName: string }) {
+function SignableAccountsGroup({ accounts, onDelete, platformLabel }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; platformLabel: string }) {
   const [open, setOpen] = useState(false);
   return <div className="rounded-[var(--radius-card,12px)] border border-dashed border-amber-400/50 dark:border-amber-600/40">
     <button
@@ -326,7 +327,7 @@ function SignableAccountsGroup({ accounts, onDelete, platformName }: { accounts:
     </button>
     {open ? <div className="space-y-1.5 border-t border-amber-200/60 px-3 py-2.5 dark:border-amber-900/40">
       <p className="pb-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-        {platformName} 的这批账号签到、领积分都正常，但调用模型会被上游以 11140（request illegal）拒绝。
+        {platformLabel} 的这批账号签到、领积分都正常，但调用模型会被上游以 11140（request illegal）拒绝。
         它们不会参与 API 路由，所以不会拉低调用成功率；每天该拿的积分照常领取。
         上游风控有时会自行解除，过几天可以重新体检一次。
       </p>
@@ -359,7 +360,7 @@ function SignableAccountsGroup({ accounts, onDelete, platformName }: { accounts:
  * 折叠后：标题行写「N 个异常账号（点开查看）」，展开才逐条列出，
  * 每条带状态和原因。这样隔几天回来重测也方便——展开一眼就能看到还有哪些。
  */
-function DeadAccountsGroup({ accounts, onDelete, platformName }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; platformName: string }) {
+function DeadAccountsGroup({ accounts, onDelete, platformLabel }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; platformLabel: string }) {
   const [open, setOpen] = useState(false);
   const banned = accounts.filter((a) => a.status === "banned").length;
   const expired = accounts.filter((a) => a.status === "expired").length;
@@ -379,7 +380,7 @@ function DeadAccountsGroup({ accounts, onDelete, platformName }: { accounts: Cre
     </button>
     {open ? <div className="space-y-1.5 border-t border-slate-200/70 px-3 py-2.5 dark:border-slate-800">
       <p className="pb-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-        这些 {platformName} 账号当前无法签到。建议隔几天再刷新重测一次：上游封禁有时会自行解除，
+        这些 {platformLabel} 账号当前无法签到。建议隔几天再刷新重测一次：上游封禁有时会自行解除，
         仅凭证过期的号重新登录即可恢复。确认长期不行再删除。
       </p>
       {accounts.map((account) => {
@@ -518,7 +519,7 @@ function AddAccountModal({ platform: initialPlatform, onClose }: { platform: Cre
     setAuthorizing(true); setFlowError("");
     try {
       const result = await creditsApi.oauthStart(platform, region);
-      await open(result.authorizationUrl);
+      await openExternal(result.authorizationUrl);
       setFlow(result);
     } catch (error) { setFlowError(errorMessage(error)); }
     finally { setAuthorizing(false); }
@@ -650,8 +651,8 @@ function FileImportBlock({ onDone }: { onDone: () => void }) {
     setError("");
     setOutcomes(null);
     try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const picked = await open({
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+      const picked = await openDialog({
         multiple: false,
         filters: [{ name: "账号文件", extensions: ["json"] }],
       });
@@ -894,8 +895,8 @@ function AccountsView({ data, onAdd }: { data: CreditDashboard; onAdd: (platform
         return <section key={platform.id} className="min-w-0 space-y-3">
           <div className="flex items-center gap-2 px-1"><AgentIcon id={platform.id} name={platform.name} className="h-7 w-7" /><h2 className="text-sm font-semibold">{platform.name}</h2>{signable.length > 0 ? <span className="ml-auto text-xs text-amber-600 dark:text-amber-400">{signable.length} 个仅可签到</span> : null}{dead.length > 0 ? <span className={`text-xs text-rose-600 dark:text-rose-400 ${signable.length > 0 ? "" : "ml-auto"}`}>{dead.length} 个异常</span> : null}<span className={signable.length > 0 || dead.length > 0 ? "text-xs text-slate-500 dark:text-slate-400" : "ml-auto text-xs text-slate-500 dark:text-slate-400"}>{countLabel}</span></div>
           {accounts.length ? <AccountStack accounts={accounts} onDelete={setDeleting} refreshingAccountIds={data.refreshingAccountIds} /> : (dead.length === 0 && signable.length === 0) ? <div className="glass-card flex min-h-[260px] flex-col items-center justify-center p-6 text-center"><KeyRound size={25} className="text-slate-400" /><p className="mt-4 text-sm font-medium">连接 {platform.name}</p><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">登录后查看余额、领取资格与模型目录。</p><Pressable type="button" className="glass-secondary-button mt-5 text-xs" onClick={() => onAdd(platform.id)}><Plus size={14} />添加账户</Pressable></div> : null}
-          {signable.length > 0 ? <SignableAccountsGroup accounts={signable} onDelete={setDeleting} platformName={platform.name} /> : null}
-          {dead.length > 0 ? <DeadAccountsGroup accounts={dead} onDelete={setDeleting} platformName={platform.name} /> : null}
+          {signable.length > 0 ? <SignableAccountsGroup accounts={signable} onDelete={setDeleting} platformLabel={platform.name} /> : null}
+          {dead.length > 0 ? <DeadAccountsGroup accounts={dead} onDelete={setDeleting} platformLabel={platform.name} /> : null}
         </section>;
       })}
     </div>
