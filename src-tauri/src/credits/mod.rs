@@ -1,5 +1,6 @@
 pub mod activate;
 pub mod account_file;
+pub mod account_health;
 pub mod growth;
 pub mod gateway;
 pub mod providers;
@@ -40,6 +41,24 @@ pub struct CreditManager {
     refresh_wake: Notify,
     scheduler_started: AtomicBool,
     event_sink: Mutex<Option<tauri::AppHandle>>,
+    /// 上次向前端广播 `credits-updated` 的时刻，用于节流。
+    ///
+    /// 为什么需要（2026-11-18 实测）：一次刷新周期里 129 个账号几乎同时完成，
+    /// 每个都 emit 一次 → 前端收到 129 个事件 → 129 次 2.41MB 全量重拉。
+    /// 节流后同一批只通知一次，前端只拉一遍。
+    last_emit_at: std::sync::atomic::AtomicI64,
+    /// 上次执行「每日体检」的自然日（北京时间），保证一天只跑一次。
+    last_daily_probe_day: std::sync::atomic::AtomicI64,
+}
+
+/// 把毫秒时间戳换算成北京时间的小时/分钟/秒。
+///
+/// 用于「23:40 之后才做每日体检」这类本地时间判断。
+/// 不用 chrono 是为了避免再引入时区依赖 —— 这里只需要 UTC+8 的固定偏移。
+fn cn_hour_minute(ts: i64) -> (i64, i64, i64) {
+    let local = ts + crate::credits::account_health::CN_OFFSET_MS;
+    let secs = local.div_euclid(1000).rem_euclid(86_400);
+    (secs / 3600, (secs % 3600) / 60, secs % 60)
 }
 
 /// One day of growth totals, for the history table.
@@ -107,6 +126,8 @@ impl CreditManager {
             refresh_wake: Notify::new(),
             scheduler_started: AtomicBool::new(false),
             event_sink: Mutex::new(None),
+            last_emit_at: std::sync::atomic::AtomicI64::new(0),
+            last_daily_probe_day: std::sync::atomic::AtomicI64::new(-1),
         }))
     }
 
@@ -129,6 +150,8 @@ impl CreditManager {
             refresh_wake: Notify::new(),
             scheduler_started: AtomicBool::new(false),
             event_sink: Mutex::new(None),
+            last_emit_at: std::sync::atomic::AtomicI64::new(0),
+            last_daily_probe_day: std::sync::atomic::AtomicI64::new(-1),
         })
     }
 
@@ -148,6 +171,10 @@ impl CreditManager {
         self.secrets.retry_access()?;
         self.refresh_schedule.lock().resume();
         Ok(())
+    }
+    /// 外部写入 vault 后，让本进程重新读盘同步凭据（无需重启客户端）。
+    pub fn reload_credentials(&self) -> Result<usize, String> {
+        self.secrets.reload_cache()
     }
     pub fn retry_gateway_key_access(&self) -> Result<(), String> {
         self.secrets
@@ -797,8 +824,7 @@ impl CreditManager {
         }
         self.store.save_account(&account)
     }
-    pub fn mark_stale(self: &Arc<Self>, id: &str) {
-        #[cfg(test)]
+    pub fn mark_stale(self: &Arc<Self>, id: &str) {        #[cfg(test)]
         {
             // Offline fixtures must never dispatch their synthetic tokens to real providers.
             if let Ok(mut account) = self.store.account(id) {
@@ -812,6 +838,48 @@ impl CreditManager {
             .dirty(now_ms() + refresh::PROXY_DELAY);
         self.refresh_wake.notify_one();
         self.emit_credits_changed();
+    }
+
+    /// 记录「这个账号在**推理**时被上游拒绝了」。
+    ///
+    /// 为什么需要（2026-11-18 实测发现的关键缺口）：
+    /// 网关路由失败时只调 `mark_stale()`（标记余额过期）然后记一条请求日志，
+    /// **从来不回写账号状态**。后果是：
+    ///   - 一批账号签到正常（`/billing` 返 active:true），但推理一直 403/11140
+    ///   - 状态却永远停在 `ready`，于是永远被选进路由池
+    ///   - 实测每 4 次请求就有 1 次失败，用户感觉"API 时好时坏"
+    ///
+    /// 这里把 11140 写回账号：状态标为 `signable`（仅可签到），
+    /// 于是它继续签到拿积分，但不再参与路由，成功率立刻回升。
+    ///
+    /// 只认 11140 这一类明确的"账号级"拒绝。429（限流）、5xx（上游故障）、
+    /// 超时都不该改状态——那是临时问题，改了会把好号越判越死。
+    pub fn note_inference_rejection(self: &Arc<Self>, id: &str, code: &str) {
+        if code != "11140" {
+            return;
+        }
+        let Ok(mut account) = self.store.account(id) else {
+            return;
+        };
+        let now = crate::credits::types::now_ms();
+        // 累计失败**天数**：这是「连续 3 天不可用就自动停用」的判据来源。
+        //
+        // 按自然日去重（record_daily_failure）：同一个账号一天里被拒 50 次，
+        // 也只记 1 天。否则 3 天的规则会被一小时刷满，等于没有。
+        let (days, first_at) =
+            crate::credits::account_health::record_daily_failure(&account, now);
+        account.last_error = Some(crate::credits::account_health::encode_fail(
+            "调用模型被上游拒绝（11140 request illegal）：签到与领积分仍正常，仅推理不可用",
+            days,
+            first_at,
+        ));
+        // 状态保持 signable（不参与路由），但**不**在这里停用 ——
+        // 停用交给调度器按「连续 3 天」统一判定，避免一次失败就判死。
+        account.status = crate::credits::account_health::STATUS_SIGNABLE.into();
+        account.enabled = true;
+        if self.store.save_account(&account).is_ok() {
+            self.emit_credits_changed();
+        }
     }
     /// userId → 账号 id。导入时用来判断「这号库里已经有了」。
     pub fn existing_user_ids(&self) -> Result<std::collections::HashMap<String, String>, String> {
@@ -869,6 +937,145 @@ impl CreditManager {
             }
         }
         Ok(out)
+    }
+
+    /// 悬浮窗专用的轻量统计。
+    ///
+    /// 与 `dashboard()` 的区别：这里**不碰 `accounts()`、不读 158 份快照**，
+    /// 只查一次聚合 SQL + 网关状态。实测 dashboard 是 70ms / 2.42MB，
+    /// 这个是 1~2ms / 不到 1KB。悬浮窗每 200ms 就要刷新一次，必须用这个。
+    /// 每日体检的触发时刻：北京时间 23:40。
+    ///
+    /// 用户要求（2026-11-19）：**只在 23:40 测今天未被调用过的账号**。
+    ///
+    /// 为什么选 23:40 而不是凌晨：一天快结束时，才能确定"今天确实没人用过"。
+    /// 凌晨测的话，账号在白天被正常调用也无法证明它是好的（可能本来就是死号，
+    /// 只是白天没被选中）。
+    const DAILY_PROBE_HOUR: i64 = 23;
+    const DAILY_PROBE_MINUTE: i64 = 40;
+
+    /// 每天 23:40 之后，给「今天一次都没被调用过」的账号补一次推理探测。
+    ///
+    /// 只测今天没被调用过的，理由：
+    ///   - 今天被调用过（无论成败）的账号，健康状态已经有结论了，不用重测；
+    ///   - 没被调用过的账号，它的「连续不可用天数」永远不前进，
+    ///     3 天停用规则对它无效。补测一次，让它每天至少前进一格。
+    ///
+    /// 一天只跑一次（用 `last_daily_probe_day` 记住已跑过的自然日）。
+    /// 串行、间隔 1 秒，避免和正常流量抢上游配额。
+    pub async fn daily_probe_if_due(self: &Arc<Self>, now: i64) {
+        let (hour, minute, _) = cn_hour_minute(now);
+        let today = crate::credits::account_health::cn_day(now);
+        // 还没到 23:40 就不做
+        if hour < Self::DAILY_PROBE_HOUR
+            || (hour == Self::DAILY_PROBE_HOUR && minute < Self::DAILY_PROBE_MINUTE)
+        {
+            return;
+        }
+        // 今天已经跑过就不再跑
+        {
+            let last = self
+                .last_daily_probe_day
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if last == today {
+                return;
+            }
+            self.last_daily_probe_day
+                .store(today, std::sync::atomic::Ordering::Relaxed);
+        }
+        // 今天已经有过请求的账号 id 集合
+        let day_start = (today * 86_400_000) - crate::credits::account_health::CN_OFFSET_MS;
+        let used: std::collections::HashSet<String> = self
+            .store
+            .requests_between(Some(day_start), now, 100_000)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.account_id)
+            .collect();
+        let Ok(accounts) = self.accounts() else {
+            return;
+        };
+        for account in accounts {
+            if !account.enabled {
+                continue;
+            }
+            // 只测今天没被调用过的
+            if used.contains(&account.id) {
+                continue;
+            }
+            if self.cancellation.is_cancelled() {
+                break;
+            }
+            // 直接用现有的刷新流程探测它的余额/模型 —— 顺带会带着推理可用性检查，
+            // 失败就会走 record_daily_failure 累计天数。
+            if let Ok(account) = self.store.account(&account.id) {
+                let _ = self.refresh(Some(account.id.as_str())).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        }
+    }
+
+    /// 自动停用「连续 3 天不可用」的账号。
+    ///
+    /// 用户明确要求（2026-11-18）：连续检测 3 天还确定不能用，就停用，
+    /// 且积分不再累计进总额。
+    ///
+    /// 判定交给 `account_health::is_dead`，条件同时满足才停：
+    ///   - 连续失败 >= 8 次（排除偶发抖动）
+    ///   - 距首次失败 >= 3 天（排除临时风控）
+    ///
+    /// 停用后：
+    ///   - 不再签到、不再参与路由（网关 account_eligible 要求 enabled + ready）
+    ///   - 不再计入总额（counts_toward_total 只认 enabled && ready）
+    ///   - 用户仍可在界面上手动重新启用（我们只改 enabled，不删数据）
+    ///
+    /// 返回本次停用的账号数，供日志/测试断言。
+    pub fn retire_dead_accounts(&self, now: i64) -> usize {
+        let Ok(accounts) = self.accounts() else {
+            return 0;
+        };
+        let mut retired = 0;
+        for mut account in accounts {
+            if !account.enabled {
+                continue; // 已经停用的不用重复处理
+            }
+            if !crate::credits::account_health::is_dead(&account, now) {
+                continue;
+            }
+            account.enabled = false;
+            account.status = "retired".into();
+            if self.store.save_account(&account).is_ok() {
+                retired += 1;
+            }
+        }
+        if retired > 0 {
+            self.emit_credits_changed();
+        }
+        retired
+    }
+
+    /// 账号健康分档，供前端展示与调试。
+    pub fn account_health(&self, id: &str, now: i64) -> Option<&'static str> {
+        let account = self.store.account(id).ok()?;
+        Some(crate::credits::account_health::classify(&account, now).as_str())
+    }
+
+    pub fn float_stats(&self) -> Result<FloatStats, String> {
+        let settings = self.store.settings()?;
+        let gateway = self.gateway.status(settings.port);
+        let usage = self.usage_stats().unwrap_or_default();
+        Ok(FloatStats {
+            running: gateway.running,
+            today_requests: usage.today_requests,
+            today_failed: usage.today_failed,
+            today_spent_credits: usage.today_spent_credits,
+            today_claimed_credits: usage.today_claimed_credits,
+            today_claiming_accounts: usage.today_claiming_accounts,
+            today_tokens: usage
+                .today_billable_prompt_tokens
+                .saturating_add(usage.today_completion_tokens),
+            sampled_at: crate::credits::types::now_ms(),
+        })
     }
 
     pub fn dashboard(&self) -> Result<Dashboard, String> {
@@ -939,6 +1146,8 @@ impl CreditManager {
         let manager = self.clone();
         tokio::spawn(async move {
             let mut last_day: Option<i64> = None;
+            // 延迟翻页平台（Qoder 10:00）的补领轮次，按天去重。
+            let mut last_late_day: Option<i64> = None;
             // Retry cadence for accounts whose daily claim ended the day as
             // "claimable" (upstream 9074 "too many participants" and similar).
             // 10min, 30min, 1h, 2h, 4h ... capped hourly until 23:00 Beijing.
@@ -966,6 +1175,26 @@ impl CreditManager {
                             let housekeeper = manager.clone();
                             tokio::task::spawn_blocking(move || housekeeper.prune_request_history());
                         }
+                        // 自动停用「连续 3 天不可用」的账号（用户 2026-11-18 要求）。
+                        //
+                        // 判据来自 account_health::classify：
+                        //   累计失败 >= 3 个自然日  → Retired
+                        // 命中就 enabled=false，于是它不再签到、不再路由、
+                        // 也不会计入总额（counts_toward_total 只认 ready）。
+                        //
+                        // 放在这里（30 秒一次的循环）而不是每次请求里：
+                        // 判死账号是件低频、需要看时间跨度的事，
+                        // 每轮扫一遍 158 个账号的开销可以忽略。
+                        manager.retire_dead_accounts(now);
+                        // 每日体检：23:40 给「今天一次都没被调用过」的账号
+                        // 补一次推理探测（用户 2026-11-19 要求）。
+                        //
+                        // 为什么需要：能签到的死号（11140）只有被调用才会暴露。
+                        // 如果某个号今天压根没人用，它就永远拿不到失败记录，
+                        // 「连续 3 天」的倒计时也就永远不开始 —— 于是变成了
+                        // "越没人用越不会被清理"的死循环。23:40 这天快结束时
+                        // 补测一轮，保证每个账号每天至少被测一次。
+                        manager.daily_probe_if_due(now).await;
                         let (day, due) = claim_schedule(now);
                         if due && last_day != Some(day) && manager.store.settings().is_ok_and(|s| s.auto_claim) {
                             last_day = Some(day);
@@ -995,6 +1224,49 @@ impl CreditManager {
                             // Schedule the catch-up pass; it no-ops when every
                             // enabled account really claimed.
                             next_retry_at = Some(now + retry_delays_ms[0]);
+                        } else if late_claim_schedule(now)
+                            && last_late_day != Some(day)
+                            && manager.store.settings().is_ok_and(|s| s.auto_claim)
+                        {
+                            // Qoder 每天 10:00 才翻页：08:00 那轮必然拿到"本轮
+                            // 积分已领取"，而重试链在 08:10 看到快照里没有
+                            // claimable 就自行取消了，于是一整天都不会再碰它，
+                            // 1800 分只能靠人手动点「领取」。这里在 10:05 之后
+                            // 单独补一轮，只动延迟翻页的平台，不惊动 WorkBuddy。
+                            last_late_day = Some(day);
+                            if let Ok(accounts) = manager.accounts() {
+                                let ids: Vec<String> = accounts
+                                    .iter()
+                                    .filter(|a| {
+                                        a.enabled
+                                            && platform_reset_hour(&a.platform.route_key(a.region)) > 0
+                                    })
+                                    .map(|a| a.id.clone())
+                                    .collect();
+                                if !ids.is_empty() {
+                                    let mut gained = 0.0f64;
+                                    for id in ids {
+                                        tokio::select! {
+                                            _ = manager.cancellation.cancelled() => break,
+                                            result = manager.claim(Some(id.as_str())) => {
+                                                if let Ok(outcomes) = result {
+                                                    gained += outcomes
+                                                        .iter()
+                                                        .filter_map(|o| o.amount)
+                                                        .sum::<f64>();
+                                                }
+                                            },
+                                        }
+                                    }
+                                    if gained > 0.0 {
+                                        crate::credits::trail::mark(&format!(
+                                            "late claim +{}",
+                                            gained as i64
+                                        ));
+                                    }
+                                    manager.emit_credits_changed();
+                                }
+                            }
                         } else if let Some(due_at) = next_retry_at {
                             if now >= due_at && manager.store.settings().is_ok_and(|s| s.auto_claim) {
                                 if let Ok(accounts) = manager.accounts() {
@@ -1081,6 +1353,61 @@ fn claim_rank(status: &str) -> u8 {
     }
 }
 
+/// 快照里平台口径的"今日已到账"积分。
+///
+/// 只看状态为 claimed 的积分类奖励：WorkBuddy 的 `today_credit`、
+/// TRAE/Qoder 的每日签到、MiniMax 的签到达标奖励都把今日到账额放在这里。
+/// 优惠券之类的 `coupon` 不计——它们不是积分，混进来会把总数弄虚。
+fn landed_today(snapshot: &crate::credits::types::ProviderSnapshot) -> f64 {
+    snapshot
+        .rewards
+        .iter()
+        .filter(|r| {
+            r.status == "claimed" && matches!(r.kind.as_str(), "credit" | "credits" | "points")
+        })
+        .map(|r| r.amount.unwrap_or(0.0))
+        .sum()
+}
+
+/// 平台每日额度翻页的时刻（北京时间整点）。
+///
+/// 绝大多数平台按自然日 0 点重置，Qoder 不是：它的「每天领 100 Credits」
+/// 每天 10:00 才开新一轮（历史领取时间 10:03 / 10:05 / 10:09 / 10:13，
+/// 从没有一次在 10 点前成功；10:04 领到的 18×100 是新一轮的）。
+///
+/// 这个时刻决定两件事：一是"快照里那条 claimed 算不算今天的"，
+/// 二是 08:00 那轮之后要不要在 10:05 再补一轮。
+fn platform_reset_hour(platform: &str) -> u32 {
+    match platform {
+        "qoder" => 10,
+        _ => 0,
+    }
+}
+
+/// 每天 10:05（北京时间）之后的补领窗口。
+///
+/// 08:00 那轮是给 WorkBuddy 抢在卖家托管签到之前用的。Qoder 10:00 才翻页，
+/// 08:00 去领只会拿到"本轮积分已领取，无需重复领取"，然后重试链在 08:10
+/// 看到快照里显示已领、没有 claimable，就把重试取消了 —— 一整天都不会再碰
+/// Qoder，1800 分要靠人手动点「领取」才拿得到。
+fn late_claim_schedule(now: i64) -> bool {
+    let beijing = now / 1000 + 8 * 3600;
+    beijing.rem_euclid(86_400) >= 10 * 3600 + 5 * 60
+}
+
+/// 快照里那条 `claimed` 能不能算"本轮到账"。
+///
+/// 两个条件缺一不可：
+///   · 本账号在本周期内真的提交过领取（`at >= cycle_start`）；
+///   · 那条记录是领到手或平台已经发过的（claimed / already_claimed）。
+///
+/// 为什么需要第一条：Qoder 每天 10:00 才翻页。今天 00:37 抓到的快照里
+/// 「每天领 100 Credits」仍然是 claimed —— 那是**昨天**领的。只看快照的话，
+/// 面板会在 00:37 就宣布"今天到账 1800"，而实际上那 1800 是昨天的账。
+fn landed_evidence(status: &str, at: i64, cycle_start: i64) -> bool {
+    at >= cycle_start && matches!(status, "claimed" | "already_claimed" | "success")
+}
+
 /// Build today's claim picture, broken down by platform and then by account.
 ///
 /// A platform total hides *which* account failed. With 27 accounts spread over
@@ -1102,6 +1429,10 @@ fn build_claim_report(
         amount: f64,
         reward: Option<String>,
         message: Option<String>,
+        /// 该账号今天最后一条领取记录的时间（epoch ms）。用来判断它到底是不是
+        /// **本周期**领的 —— Qoder 每天 10:00 才翻页，00:37 那次"本轮已领取"
+        /// 说的是昨天那一轮，不能拿来当今天的证据。
+        at: i64,
     }
 
     let mut per_account: HashMap<String, Won> = HashMap::new();
@@ -1116,6 +1447,7 @@ fn build_claim_report(
             },
             reward: Some(reward.name.clone()).filter(|n| !n.is_empty()),
             message: Some(reward.message.clone()).filter(|m| !m.is_empty()),
+            at: reward.created_at,
         };
         match per_account.entry(reward.account_id.clone()) {
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -1123,6 +1455,7 @@ fn build_claim_report(
             }
             std::collections::hash_map::Entry::Occupied(mut slot) => {
                 let existing = slot.get();
+                let latest = existing.at.max(candidate.at);
                 let (winner, other_amount) = if claim_rank(&candidate.status) > claim_rank(&existing.status) {
                     (candidate, existing.amount)
                 } else {
@@ -1132,12 +1465,14 @@ fn build_claim_report(
                             amount: existing.amount,
                             reward: existing.reward.clone(),
                             message: existing.message.clone(),
+                            at: existing.at,
                         },
                         candidate.amount,
                     )
                 };
                 slot.insert(Won {
                     amount: winner.amount.max(other_amount),
+                    at: latest,
                     ..winner
                 });
             }
@@ -1147,10 +1482,81 @@ fn build_claim_report(
     let mut rows_by_platform: HashMap<String, Vec<ClaimAccountRow>> = HashMap::new();
     let mut totals: HashMap<String, [u64; 5]> = HashMap::new(); // accounts, claimed, already, unavailable, pending
     let mut credits: HashMap<String, f64> = HashMap::new();
+    // 平台口径的"本轮到账"：快照里 claimed 的积分类奖励。
+    let mut credited: HashMap<String, f64> = HashMap::new();
+    // 哪些平台是转发型网关（豆包）。它们不做成功率，也不进合计。
+    let mut gateway_platforms: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for account in &accounts {
         let platform = account.platform.route_key(account.region).to_string();
         let won = per_account.get(&account.id);
+
+        // 转发型平台（豆包）先处理，路径完全不同：AiToolkit 里它是"一个网关"，
+        // 网关里的号才是真的号。之前把它当普通账号统计，界面上永远是
+        // 「豆包 0% · 未尝试」，而真正那 3 个号一个也看不见。
+        if account.platform.is_proxied() {
+            gateway_platforms.insert(platform.clone());
+            let subs = account
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.sub_accounts.clone())
+                .unwrap_or_default();
+            let mut new_rows: Vec<ClaimAccountRow> = subs
+                .iter()
+                .map(|sub| ClaimAccountRow {
+                    account_id: format!("{}#{}", account.id, sub.name),
+                    name: sub.name.clone(),
+                    status: "managed".into(),
+                    amount: 0.0,
+                    reward: None,
+                    message: Some(match sub.state.as_str() {
+                        "ok" => format!("可用 · 今日已调用 {} 次", sub.calls),
+                        other => format!("{other} · 今日已调用 {} 次", sub.calls),
+                    }),
+                })
+                .collect();
+            if new_rows.is_empty() {
+                let label = account.label.trim();
+                new_rows.push(ClaimAccountRow {
+                    account_id: account.id.clone(),
+                    name: if label.is_empty() {
+                        account.id.chars().take(8).collect()
+                    } else {
+                        label.to_string()
+                    },
+                    status: "managed".into(),
+                    amount: 0.0,
+                    reward: None,
+                    message: Some("网关没有返回账号清单，打开 /admin 查看".into()),
+                });
+            }
+            let count = new_rows.len() as u64;
+            rows_by_platform
+                .entry(platform.clone())
+                .or_default()
+                .extend(new_rows);
+            totals.entry(platform).or_insert([0; 5])[0] += count;
+            continue;
+        }
+
+        if let Some(snapshot) = &account.snapshot {
+            // 只认今天刷新过的快照：几天没刷的账号，rewards 里那个 claimed
+            // 可能是前几天的签到，算进来就会把"到账"吹大。
+            if snapshot.fetched_at >= day_start {
+                // 光"快照显示已领"还不够。Qoder 每天 10:00 才翻页，在这之前
+                // 抓到的快照里那条 claimed 说的是昨天那轮（今天 10:04 之前，
+                // 面板会把 18×100 记成今天的到账，其实一分没进）。
+                // 所以必须本账号在本周期内真的有过领取动作，才认这笔账。
+                let cycle_start = day_start + platform_reset_hour(&platform) as i64 * 3_600_000;
+                let evidence = won.is_some_and(|w| landed_evidence(&w.status, w.at, cycle_start));
+                if evidence {
+                    let landed = landed_today(snapshot);
+                    if landed > 0.0 {
+                        *credited.entry(platform.clone()).or_default() += landed;
+                    }
+                }
+            }
+        }
         let (status, amount, reward, message) = match won {
             Some(w) => (w.status.clone(), w.amount, w.reward.clone(), w.message.clone()),
             None => ("none".to_string(), 0.0, None, None),
@@ -1188,21 +1594,34 @@ fn build_claim_report(
         .into_iter()
         .map(|(platform, [accounts, claimed, already, unavailable, pending])| {
             let mut rows = rows_by_platform.remove(&platform).unwrap_or_default();
-            let recorded = rows.iter().filter(|r| r.status != "none").count() as u64;
-            let missing = accounts.saturating_sub(recorded);
+            let gateway = gateway_platforms.contains(&platform);
+            let recorded = if gateway {
+                rows.len() as u64
+            } else {
+                rows.iter().filter(|r| r.status != "none").count() as u64
+            };
+            let missing = if gateway { 0 } else { accounts.saturating_sub(recorded) };
             // `already_claimed` is excluded from the denominator: those accounts
             // already hold today's credits, so counting them as failures would
             // make a healthy platform look broken.
             let denominator = claimed + unavailable + pending + missing;
-            let success_rate = (denominator > 0).then(|| claimed as f64 / denominator as f64);
+            // 网关型平台没有"领取"这回事，成功率给 None（界面显示「—」），
+            // 不然它永远挂着 0%，看起来像坏了。
+            let success_rate = if gateway {
+                None
+            } else {
+                (denominator > 0).then(|| claimed as f64 / denominator as f64)
+            };
             // Problems first — spotting what still needs action is the point.
             rows.sort_by_key(|r| {
                 (claim_rank_complaint_order(&r.status), r.name.clone())
             });
             // Take the credit total before `platform` is moved into the struct.
             let platform_credits = credits.remove(&platform).unwrap_or(0.0);
+            let platform_credited = credited.remove(&platform).unwrap_or(0.0);
             PlatformClaims {
                 platform,
+                gateway,
                 accounts,
                 recorded,
                 claimed,
@@ -1211,6 +1630,7 @@ fn build_claim_report(
                 pending,
                 missing,
                 credits: platform_credits,
+                credited: platform_credited.max(platform_credits),
                 success_rate,
                 rows,
             }
@@ -1218,10 +1638,15 @@ fn build_claim_report(
         .collect();
 
     out.sort_by(|a, b| {
-        a.success_rate
-            .unwrap_or(1.0)
-            .partial_cmp(&b.success_rate.unwrap_or(1.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
+        // 网关型平台排到最后：它没有成功率，混在中间只会挡路。
+        a.gateway
+            .cmp(&b.gateway)
+            .then_with(|| {
+                a.success_rate
+                    .unwrap_or(1.0)
+                    .partial_cmp(&b.success_rate.unwrap_or(1.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| b.credits.partial_cmp(&a.credits).unwrap_or(std::cmp::Ordering::Equal))
     });
     Ok(out)
@@ -1469,7 +1894,163 @@ impl CreditManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 每日体检只在 23:40 之后触发（用户 2026-11-19 要求）。
+    #[test]
+    fn 每日体检的北京时间判断() {
+        // 构造 2026-11-19 的各个北京时间点（UTC+8）
+        // 用 cn_day 反推：找某天 00:00 北京时间的毫秒值
+        let base_day = 20_000i64; // 随便取一个自然日序号
+        let zero = base_day * 86_400_000
+            - crate::credits::account_health::CN_OFFSET_MS;
+        // 23:39 —— 还不到
+        let t_2339 = zero + 23 * 3_600_000 + 39 * 60_000;
+        assert_eq!(cn_hour_minute(t_2339), (23, 39, 0));
+        // 23:40 —— 刚好到
+        let t_2340 = zero + 23 * 3_600_000 + 40 * 60_000;
+        assert_eq!(cn_hour_minute(t_2340), (23, 40, 0));
+        // 23:59
+        let t_2359 = zero + 23 * 3_600_000 + 59 * 60_000;
+        assert_eq!(cn_hour_minute(t_2359), (23, 59, 0));
+        // 00:05（次日）
+        let t_0005 = zero + 5 * 60_000;
+        assert_eq!(cn_hour_minute(t_0005), (0, 5, 0));
+        // 22:00 —— 不到
+        let t_2200 = zero + 22 * 3_600_000;
+        assert_eq!(cn_hour_minute(t_2200), (22, 0, 0));
+    }
+
+    /// 平台自动发的那部分必须被看见，但不能冒充"本程序领到的"。
+    ///
+    /// 2026-11-14：总览显示 WorkBuddy "10/56 个账号领到 · 共 1000 分"，
+    /// 用户当场问"为什么只有 1000 分"。查平台原始状态：56 个号的
+    /// today_checked_in 全是 true、today_credit 各 100，加起来 5600 分
+    /// 早就到账了，只是其中 46 个号是平台先签、我们再去领只拿到
+    /// "当前没有可领取的签到积分"。这条测试钉死两个口径：
+    ///   claimed 金额（我们领的）≠ 平台今日到账（credited）。
+    #[test]
+    fn credited_counts_platform_landed_credits_separately() {
+        let snapshot = ProviderSnapshot {
+            balance: Some(5600.0),
+            unit: "credits".into(),
+            quota: None,
+            packs: vec![],
+            rewards: vec![
+                crate::credits::types::Reward {
+                    id: "daily-checkin".into(),
+                    name: "每日签到".into(),
+                    kind: "credits".into(),
+                    status: "claimed".into(),
+                    amount: Some(100.0),
+                    next_available_at: None,
+                    action_url: None,
+                },
+                // 优惠券不是积分，不能算进到账额
+                crate::credits::types::Reward {
+                    id: "coupon-1".into(),
+                    name: "首次订阅福利".into(),
+                    kind: "coupon".into(),
+                    status: "claimed".into(),
+                    amount: Some(500.0),
+                    next_available_at: None,
+                    action_url: None,
+                },
+                // 可领但还没领的不算到账
+                crate::credits::types::Reward {
+                    id: "pending-1".into(),
+                    name: "未领的签到".into(),
+                    kind: "credits".into(),
+                    status: "claimable".into(),
+                    amount: Some(100.0),
+                    next_available_at: None,
+                    action_url: None,
+                },
+            ],
+            models: vec![],
+            fetched_at: 1,
+            stale: false,
+            diagnostic: None,
+            sync: SnapshotSync::default(),
+            sub_accounts: vec![],
+        };
+        assert_eq!(landed_today(&snapshot), 100.0, "只算 claimed 的积分类奖励");
+        let none = ProviderSnapshot { rewards: vec![], ..snapshot };
+        assert_eq!(landed_today(&none), 0.0);
+    }
     
+    /// Qoder 每天 10:00 才翻页：00:37 那次"本轮已领取"不是今天的账。
+    ///
+    /// 2026-11-15：面板在早上就把 18×100 记成"今天到账"，实际是昨天那轮；
+    /// 用户问"这 1800 哪来的，我只有这个程序"。真正的那 1800 是 10:04:22
+    /// 手动点「领取」之后才到账的。
+    #[test]
+    fn late_reset_platform_needs_evidence_inside_its_own_cycle() {
+        // 北京时间 2026-11-15 00:00 = day_start
+        let day_start = 1_763_136_000_000i64;
+        let qoder_cycle = day_start + 10 * 3_600_000;
+        let workbuddy_cycle = day_start;
+
+        // 00:37 的"本轮已领取" —— 昨天那轮，不算今天
+        assert!(!landed_evidence("already_claimed", day_start + 37 * 60_000, qoder_cycle));
+        // 08:00 再试一次，还是昨天的轮次
+        assert!(!landed_evidence("already_claimed", day_start + 8 * 3_600_000, qoder_cycle));
+        // 10:04 真的领到 100
+        assert!(landed_evidence("claimed", day_start + 10 * 3_600_000 + 4 * 60_000, qoder_cycle));
+        // 没领到就不算到账
+        assert!(!landed_evidence("unavailable", day_start + 10 * 3_600_000, qoder_cycle));
+
+        // 自然日翻页的平台不设门槛
+        assert!(landed_evidence("already_claimed", day_start + 37 * 60_000, workbuddy_cycle));
+        // 平台重置时刻也是可配置的：只有 Qoder 是 10 点
+        assert_eq!(platform_reset_hour("qoder"), 10);
+        assert_eq!(platform_reset_hour("workbuddy"), 0);
+        assert_eq!(platform_reset_hour("traework"), 0);
+    }
+
+    /// 豆包这类转发型平台：一个账号 = 一个网关，网关里才是真的号。
+    ///
+    /// 之前它被当普通账号统计，界面上永远「豆包 0% · 未尝试 1 个账号」，
+    /// 而网关里那 3 个号一个也看不见。这条测试钉住：网关内的号要列出来
+    /// （状态 managed），而且不能算进成功率、不能冒充"没领到"。
+    #[test]
+    fn gateway_platforms_list_inner_accounts_without_a_success_rate() {
+        let manager = CreditManager::test();
+        let mut account = saved_snapshot_account("doubao-gateway");
+        account.platform = crate::credits::types::Platform::Doubao;
+        account.user_id = "http://127.0.0.1:9091".into();
+        account.label = "豆包网关".into();
+        account.snapshot.as_mut().unwrap().sub_accounts = vec![
+            crate::credits::types::SubAccount {
+                name: "豆包-默认账号".into(),
+                state: "ok".into(),
+                seconds_left: Some(2_420_743_000),
+                calls: 15,
+            },
+            crate::credits::types::SubAccount {
+                name: "豆包-1bf9".into(),
+                state: "ok".into(),
+                seconds_left: Some(2_442_176_000),
+                calls: 37,
+            },
+        ];
+        manager.store.save_account(&account).unwrap();
+
+        let (start, end) = claim_day_bounds(now_ms());
+        let report = build_claim_report(&manager.store, start, end).unwrap();
+        let row = report
+            .iter()
+            .find(|platform| platform.platform == "doubao")
+            .expect("豆包平台应当出现在报告里");
+
+        assert!(row.gateway, "必须标成网关型，前端才能区别对待");
+        assert_eq!(row.accounts, 2, "列出的是网关里的号，不是一个网关");
+        assert_eq!(row.success_rate, None, "网关没有成功率可言");
+        assert_eq!(row.credits, 0.0);
+        assert_eq!(row.credited, 0.0);
+        assert!(row.rows.iter().all(|r| r.status == "managed"));
+        assert!(row.rows.iter().any(|r| r.message.as_deref().unwrap_or("").contains("37")));
+    }
+
     fn saved_snapshot_account(id: &str) -> Account {
         Account {
             id: id.into(),
@@ -1628,15 +2209,26 @@ mod tests {
         println!("WorkBuddy Messages inference verified: HTTP {}; model=workbuddy/glm-5.3-flash; stop_reason={}", status.as_u16(), result["stop_reason"]);
     }
 
+    /// 第一轮领取在 08:00（北京时间），延迟翻页的平台在 10:05 补一轮。
+    ///
+    /// 08:00 是为了抢在卖家托管/客户端自动签到之前把分记在我们账上；
+    /// 10:05 是给 Qoder 的 —— 它 10:00 才开新一轮，早去只会拿到
+    /// "本轮积分已领取"。
     #[test]
-    fn scheduler_uses_beijing_ten_thirty() {
-        assert_eq!(claim_schedule(3_600_000), (0, false));
-        assert_eq!(claim_schedule(8_999_999), (0, false));
-        assert_eq!(claim_schedule(9_000_000), (0, true));
-        assert_eq!(claim_schedule(57_599_999), (0, true));
-        assert_eq!(claim_schedule(57_600_000), (1, false));
-        assert_eq!(claim_schedule(95_399_999), (1, false));
-        assert_eq!(claim_schedule(95_400_000), (1, true));
+    fn scheduler_runs_at_eight_and_retries_late_platforms_after_ten() {
+        // 北京时间换算成 epoch ms：08:00 即 UTC 零点。
+        let beijing = |hour: i64, minute: i64| ((hour * 3600 + minute * 60) - 8 * 3600) * 1000;
+        assert_eq!(claim_schedule(beijing(7, 59)), (0, false));
+        assert_eq!(claim_schedule(beijing(8, 0)), (0, true));
+        assert_eq!(claim_schedule(beijing(23, 59)), (0, true));
+        // 跨天重新算一天
+        assert_eq!(claim_schedule(beijing(24, 0)), (1, false));
+        assert_eq!(claim_schedule(beijing(32, 0)), (1, true));
+
+        assert!(!late_claim_schedule(beijing(9, 0)));
+        assert!(!late_claim_schedule(beijing(10, 4)));
+        assert!(late_claim_schedule(beijing(10, 5)));
+        assert!(late_claim_schedule(beijing(20, 0)));
     }
     #[test]
     fn gateway_keys_persist_and_do_not_enter_dashboard() {

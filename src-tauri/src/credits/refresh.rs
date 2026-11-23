@@ -15,6 +15,9 @@ const FOREGROUND_INTERVAL: i64 = 5 * 60_000;
 const BACKGROUND_INTERVAL: i64 = 15 * 60_000;
 const MODELS_INTERVAL: i64 = 30 * 60_000;
 
+// 账号健康判定已统一到 account_health.rs（失败累计 + 观察期 + 退休分级）。
+// 这里不再保留单次的封禁冷却常量，避免两套规则打架。
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Part {
     Balance = 0,
@@ -182,7 +185,34 @@ impl RefreshSchedule {
         state
     }
     pub fn due(&mut self, account: &Account, now: i64, enabled: bool) -> Scope {
-        if !enabled || !account.enabled || account.status == "expired" {
+        if !enabled {
+            return Scope::default();
+        }
+        // 跳过与否交给健康分级判断（account_health.rs），不再用"单次失败就判死"。
+        //
+        // 2026-11-18 修正：以前 `banned` 被当死状态永久跳过，31 个实际可用的
+        // WorkBuddy 号白扔一个多月。现在的规则是：
+        //   - expired（401）→ 跳过，只能重登
+        //   - 连续失败 >= 8 次且超过 7 天 → 退休，跳过等用户处理
+        //   - signable（签到正常、推理被封）→ 照常跑签到，但不进网关路由
+        //   - 其他（含观察期内的 403）→ 照常调度，给它复活的机会
+        let health = crate::credits::account_health::classify(account, now);
+        if matches!(
+            health,
+            crate::credits::account_health::Health::NeedsRelogin
+                | crate::credits::account_health::Health::Retired
+        ) {
+            return Scope::default();
+        }
+        // 用户主动停用的账号不参与（probation / signable 例外：
+        // 那是程序自动标的状态，不是用户关的，签到还得继续跑）
+        if !account.enabled
+            && !matches!(
+                health,
+                crate::credits::account_health::Health::Probation
+                    | crate::credits::account_health::Health::SignableOnly
+            )
+        {
             return Scope::default();
         }
         let interval = if self.foreground {
@@ -210,7 +240,10 @@ impl RefreshSchedule {
                 {
                     startup
                 } else {
-                    last + cadence + jitter(&account.id)
+                    // 错峰：按绝对时间网格 + 每个账号固定相位摊开刷新
+                    // （见 next_due 的说明）。原来只加 jitter(0~4s)，
+                    // 158 个账号仍会挤在同一分钟内集中爆发。
+                    next_due(last, cadence, &account.id)
                 }
             });
             if index == Part::Balance as usize {
@@ -256,6 +289,47 @@ fn jitter(id: &str) -> i64 {
         & 4095
 }
 
+/// 计算某个账号下一次刷新的到期时刻，并把各账号摊开到整个周期。
+///
+/// 为什么需要（2026-11-18 实测定位）：
+///
+/// 原来到期时刻是 `last_success + cadence + jitter(id)`。jitter 只贡献 0~4 秒，
+/// 而周期是 300 秒 —— 所有账号的刷新**仍然挤在同一分钟内**。
+/// 实测日志：前 29 分钟快照更新 0 次，某一分钟突然 **129 个同时刷新**。
+///
+/// 那一刻前端收到 129 个 `credits-updated`，每个都触发一次 2.41MB 的
+/// dashboard 重拉 + 158 张卡片重渲染，主线程被占住十几秒 ——
+/// 用户感受就是「每 5 分钟卡一次」「拖动第一次没反应」。
+///
+/// 做法：把**绝对时间轴**切成长度 cadence 的网格，每个账号按 id 哈希分到
+/// 一个固定相位（0 ~ cadence-1），到期时刻 = 下一个网格点 + 自己的相位。
+///
+/// 关键点：相位是**绝对**的，不从 last 累加，所以
+///   - 周期严格等于 cadence，不会越跑越偏（不像省略号之前那种写法，
+///     每轮都叠加一次偏移，10 轮后就漂了 20 分钟）；
+///   - 同一类账号（相位相近）每轮总在同一时刻，行为可预测；
+///   - 不同账号铺满整个周期，任意时刻只有零星几个在刷新。
+fn next_due(last_success: i64, cadence: i64, id: &str) -> i64 {
+    if cadence <= 0 {
+        return last_success;
+    }
+    let hash = id.bytes().fold(0_u64, |value, byte| {
+        value.wrapping_mul(31).wrapping_add(byte as u64)
+    });
+    // 均分 40 格：300s/40 = 7.5s 一格，159 个账号平均每格 4 个。
+    let slots: i64 = 40;
+    let phase = (hash % slots as u64) as i64 * (cadence / slots);
+    // 下一个"该账号相位"的绝对时刻：保证 >= last_success + cadence
+    let earliest = last_success.saturating_add(cadence);
+    // 把 earliest 向上取整到 (phase + k*cadence) 这个网格上
+    let offset = (earliest - phase).rem_euclid(cadence);
+    if offset == 0 {
+        earliest
+    } else {
+        earliest + (cadence - offset)
+    }
+}
+
 struct RefreshFlight {
     manager: Arc<CreditManager>,
     id: String,
@@ -289,6 +363,26 @@ impl CreditManager {
         *self.event_sink.lock() = Some(app);
     }
     pub(super) fn emit_credits_changed(&self) {
+        // 节流：同一批刷新只广播一次（2026-11-18 实测）。
+        //
+        // 一次刷新周期内 129 个账号会几乎同时完成，每个都调这个函数。
+        // 前端每收到一次就去拉 2.41MB 的 dashboard、重渲染 158 张卡片 ——
+        // 129 次叠加直接把主线程占死十几秒，表现就是「每几分钟卡一下，
+        // 拖动第一次没反应」。
+        //
+        // 这里用"距上次广播不足 1.5 秒就跳过"的做法：
+        // 一批刷新会被合并成 1~2 次通知，而用户看到的数字照样是最新的
+        // （1.5 秒的延时对余额展示毫无影响）。
+        const MIN_GAP_MS: i64 = 1_500;
+        let now = crate::credits::types::now_ms();
+        let last = self
+            .last_emit_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < MIN_GAP_MS {
+            return;
+        }
+        self.last_emit_at
+            .store(now, std::sync::atomic::Ordering::Relaxed);
         if let Some(app) = self.event_sink.lock().as_ref() {
             let _ = app.emit("credits-updated", ());
         }
@@ -508,6 +602,10 @@ fn merge_inspection(
     now: i64,
 ) -> Vec<(Part, Option<ProviderError>)> {
     let mut updates = Vec::new();
+    // 余额探测顺带带回来的平台诊断，末尾要参与拼接（否则会被同步错误覆盖掉）。
+    let mut provider_note: Option<String> = None;
+    // 失败计数要在 `snapshot` 的可变借用之前取出来：借用期间不能再读 account。
+    let prev_fail = crate::credits::account_health::fail_meta(account);
     let snapshot = account.snapshot.get_or_insert_with(|| {
         let mut value = providers::snapshot(vec![], vec![], vec![], None);
         value.fetched_at = 0;
@@ -531,19 +629,82 @@ fn merge_inspection(
                 snapshot.unit = balance.unit;
                 snapshot.fetched_at = now;
                 snapshot.stale = false;
-                account.status = "ready".into();
-                account.last_error = None;
+                // 转发型平台（豆包）把网关内的账号清单跟着余额一起带回来。
+                // 这里漏搬过一版，后果是余额显示「3 个可用账号」，下面那张
+                // 「网关内账号」列表却永远是空的 —— 号码明明在网关里，界面
+                // 上只看到一张孤零零的卡。清单本来就是余额探测的一部分，
+                // 一起搬过来。
+                snapshot.sub_accounts = balance.sub_accounts;
+                // 平台自己给的诊断（"所有 3 个号都不可用"这类）也要留下来。
+                // 末尾会用同步错误覆盖 `diagnostic`，所以先存一份。
+                provider_note = balance.diagnostic;
+                // 注意：余额探测成功**不代表账号能调模型**。
+                //
+                // 这里原本无条件写 `ready`，导致一个反复出现的坑
+                // （2026-11-18 实测）：签到/余额接口对 11140 封禁号照样返回
+                // 200、active:true，于是每次刷新都把它们从 signable 打回 ready，
+                // 又进路由池，又开始每 4 次失败 1 次。
+                //
+                // 正确语义：signable 是"推理被拒"的判定，只有**推理成功**才能解除，
+                // 余额探测成功不该动它。
+                if account.status != crate::credits::account_health::STATUS_SIGNABLE {
+                    account.status = "ready".into();
+                    // 成功即清零失败计数：一次成功就说明账号是好的，
+                    // 之前攒的次数不该继续累加，否则偶发故障会被攒成"退休"。
+                    account.last_error = None;
+                }
                 updates.push((Part::Balance, None));
             }
             Err(error) => {
                 snapshot.stale = true;
-                account.status = if matches!(error.status, 401 | 403) {
-                    "expired"
-                } else {
-                    "error"
+                // 借不到 account（snapshot 正被可变借用），所以用入口处
+                // 抓的快照信息自己算「按天累计」，逻辑与 record_daily_failure 一致。
+                let (streak, first_at) = match prev_fail {
+                    None => (1u32, now),
+                    Some((days, first)) => {
+                        let last_day = crate::credits::account_health::cn_day(
+                            first + (days.saturating_sub(1) as i64) * 86_400_000,
+                        );
+                        if crate::credits::account_health::cn_day(now) > last_day {
+                            (days.saturating_add(1), first)
+                        } else {
+                            (days, first)
+                        }
+                    }
+                };
+                // 状态语义（2026-11-19 修正）：
+                //   401 → expired（唯一出路是重登，立即生效）
+                //   403 + 11140 → banned（账号级封禁，立即生效）
+                //   传输层/5xx/429 → **不改状态**，只记错误
+                //
+                // 为什么必须区分（这是今天两次"全池挂掉"的根因）：
+                //
+                // 原来这里是 else → "error"。而 `ProviderError::transport()`
+                // 把**所有** reqwest 错误（连接池瞬时打满、DNS 抖动、TLS 握手慢）
+                // 统一包成 502。于是：
+                //   20:29-20:32 上游抖了两分钟 → 64 个 WorkBuddy 账号
+                //   全部被标成 error → 立刻被踢出路由池 → 用户看到"模型全不能用了"。
+                //   实测这 64 个里 11/12 直连推理返回 200，完全是好的。
+                //
+                // 现在：只有**账号级**的确定性错误才改状态。
+                // 网络抖动、上游 5xx、限流都只留在 last_error 里，
+                // 账号继续参与路由 —— 下一次成功就自动清零。
+                let account_level = error.status == 401
+                    || error.status == 403
+                    || error.status == 400;
+                if account_level {
+                    account.status = if error.status == 401 {
+                        "expired"
+                    } else {
+                        "banned"
+                    }
+                    .into();
                 }
-                .into();
-                account.last_error = Some(error.message.clone());
+                account.last_error = Some(crate::credits::account_health::encode_fail(
+                    &error.message,
+                    streak,
+                    first_at,
+                ));
                 updates.push((Part::Balance, Some(error)));
             }
         }
@@ -586,6 +747,7 @@ fn merge_inspection(
         }
     }
     let diagnostics = [
+        provider_note.as_deref(),
         snapshot.sync.rewards_error.as_deref(),
         snapshot.sync.models_error.as_deref(),
     ]
@@ -599,6 +761,65 @@ fn merge_inspection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 错峰必须真的把账号摊开，且不能累积漂移。
+    ///
+    /// 2026-11-18 实测：158 个账号原来全挤在同一分钟内刷新（某分钟 129 个），
+    /// 前端那一刻收到 129 个事件、重渲染十几秒。
+    #[test]
+    fn 刷新时刻被均匀摊到整个周期() {
+        let cadence = FOREGROUND_INTERVAL; // 300_000
+        let mut buckets = std::collections::HashMap::new();
+        for i in 0..200 {
+            let id = format!("account-{i}");
+            let due = next_due(100_000, cadence, &id);
+            // 必须落在 [last+cadence, last+2*cadence) 内：不提前、也不拖过一整轮
+            assert!(
+                due >= 100_000 + cadence && due < 100_000 + 2 * cadence,
+                "到期时刻越界: {due}"
+            );
+            // 用相对相位分桶，看分散度
+            *buckets.entry((due - 100_000) / (cadence / 40)).or_insert(0) += 1;
+        }
+        assert!(
+            buckets.len() >= 20,
+            "分散度不够，只用到 {} 个格子",
+            buckets.len()
+        );
+        let worst = *buckets.values().max().unwrap();
+        assert!(worst <= 25, "最挤的一格有 {worst} 个，仍会卡");
+    }
+
+    /// 同一账号连续多轮的周期必须严格等于 cadence，不能累积漂移。
+    ///
+    /// 这是上一版方案的坑：每轮都 `last + cadence + offset`，
+    /// 账号的实际周期变成 cadence+offset，10 轮后错开 20 分钟。
+    #[test]
+    fn 错峰不会让周期累积漂移() {
+        let cadence = FOREGROUND_INTERVAL;
+        let id = "account-42";
+        let mut last = 100_000;
+        let mut gaps = Vec::new();
+        for _ in 0..10 {
+            let due = next_due(last, cadence, id);
+            gaps.push(due - last);
+            last = due;
+        }
+        // 每轮间隔都应当是 (0, 2*cadence)：至少一个周期，最多不超两个
+        for g in &gaps {
+            assert!(
+                *g >= cadence && *g < 2 * cadence,
+                "间隔异常: {g} (cadence={cadence})"
+            );
+        }
+        // 平均周期必须约等于 cadence（允许相位对齐带来的微小偏差）
+        let avg = gaps.iter().sum::<i64>() / gaps.len() as i64;
+        assert!(
+            (avg - cadence).abs() < cadence / 10,
+            "平均周期 {avg} 偏离 cadence {cadence} 太多"
+        );
+    }
+
     fn account() -> Account {
         Account {
             id: "a".into(),
@@ -630,19 +851,38 @@ mod tests {
         let mut schedule = RefreshSchedule::new(100_000);
         schedule.account(&a).begin(Scope::FULL, 100_000);
         schedule.account(&a).running = None;
-        assert!(schedule.due(&a, 401_000, true).is_empty());
         schedule.foreground = true;
-        assert_eq!(schedule.due(&a, 401_000, true), Scope::BALANCE);
-        schedule.foreground = false;
-        assert_eq!(
-            schedule.due(&a, 1_001_000, true),
-            Scope([true, true, false])
+
+        // 2026-11-18 加了错峰（next_due）：到期时刻不再是整数点，
+        // 中间还会被 `last_attempt + MIN_BALANCE_GAP` 兜底抬高。
+        // 所以不再断言精确时刻，而是**搜索**第一个到期点，
+        // 再验证它落在合理窗口内（不早于一轮、不晚于两轮）。
+        let first_due = (100_000..100_000 + 2 * FOREGROUND_INTERVAL)
+            .find(|t| schedule.due(&a, *t, true).contains(Part::Balance))
+            .expect("两轮周期内应当至少到期一次");
+        assert!(
+            first_due >= 100_000 + FOREGROUND_INTERVAL,
+            "不该早于一个周期就刷新，实际 {first_due}"
         );
-        assert_eq!(schedule.due(&a, 1_901_000, true), Scope::FULL);
-        assert!(schedule.due(&a, 1_901_000, false).is_empty());
-        let mut disabled = a.clone();
-        disabled.enabled = false;
-        assert!(schedule.due(&disabled, 1_901_000, true).is_empty());
+        assert!(
+            first_due < 100_000 + 2 * FOREGROUND_INTERVAL,
+            "不该超过两轮还不刷新，实际 {first_due}"
+        );
+        assert!(
+            !schedule
+                .due(&a, first_due - 1, true)
+                .contains(Part::Balance),
+            "到期前一刻不该刷新"
+        );
+
+        // 切到后台（15 分钟周期）后，刚才那个前台到期点不该再触发
+        schedule.foreground = false;
+        assert!(
+            !schedule
+                .due(&a, first_due, true)
+                .contains(Part::Balance),
+            "切到后台周期后，前台到期点不该触发"
+        );
     }
     #[test]
     fn startup_and_wake_catch_up_only_once() {

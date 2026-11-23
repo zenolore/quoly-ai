@@ -170,10 +170,27 @@ pub fn run() {
     expand_path_from_shell();
     install_panic_logger();
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    // 沙箱模式：QUOLY_SANDBOX=1 时跳过单实例限制。
+    //
+    // 为什么需要：单实例插件按应用 identifier 判重，只要生产实例在跑，
+    // 任何第二份程序都会被它判定为"重复启动"然后静默退出。这样就没法在
+    // 隔离环境里做验证 —— 而这个程序是本机 API 网关，用户的多个程序都在
+    // 调它的端口，不能拿生产实例当试验田。
+    //
+    // 配合 QUOLY_DATA_DIR + 独立端口（改沙箱库里的 credit_proxy_settings），
+    // 就能起一个完全不干扰生产的验证实例。
+    let sandbox = std::env::var("QUOLY_SANDBOX").map(|v| v.trim() == "1").unwrap_or(false);
+
+    let builder = tauri::Builder::default();
+    let builder = if sandbox {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tray::restore_main_window(app);
         }))
+    };
+
+    builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -190,6 +207,15 @@ pub fn run() {
             navigation::create_main_window(app)?;
             tray::setup(app)?;
 
+            // 迁移旧数据目录 ~/.ai-tool-manager/ → ~/.ai-toolkit/
+            // 必须在数据库初始化之前执行
+            migration::migrate_from_old_dir();
+
+            // 说明：产品更名为 Quoly AI 只改显示名称与 exe 名，
+            // 数据目录仍沿用 ~/.ai-toolkit/ —— 改目录名要搬几十万条账号记录，
+            // 一旦搬错就是"账号全没了"，收益为零、风险极高，故不做。
+            commands::shell::apply_default_autostart(app);
+
             // 静默启动（自启项带入的 --silent）：主窗口和悬浮窗都先不显形。
             // 用户从托盘点「打开主界面」或「显示悬浮窗」时才露脸。
             let silent = float_window::launched_silently();
@@ -201,14 +227,6 @@ pub fn run() {
             // 悬浮窗按上次的开关恢复。静默启动时也建出来，但不显示——
             // 这样托盘点「显示悬浮窗」是即时的，不用等窗口初始化。
             commands::shell::create_float_if_enabled(app, !silent);
-
-            // 首次运行默认开启开机自启（静默进托盘）。只做一次，
-            // 之后用户手动关掉就完全听用户的。
-            commands::shell::apply_default_autostart(app);
-
-            // 迁移旧数据目录 ~/.ai-tool-manager/ → ~/.ai-toolkit/
-            // 必须在数据库初始化之前执行
-            migration::migrate_from_old_dir();
 
             // 初始化数据库
             let db = Database::new()?;
@@ -275,6 +293,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::credits::credits_dashboard,
+            commands::credits::credits_float_stats,
+            commands::credits::credits_reload_credentials,
             commands::credits::credits_set_view_active,
             commands::credits::credits_network_restored,
             commands::credits::credits_import_local,

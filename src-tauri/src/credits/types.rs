@@ -464,6 +464,7 @@ pub struct ClaimAccountRow {
     /// Display name (nickname / label), falling back to a short id.
     pub name: String,
     /// `claimed` | `already_claimed` | `pending` | `unavailable` | `failed` | `none`
+    /// | `managed`（网关内账号，签到由网关自己跑，不参与统计）
     pub status: String,
     /// Credits actually added today by this account.
     pub amount: f64,
@@ -478,6 +479,12 @@ pub struct ClaimAccountRow {
 #[serde(rename_all = "camelCase")]
 pub struct PlatformClaims {
     pub platform: String,
+    /// 转发型平台（目前只有豆包）：这里的"账号"是一个本地网关，里面养着
+    /// 好几个号，签到由网关自己的调度器跑，不产生本模块统计的积分。
+    ///
+    /// 标出来是为了让界面区别对待：它没有成功率可言（快照里永远没有可领
+    /// 奖励），算进「共 N 个账号」「合计 X 分」只会污染两个总数。
+    pub gateway: bool,
     /// Accounts configured for this platform (enabled or not).
     pub accounts: u64,
     /// Accounts that produced any claim record today.
@@ -492,8 +499,21 @@ pub struct PlatformClaims {
     pub pending: u64,
     /// Accounts with no record at all — usually not yet attempted.
     pub missing: u64,
-    /// Credits added today.
+    /// Credits added today by claims this program submitted.
+    ///
+    /// This is deliberately narrower than what the user calls "今天领到多少":
+    /// WorkBuddy 这类平台会在账号当天首次被访问时就把签到记上，等到我们
+    /// 再调 claim 时只回一句"当前没有可领取的签到积分"。这些分确实到账了，
+    /// 但不是我们领的，所以不能算进 `credits`；否则又变成把没发生的事记成
+    /// 成功。它们由 `credited` 单独统计。
     pub credits: f64,
+    /// Credits the platform confirms as landed today, including the ones that
+    /// were granted before our claim ran (`already_claimed` accounts).
+    ///
+    /// 数据来自账号快照里状态为 claimed 的积分类奖励（WorkBuddy 的
+    /// `today_credit`、TRAE/Qoder 的每日签到、MiniMax 的签到达标奖励），
+    /// 是平台口径，不是本地记账推出来的。
+    pub credited: f64,
     /// `claimed / (claimed + unavailable + pending + missing)` — how many
     /// accounts actually got their credits. `alreadyClaimed` is excluded because
     /// those accounts already have the credits.
@@ -612,6 +632,34 @@ pub struct Dashboard {
     pub refreshing_account_ids: Vec<String>,
     /// Full-window totals; use these for any card that shows a number.
     pub usage: UsageStats,
+}
+
+/// 悬浮窗专用的极小载荷（< 1KB）。
+///
+/// 悬浮窗只显示 4 个数字，给它完整 Dashboard（2.42MB）是纯浪费：
+/// 传过去 99.96% 的数据会被丢掉，但每 211ms 传一次，
+/// 期间同步命令阻塞 Tauri 主线程 —— 表现就是拖动悬浮窗第一次没反应。
+///
+/// 这个结构只挑悬浮窗真正用到的字段。
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloatStats {
+    /// 代理是否在跑（悬浮窗左上角那个绿点）。
+    pub running: bool,
+    /// 今日请求数。
+    pub today_requests: u64,
+    /// 今日失败数。
+    pub today_failed: u64,
+    /// 今日消耗积分。
+    pub today_spent_credits: f64,
+    /// 今日已领取积分。
+    pub today_claimed_credits: f64,
+    /// 今日领取中的账号数。
+    pub today_claiming_accounts: u64,
+    /// 今日计费 token 合计。
+    pub today_tokens: u64,
+    /// 采样时刻，前端用来判断"这是新数还是旧数"。
+    pub sampled_at: i64,
 }
 
 pub fn now_ms() -> i64 {

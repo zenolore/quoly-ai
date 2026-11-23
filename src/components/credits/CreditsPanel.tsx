@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowUpRight, CheckCircle2, Coins, Copy, ExternalLink, KeyRound, Loader2,
-  FileUp, Info, Plus, Power, RefreshCw, Server, ShieldCheck, Sparkles, Trash2, X,
+  ArrowUpRight, CheckCircle2, ChevronDown, ChevronRight, Coins, Copy, ExternalLink, KeyRound, Loader2,
+  FileUp, Info, Plus, Power, RefreshCw, Server, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, X,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-shell";
 import { toast } from "sonner";
@@ -34,10 +34,29 @@ const sections = [
 ] as const;
 type PanelTab = typeof sections[number]["id"];
 const platformName = (platform: CreditPlatform) => platforms.find((item) => item.id === platform)?.name ?? platform;
+/** 停用或封禁的账号统一标红（列表行与详情卡片共用）。 */
+const inactiveAccount = (account: { enabled: boolean; status: string }) => !account.enabled || account.status === "banned";
+/**
+ * 仅可签到的账号：签到/领积分正常，但调模型会被上游拒绝（WorkBuddy 11140）。
+ * 单独判断，因为它既不是"好号"也不是"坏号"——标红会让人以为要删，
+ * 标绿又会让人拿去跑任务然后频繁失败，所以用琥珀色提示。
+ */
+const signableOnly = (account: { status: string }) => account.status === "signable";
 const regionName = (region?: CreditRegion) => region === "intl" ? "国际版" : "国内版";
 const unitName = (unit?: string) => ({ credits: "积分", usd: "USD", requests: "次", mixed: "分项额度", unknown: "单位未知" })[unit ?? "credits"] ?? unit;
-const amount = (value: number, unit?: string) => new Intl.NumberFormat("zh-CN", { maximumFractionDigits: unit?.toLowerCase() === "usd" ? 6 : 2 }).format(value);
-const number = (value: number) => new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
+
+/**
+ * 数字格式化器**预建并复用**，不要在函数里 new。
+ *
+ * 为什么（2026-11-18 实测）：`new Intl.NumberFormat` 是重量级对象，
+ * 构造一次比直接 format 慢 34 倍（实测 1,896 次调用：每次新建 34ms，
+ * 复用实例 1ms）。而这个函数在 158 个账号卡片里被调用上千次，
+ * 每次重渲染全部重建 —— 这是主线程被拖住的主要原因之一。
+ */
+const FMT_INT = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
+const FMT_USD = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 });
+const amount = (value: number, unit?: string) => (unit?.toLowerCase() === "usd" ? FMT_USD : FMT_INT).format(value);
+const number = (value: number) => FMT_INT.format(value);
 const time = (value?: number | null) => value ? new Date(value).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "尚未同步";
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 const isCredits = (kind: string) => ["credit", "credits", "points"].includes(kind);
@@ -57,6 +76,11 @@ const availableModels = (data: CreditDashboard) => data.accounts.filter((account
 const labels: Record<string, string> = {
   active: "已连接", ready: "已连接", connected: "已连接", authenticated: "已连接",
   expired: "登录已过期", auth_expired: "登录已过期", error: "连接异常", unknown: "待刷新",
+  // 仅可签到：签到/领积分正常，但调模型会被上游 11140 拒绝。
+  // 必须跟「已连接」区分开，否则用户会以为它能调模型，用它跑任务就频繁失败。
+  signable: "仅可签到",
+  // 连续 3 天检测不过，已自动停用（用户 2026-11-18 要求）。
+  retired: "已停用（连续3天不可用）",
   unsupported: "暂不支持", pending: "等待授权", claimed: "已领取", success: "成功",
   failed: "失败", skipped: "已跳过", claimable: "可领取", available: "可领取",
   unavailable: "暂不可领", already_claimed: "已领取", not_supported: "暂不支持",
@@ -171,7 +195,17 @@ function ModelsModal({ title, groups, onClose }: { title: string; groups: ModelG
   </Modal>;
 }
 
-function AccountCard({ account, onDelete, refreshing = false }: { account: CreditAccount; onDelete: () => void; refreshing?: boolean }) {
+/**
+ * 单个账号卡片。
+ *
+ * 用 `memo` 包住（2026-11-18 性能优化）：账号已经有 158 个，每次 dashboard
+ * 刷新都会重渲染全部卡片，而绝大多数账号的数据根本没变。memo 后只有数据
+ * 变了的卡片才重建，主线程压力大幅下降 —— 这是"拖动卡顿"的直接缓解。
+ *
+ * 注意：props 里**不能传内联箭头函数**，否则引用每次都变，memo 形同虚设。
+ * 所以 `onDelete` 改成传 `account` + 稳定的 `onDeleteAccount` 回调。
+ */
+const AccountCard = memo(function AccountCard({ account, onDeleteAccount, refreshing = false }: { account: CreditAccount; onDeleteAccount: (account: CreditAccount) => void; refreshing?: boolean }) {
   const refresh = useCreditsAction(() => creditsApi.refresh(account.id));
   const claim = useCreditsAction(() => creditsApi.claim(account.id));
   const toggle = useCreditsAction((enabled: boolean) => creditsApi.setAccountEnabled(account.id, enabled));
@@ -183,18 +217,24 @@ function AccountCard({ account, onDelete, refreshing = false }: { account: Credi
   const activities = snapshot?.rewards.filter((reward) => reward.kind === "activity") ?? [];
   const otherRewards = snapshot?.rewards.filter((reward) => !isCredits(reward.kind) && reward.kind !== "activity") ?? [];
   const busy = refresh.isPending || claim.isPending || toggle.isPending;
+  // 停用/封禁的账号整体标红：红色描边 + 淡红底 + 降低饱和度，一眼能从列表里区分出来。
+  const inactive = !account.enabled || account.status === "banned";
   const [showingModels, setShowingModels] = useState(false);
-  return <article className={`glass-card min-w-0 p-5 ${account.enabled ? "" : "opacity-70"}`}>
+  return <article className={`glass-card min-w-0 p-5 ${inactive ? "opacity-80 ring-2 ring-red-500/60 border-red-500/40 bg-red-500/5" : ""}`}>
     <div className="flex items-start justify-between gap-3">
-      <div className="min-w-0"><h3 className="truncate text-sm font-semibold">{account.label || platformName(account.platform)}</h3><p className="mt-1 truncate text-xs text-slate-500 dark:text-slate-400">{platformName(account.platform)} · {regionName(account.region)} · {account.userId || "账户"}</p></div>
-      <Pressable type="button" className="glass-icon-button shrink-0" aria-label={`移除账户 ${account.label}`} onClick={onDelete} disabled={busy}><Trash2 size={14} /></Pressable>
+      <div className="min-w-0"><h3 className={`truncate text-sm font-semibold ${inactive ? "text-red-600 dark:text-red-400" : ""}`}>{account.label || platformName(account.platform)}</h3>
+        {/* 副标题里平台名已经由列标题给过了，再拼一遍会变成「豆包 豆包」。
+            豆包的 userId 是网关地址，比"账户"两个字有信息量，单独展示。 */}
+        <p className="mt-1 truncate text-xs text-slate-500 dark:text-slate-400">{platformName(account.platform)} · {regionName(account.region)} · {account.userId || "账户"}</p></div>
+      <Pressable type="button" className="glass-icon-button shrink-0" aria-label={`移除账户 ${account.label}`} onClick={() => onDeleteAccount(account)} disabled={busy}><Trash2 size={14} /></Pressable>
     </div>
     <div className="mt-5 flex items-end justify-between gap-2">
       <div><p className="text-[11px] font-medium text-slate-500 dark:text-slate-400">剩余额度</p><p className="mt-2 text-3xl font-semibold tracking-tight tabular-nums">{snapshot?.balance != null ? amount(snapshot.balance, snapshot.unit) : "—"}<span className="ml-2 text-xs font-normal text-slate-500 dark:text-slate-400">{unitName(snapshot?.unit)}</span></p></div>
-      <Badge success={account.enabled && ["active", "ready", "connected", "authenticated"].includes(account.status)}>{!account.enabled ? "已停用" : labels[account.status] ?? account.status}</Badge>
+      <Badge success={account.enabled && ["active", "ready", "connected", "authenticated"].includes(account.status)}>{!account.enabled ? "已停用" : account.status === "banned" ? "已封禁" : labels[account.status] ?? account.status}</Badge>
     </div>
+    {signableOnly(account) ? <p className="mt-2 rounded-lg bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-800 dark:text-amber-200">此账号签到与领积分正常，但调用模型会被上游拒绝（11140）。它不会参与 API 路由，不会拉低调用成功率；积分照常领取。</p> : null}
     <p role="status" className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">{refreshing || refresh.isPending ? "同步中 · " : ""}{snapshot?.fetchedAt ? `上次成功同步 ${time(snapshot.fetchedAt)}` : "余额待同步"}{snapshot?.stale ? account.lastError ? " · 同步失败，显示历史余额" : " · 余额待更新" : ""}{snapshot?.quota ? ` · ${snapshot.quota}` : ""}</p>
-    {account.lastError || snapshot?.diagnostic ? <p className="mt-3 rounded-lg bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:text-amber-200">{account.lastError || snapshot?.diagnostic}</p> : null}
+    {account.lastError || snapshot?.diagnostic ? <p className={`mt-3 rounded-lg px-3 py-2 text-xs leading-relaxed ${inactive ? "bg-red-500/10 text-red-700 dark:text-red-300" : "bg-amber-500/10 text-amber-800 dark:text-amber-200"}`}>{account.lastError || snapshot?.diagnostic}</p> : null}
     {snapshot?.subAccounts?.length ? <DoubaoSubAccounts subs={snapshot.subAccounts} /> : null}
     <div className="mt-4 flex flex-wrap gap-2">
       {!automaticReward && !noDailyReward ? <Pressable type="button" className="glass-primary-button min-h-8 px-3 py-2 text-xs" disabled={busy || !isClaimable(account)} onClick={() => claim.mutate(undefined, { onSuccess: reportClaims })}>{claim.isPending ? <Loader2 size={13} className="animate-spin" /> : <Coins size={13} />}领取积分</Pressable> : null}
@@ -211,7 +251,7 @@ function AccountCard({ account, onDelete, refreshing = false }: { account: Credi
     <div className="mt-4 border-t border-slate-500/10 pt-3"><Pressable type="button" className="glass-secondary-button min-h-8 px-3 py-2 text-xs" onClick={() => setShowingModels(true)}>可用模型 · {models.length}</Pressable></div>
     {showingModels ? <ModelsModal title="可用模型" groups={[{ title: account.label || platformName(account.platform), entries: models.map((model) => ({ account, model })) }]} onClose={() => setShowingModels(false)} /> : null}
   </article>;
-}
+});
 
 /**
  * 豆包网关内部的账号清单。
@@ -256,6 +296,112 @@ function DoubaoSubAccounts({ subs }: { subs: SubAccount[] }) {
   </div>;
 }
 
+/**
+ * 「仅可签到」账号折叠区。
+ *
+ * 这类账号的处境很特殊（2026-11-18 实测）：
+ *   - 签到接口返回 active:true、每天正常拿积分 ✅
+ *   - 推理接口直接 403/11140 ❌
+ *
+ * 所以它们既不能当"好号"铺在正常列表里（用户拿去跑任务会频繁失败），
+ * 也不能当"坏号"折叠到异常区（它们每天都在真实产出积分）。
+ * 单独一组，用琥珀色说明清楚，既保住积分收益，又不误导用户。
+ *
+ * 它们不参与网关路由 —— 网关的 account_eligible 只认 ready，
+ * 而这里的状态是 signable，天然被排除。
+ */
+function SignableAccountsGroup({ accounts, onDelete, platformName }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; platformName: string }) {
+  const [open, setOpen] = useState(false);
+  return <div className="rounded-[var(--radius-card,12px)] border border-dashed border-amber-400/50 dark:border-amber-600/40">
+    <button
+      type="button"
+      onClick={() => setOpen((v) => !v)}
+      className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
+      aria-expanded={open}
+    >
+      <ChevronDown size={14} className={`shrink-0 text-amber-500 transition-transform ${open ? "" : "-rotate-90"}`} />
+      <span className="text-xs font-medium text-amber-700 dark:text-amber-300">{accounts.length} 个仅可签到</span>
+      <span className="text-[11px] text-slate-400 dark:text-slate-500">积分照领 · 不参与 API 路由</span>
+      <span className="ml-auto text-[11px] text-slate-400 dark:text-slate-500">{open ? "收起" : "点开查看"}</span>
+    </button>
+    {open ? <div className="space-y-1.5 border-t border-amber-200/60 px-3 py-2.5 dark:border-amber-900/40">
+      <p className="pb-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+        {platformName} 的这批账号签到、领积分都正常，但调用模型会被上游以 11140（request illegal）拒绝。
+        它们不会参与 API 路由，所以不会拉低调用成功率；每天该拿的积分照常领取。
+        上游风控有时会自行解除，过几天可以重新体检一次。
+      </p>
+      {accounts.map((account) => {
+        const name = account.label || account.userId || account.id;
+        return <div key={account.id} className="flex items-center gap-2 rounded-md bg-amber-500/[0.06] px-2 py-1.5">
+          <span className="min-w-0 flex-1 truncate text-[11px] text-slate-600 dark:text-slate-300" title={name}>{name}</span>
+          <span className="shrink-0 text-[11px] text-amber-700 dark:text-amber-300">仅可签到</span>
+          <button
+            type="button"
+            onClick={() => onDelete(account)}
+            className="shrink-0 text-[11px] text-slate-400 hover:text-rose-600 dark:hover:text-rose-400"
+            title="删除该账号"
+          >
+            删除
+          </button>
+        </div>;
+      })}
+    </div> : null}
+  </div>;
+}
+
+/**
+ * 异常账号折叠区：封禁 / 过期 / 停用的账号收在这里，默认收起，只显示数量。
+ *
+ * 为什么要折叠：一个平台可能攒了几十个签不了号的账号（历史封禁标记、
+ * 凭证过期等），如果和正常号混排，正常号会被挤到看不见的地方，用户也
+ * 判断不出"我到底还有多少能用的号"。
+ *
+ * 折叠后：标题行写「N 个异常账号（点开查看）」，展开才逐条列出，
+ * 每条带状态和原因。这样隔几天回来重测也方便——展开一眼就能看到还有哪些。
+ */
+function DeadAccountsGroup({ accounts, onDelete, platformName }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; platformName: string }) {
+  const [open, setOpen] = useState(false);
+  const banned = accounts.filter((a) => a.status === "banned").length;
+  const expired = accounts.filter((a) => a.status === "expired").length;
+  const disabled = accounts.filter((a) => !a.enabled).length;
+  const parts = [banned ? `封禁 ${banned}` : "", expired ? `过期 ${expired}` : "", disabled ? `停用 ${disabled}` : ""].filter(Boolean);
+  return <div className="rounded-[var(--radius-card,12px)] border border-dashed border-slate-300/70 dark:border-slate-700">
+    <button
+      type="button"
+      onClick={() => setOpen((v) => !v)}
+      className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
+      aria-expanded={open}
+    >
+      <ChevronDown size={14} className={`shrink-0 text-slate-400 transition-transform ${open ? "" : "-rotate-90"}`} />
+      <span className="text-xs font-medium text-slate-600 dark:text-slate-300">{accounts.length} 个异常账号</span>
+      <span className="text-[11px] text-slate-400 dark:text-slate-500">{parts.join(" · ")}</span>
+      <span className="ml-auto text-[11px] text-slate-400 dark:text-slate-500">{open ? "收起" : "点开查看"}</span>
+    </button>
+    {open ? <div className="space-y-1.5 border-t border-slate-200/70 px-3 py-2.5 dark:border-slate-800">
+      <p className="pb-1 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+        这些 {platformName} 账号当前无法签到。建议隔几天再刷新重测一次：上游封禁有时会自行解除，
+        仅凭证过期的号重新登录即可恢复。确认长期不行再删除。
+      </p>
+      {accounts.map((account) => {
+        const name = account.label || account.userId || account.id;
+        const reason = !account.enabled ? "已停用" : account.status === "banned" ? "已封禁" : "登录已过期";
+        return <div key={account.id} className="flex items-center gap-2 rounded-md bg-slate-500/[0.04] px-2 py-1.5 dark:bg-slate-400/[0.06]">
+          <span className="min-w-0 flex-1 truncate text-[11px] text-slate-600 dark:text-slate-300" title={name}>{name}</span>
+          <span className="shrink-0 text-[11px] text-rose-600 dark:text-rose-400">{reason}</span>
+          <button
+            type="button"
+            onClick={() => onDelete(account)}
+            className="shrink-0 text-[11px] text-slate-400 hover:text-rose-600 dark:hover:text-rose-400"
+            title="删除该账号"
+          >
+            删除
+          </button>
+        </div>;
+      })}
+    </div> : null}
+  </div>;
+}
+
 function AccountStack({ accounts, onDelete, refreshingAccountIds = [] }: { accounts: CreditAccount[]; onDelete: (account: CreditAccount) => void; refreshingAccountIds?: string[] }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const frontCard = useRef<HTMLDivElement>(null);
@@ -280,7 +426,7 @@ function AccountStack({ accounts, onDelete, refreshingAccountIds = [] }: { accou
           tabIndex={active ? -1 : undefined}
           className={`grid min-w-0 rounded-[var(--radius-card,12px)] ${active ? "bg-[hsl(var(--card))]" : "invisible pointer-events-none"}`}
         >
-          <AccountCard account={account} onDelete={() => onDelete(account)} refreshing={refreshingAccountIds.includes(account.id)} />
+          <AccountCard account={account} onDeleteAccount={onDelete} refreshing={refreshingAccountIds.includes(account.id)} />
         </div>
         {!active ? <Pressable
           type="button"
@@ -291,10 +437,14 @@ function AccountStack({ accounts, onDelete, refreshingAccountIds = [] }: { accou
             setSelectedId(account.id);
             requestAnimationFrame(() => frontCard.current?.focus({ preventScroll: true }));
           }}
-          className="absolute inset-x-0 top-0 flex h-14 items-start gap-2 rounded-[var(--radius-card,12px)] border border-slate-200/80 bg-slate-100 px-4 pt-3 text-left text-xs text-slate-600 transition-colors hover:bg-slate-200/80 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+          className={`absolute inset-x-0 top-0 flex h-14 items-start gap-2 rounded-[var(--radius-card,12px)] border px-4 pt-3 text-left text-xs transition-colors ${
+            inactiveAccount(account)
+              ? "border-red-400/70 bg-red-500/10 text-red-700 dark:border-red-500/60 dark:bg-red-500/15 dark:text-red-300"
+              : "border-slate-200/80 bg-slate-100 text-slate-600 hover:bg-slate-200/80 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700"
+          }`}
         >
-          <span className="min-w-0 flex-1 truncate font-medium">{name} · {regionName(account.region)}</span>
-          <span className="shrink-0 text-[11px] tabular-nums text-slate-500 dark:text-slate-400">{!account.enabled ? "已停用" : balance != null ? `${amount(balance, account.snapshot?.unit)} ${unit}` : "切换账户"}</span>
+          <span className={`min-w-0 flex-1 truncate font-medium ${inactiveAccount(account) ? "text-red-600 dark:text-red-400" : ""}`}>{name} · {regionName(account.region)}</span>
+          <span className={`shrink-0 text-[11px] tabular-nums ${inactiveAccount(account) ? "font-medium text-red-600 dark:text-red-400" : "text-slate-500 dark:text-slate-400"}`}>{!account.enabled ? "已停用" : account.status === "banned" ? "已封禁" : balance != null ? `${amount(balance, account.snapshot?.unit)} ${unit}` : "切换账户"}</span>
           <ArrowUpRight size={13} className="mt-0.5 shrink-0 text-slate-400" aria-hidden="true" />
         </Pressable> : null}
       </div>;
@@ -722,17 +872,30 @@ function AccountsView({ data, onAdd }: { data: CreditDashboard; onAdd: (platform
     })();
   };
   return <div className="space-y-6">
-    <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-slate-500 dark:text-slate-400">各平台分别展示原生额度，领取结果逐项记录。</p><div className="flex flex-wrap gap-2"><Pressable type="button" className="glass-secondary-button text-xs" disabled={refresh.isPending || !data.accounts.length} onClick={() => refresh.mutate(undefined)}><RefreshCw size={14} className={refresh.isPending ? "animate-spin" : ""} />刷新余额</Pressable><Pressable type="button" className="glass-primary-button text-xs" disabled={claim.isPending || !data.accounts.some(isClaimable)} onClick={() => claim.mutate(undefined, { onSuccess: reportClaims })}>{claim.isPending ? <Loader2 size={14} className="animate-spin" /> : <Coins size={14} />}一键领取积分</Pressable></div></div>
+    <div className="flex flex-wrap items-center justify-between gap-3"><p className="text-xs text-slate-500 dark:text-slate-400">各平台分别展示原生额度，领取结果逐项记录。<span className="ml-1 text-slate-400 dark:text-slate-500">排序：最新添加的账号始终排在最前，停用/封禁标红。</span></p><div className="flex flex-wrap gap-2"><Pressable type="button" className="glass-secondary-button text-xs" disabled={refresh.isPending || !data.accounts.length} onClick={() => refresh.mutate(undefined)}><RefreshCw size={14} className={refresh.isPending ? "animate-spin" : ""} />刷新余额</Pressable><Pressable type="button" className="glass-primary-button text-xs" disabled={claim.isPending || !data.accounts.some(isClaimable)} onClick={() => claim.mutate(undefined, { onSuccess: reportClaims })}>{claim.isPending ? <Loader2 size={14} className="animate-spin" /> : <Coins size={14} />}一键领取积分</Pressable></div></div>
     <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-3">
       {platforms.map((platform) => {
-        const accounts = data.accounts.filter((account) => account.platform === platform.id);
+        const all = data.accounts.filter((account) => account.platform === platform.id);
+        // 异常账号（封禁/过期/停用）折叠收起，只显示数量。
+        // 理由：这些号签不了，却和正常号混在一起占满列表，用户既看不清
+        // 又有多少是好号。折叠后正常号一目了然，异常号随时可展开查看。
+        // 过几天再展开重测，确认真的不行才清理。
+        // 三类分开：
+        //   正常  —— 能签到也能调模型，直接铺开
+        //   仅可签到 —— 签到正常但推理被封，单独折叠（不占正常列表，也不误报为坏号）
+        //   异常  —— 封禁/过期/停用，折叠，隔几天重测再决定清理
+        const accounts = all.filter((a) => a.enabled && a.status !== "banned" && a.status !== "expired" && a.status !== "signable");
+        const signable = all.filter((a) => a.status === "signable");
+        const dead = all.filter((a) => a.status !== "signable" && (!a.enabled || a.status === "banned" || a.status === "expired"));
         // 豆包这类转发型平台，一个账户背后是网关里的一堆号。
         // 数量标签要显示真实号数（7 个），而不是 1 个网关 —— 否则用户会觉得"我的号呢"。
         const subCount = accounts.reduce((sum, a) => sum + (a.snapshot?.subAccounts?.length ?? 0), 0);
         const countLabel = subCount > 0 ? `${subCount} 个账号` : `${accounts.length} 个账户`;
         return <section key={platform.id} className="min-w-0 space-y-3">
-          <div className="flex items-center gap-2 px-1"><AgentIcon id={platform.id} name={platform.name} className="h-7 w-7" /><h2 className="text-sm font-semibold">{platform.name}</h2><span className="ml-auto text-xs text-slate-500 dark:text-slate-400">{countLabel}</span></div>
-          {accounts.length ? <AccountStack accounts={accounts} onDelete={setDeleting} refreshingAccountIds={data.refreshingAccountIds} /> : <div className="glass-card flex min-h-[260px] flex-col items-center justify-center p-6 text-center"><KeyRound size={25} className="text-slate-400" /><p className="mt-4 text-sm font-medium">连接 {platform.name}</p><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">登录后查看余额、领取资格与模型目录。</p><Pressable type="button" className="glass-secondary-button mt-5 text-xs" onClick={() => onAdd(platform.id)}><Plus size={14} />添加账户</Pressable></div>}
+          <div className="flex items-center gap-2 px-1"><AgentIcon id={platform.id} name={platform.name} className="h-7 w-7" /><h2 className="text-sm font-semibold">{platform.name}</h2>{signable.length > 0 ? <span className="ml-auto text-xs text-amber-600 dark:text-amber-400">{signable.length} 个仅可签到</span> : null}{dead.length > 0 ? <span className={`text-xs text-rose-600 dark:text-rose-400 ${signable.length > 0 ? "" : "ml-auto"}`}>{dead.length} 个异常</span> : null}<span className={signable.length > 0 || dead.length > 0 ? "text-xs text-slate-500 dark:text-slate-400" : "ml-auto text-xs text-slate-500 dark:text-slate-400"}>{countLabel}</span></div>
+          {accounts.length ? <AccountStack accounts={accounts} onDelete={setDeleting} refreshingAccountIds={data.refreshingAccountIds} /> : (dead.length === 0 && signable.length === 0) ? <div className="glass-card flex min-h-[260px] flex-col items-center justify-center p-6 text-center"><KeyRound size={25} className="text-slate-400" /><p className="mt-4 text-sm font-medium">连接 {platform.name}</p><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">登录后查看余额、领取资格与模型目录。</p><Pressable type="button" className="glass-secondary-button mt-5 text-xs" onClick={() => onAdd(platform.id)}><Plus size={14} />添加账户</Pressable></div> : null}
+          {signable.length > 0 ? <SignableAccountsGroup accounts={signable} onDelete={setDeleting} platformName={platform.name} /> : null}
+          {dead.length > 0 ? <DeadAccountsGroup accounts={dead} onDelete={setDeleting} platformName={platform.name} /> : null}
         </section>;
       })}
     </div>
@@ -740,7 +903,7 @@ function AccountsView({ data, onAdd }: { data: CreditDashboard; onAdd: (platform
       <label aria-label="自动刷新余额" htmlFor="credits-auto-refresh" className="mt-4 flex items-start gap-3"><input id="credits-auto-refresh" type="checkbox" className="mt-0.5 h-4 w-4 accent-blue-500" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} disabled={save.isPending} /><span><span className="block text-sm font-medium">自动刷新余额</span><span className="mt-1 block text-xs leading-relaxed text-slate-500 dark:text-slate-400">默认开启。查看本页时每 5 分钟同步，其他页面或托盘运行时每 15 分钟同步；代理调用后自动补刷。退出应用后停止。</span></span></label>
       <label aria-label="自动领取可用积分" htmlFor="credits-auto-claim" className="mt-4 flex items-start gap-3"><input id="credits-auto-claim" type="checkbox" className="mt-0.5 h-4 w-4 accent-blue-500" checked={autoClaim} onChange={(event) => setAutoClaim(event.target.checked)} disabled={save.isPending} /><span><span className="block text-sm font-medium">自动领取可用积分</span><span className="mt-1 block text-xs leading-relaxed text-slate-500 dark:text-slate-400">开启后仅在 Quoly AI 运行期间，按北京时间每天 08:00 起检查并领取；当天 08:00 之后启动会立刻补做一次，已领取的任务自动跳过。</span></span></label>
       <label aria-label="自动执行成长任务" htmlFor="credits-auto-growth" className="mt-4 flex items-start gap-3"><input id="credits-auto-growth" type="checkbox" className="mt-0.5 h-4 w-4 accent-blue-500" checked={autoGrowth} onChange={(event) => setAutoGrowth(event.target.checked)} disabled={save.isPending} /><span><span className="block text-sm font-medium">自动执行成长任务</span><span className="mt-1 block text-xs leading-relaxed text-slate-500 dark:text-slate-400">默认关闭。跟随「自动领取」同一次检查执行 WorkBuddy 成长中心：领回旅行礼物、接取新任务、领取已完成任务的奖励、连登兑换、补登、抽奖、开盲盒，最后派出旅行。任务进度由平台按真实使用记账，这里只接取和领取，不代为完成。</span></span></label>
-      <Pressable type="button" className="glass-secondary-button mt-4 text-xs" disabled={!changed || save.isPending} onClick={() => save.mutate({ port: data.settings.port, autoClaim, autoRefresh, autoGrowth }, { onSuccess: () => toast.success("设置已保存") })}>{save.isPending ? <Loader2 size={13} className="animate-spin" /> : null}保存设置</Pressable>
+      <Pressable type="button" className="glass-secondary-button mt-4 text-xs" disabled={!changed || save.isPending} onClick={() => save.mutate({ ...data.settings, autoClaim, autoRefresh, autoGrowth }, { onSuccess: () => toast.success("设置已保存") })}>{save.isPending ? <Loader2 size={13} className="animate-spin" /> : null}保存设置</Pressable>
     </section>
     <section className="glass-card p-5"><h2 className="text-sm font-semibold">成长中心（WorkBuddy）</h2>
       <p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">手动执行一次完整流程：领回旅行礼物 → 领已完成任务奖励 → 接取新任务 → 连登兑换 / 补登 → 抽奖 → 开盲盒 → 派出旅行。任务进度由平台按真实使用记账，这里不会代替你完成任务。</p>
@@ -798,7 +961,12 @@ function ProxyView({ data }: { data: CreditDashboard }) {
   const start = useCreditsAction(creditsApi.startProxy);
   const stop = useCreditsAction(creditsApi.stopProxy);
   const probe = useCreditsAction(creditsApi.probeProxy);
-  const models = availableModels(data);
+  // 保存勾选的模型清单。用 spread 合并现有设置，只改 sharedModels ——
+  // 早先这里漏传字段会把 lanShare 一起清掉，等于把局域网共享悄悄关掉。
+  const saveSettings = useCreditsAction(creditsApi.saveSettings);
+  // 缓存住：它会展开 3,459 个（账号，模型）组合（158 个账号 × 各自模型目录），
+  // 每次 render 重算一遍纯属浪费。data 不变就不该重算。
+  const models = useMemo(() => availableModels(data), [data]);
   const [showingCatalog, setShowingCatalog] = useState(false);
   const catalogGroups: ModelGroup[] = platforms
     .flatMap((platform) => (["cn", "intl"] as const).map((region) => ({ title: `${platform.name} · ${regionName(region)}`, entries: models.filter(({ account }) => account.platform === platform.id && (account.region ?? "cn") === region) })))
@@ -810,7 +978,7 @@ function ProxyView({ data }: { data: CreditDashboard }) {
       <p className="mt-5 text-xs leading-relaxed text-slate-500 dark:text-slate-400">在客户端的自定义提供商设置中填写下方连接参数，再添加一个目录模型 ID。保持 Quoly AI 与代理运行即可使用。</p>
       <div className="mt-5 grid gap-5 md:grid-cols-2"><CopyField label="提供商名称" value="Quoly AI" /><CopyField label="Base URL" value={data.gateway.baseUrl} /></div>
       <div className="mt-5 grid gap-5 md:grid-cols-2"><div className="space-y-2"><p className="text-xs font-medium text-slate-500 dark:text-slate-400">协议</p><div className="glass-code space-y-2 rounded-xl px-3 py-2.5 text-xs"><p>OpenAI Chat Completions <code className="block break-all text-[11px] text-slate-500 dark:text-slate-400">/v1/chat/completions</code></p><p>Anthropic Messages <code className="block break-all text-[11px] text-slate-500 dark:text-slate-400">/v1/messages</code></p></div><p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">两种协议使用同一 Base URL，在客户端选择对应协议。</p></div><div className="space-y-2"><p className="text-xs font-medium text-slate-500 dark:text-slate-400">API Key</p><div className="glass-code flex min-h-[44px] items-center justify-between gap-3 rounded-xl px-3 py-2.5"><span className="text-xs text-slate-500 dark:text-slate-400">使用本地代理密钥</span><CopyProxyKey /></div></div></div>
-      <div className="mt-4 flex flex-wrap gap-2"><Pressable type="button" className="glass-secondary-button text-xs" disabled={!data.gateway.running || probe.isPending} onClick={() => probe.mutate(undefined, { onSuccess: (message) => toast.success(message) })}>{probe.isPending ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}检测连接</Pressable><CopyAllProxyConfig baseUrl={data.gateway.baseUrl} lanUrl={data.gateway.lanUrl} /></div>
+      <div className="mt-4 flex flex-wrap gap-2"><Pressable type="button" className="glass-secondary-button text-xs" disabled={!data.gateway.running || probe.isPending} onClick={() => probe.mutate(undefined, { onSuccess: (message) => toast.success(message) })}>{probe.isPending ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}检测连接</Pressable><CopyAllProxyConfig baseUrl={data.gateway.baseUrl} lanUrl={data.gateway.lanUrl} models={models} saved={data.settings.sharedModels ?? []} running={data.gateway.running} onSave={async (ids) => { await saveSettings.mutateAsync({ ...data.settings, sharedModels: ids }); toast.success(`已记住 ${ids.length} 个模型的选择`); }} /></div>
     </section>
     <section className="glass-card p-6"><div className="flex flex-wrap items-start justify-between gap-4"><div className="min-w-0"><h2 className="text-sm font-semibold">目录模型 ID</h2><p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">平台模型 ID 来自已连接账户的目录，可以指定对应平台调用；上游推理的可用性以实际请求结果为准。</p></div><Pressable type="button" className="glass-secondary-button shrink-0 text-xs" onClick={() => setShowingCatalog(true)}>查看模型 · {models.length}</Pressable></div><p className="mt-4 text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">模型 ID 固定平台与区域，国际版使用 -intl 前缀；失败不会切换到国内账号。</p>{showingCatalog ? <ModelsModal title="目录模型 ID" groups={catalogGroups} onClose={() => setShowingCatalog(false)} /> : null}</section>
     <section className="glass-card p-6"><h2 className="text-sm font-semibold">最近请求</h2>{data.requests.length ? <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-xs"><thead className="text-[11px] text-slate-500 dark:text-slate-400"><tr><th className="py-2 pr-4 font-medium">模型 / 平台</th><th className="py-2 pr-4 font-medium">耗时</th><th className="py-2 pr-4 font-medium">Tokens 输入 / 输出</th><th className="py-2 pr-4 font-medium">状态</th><th className="py-2 font-medium">时间</th></tr></thead><tbody>{data.requests.slice(0, 15).map((request) => <tr key={request.id} className="border-t border-slate-500/10"><td className="max-w-[260px] py-3 pr-4"><p className="break-all font-medium">{request.model}</p><p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">{platformName(request.platform)} · {regionName(request.region)} · {data.accounts.find((account) => account.id === request.accountId)?.label || request.accountId}</p></td><td className="whitespace-nowrap py-3 pr-4 tabular-nums">{number(request.elapsedMs)} ms</td><td className="whitespace-nowrap py-3 pr-4 tabular-nums">{request.inputTokens == null ? "—" : number(request.inputTokens)} / {request.outputTokens == null ? "—" : number(request.outputTokens)}</td><td className="py-3 pr-4"><Badge success={["success", "completed"].includes(request.status)}>{labels[request.status] ?? request.status}</Badge>{request.diagnostic ? <details className="mt-2 min-w-[180px] max-w-[340px] text-[11px]"><summary className="cursor-pointer text-blue-600 dark:text-blue-300">错误详情</summary><p className="mt-2 break-words leading-relaxed text-slate-600 dark:text-slate-300">{request.diagnostic.message}</p><p className="mt-2 break-all text-slate-500 dark:text-slate-400">代理请求 ID：{request.id}</p></details> : null}</td><td className="whitespace-nowrap py-3 text-[11px] text-slate-500 dark:text-slate-400">{time(request.createdAt)}</td></tr>)}</tbody></table></div> : <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">开启代理并从客户端调用后，显示平台、耗时和用量。</p>}</section>
@@ -837,33 +1005,200 @@ function CopyProxyKey() {
  * 复制内容刻意做成"能直接读懂"的格式而不是 JSON：用户多半是往 Claude Code、
  * Cline 这类工具的自定义提供商表单里填，边看边填比解析 JSON 顺手。
  */
-function CopyAllProxyConfig({ baseUrl, lanUrl }: { baseUrl: string; lanUrl: string | null }) {
+/**
+ * 一键复制连接参数 —— 带模型勾选。
+ *
+ * 为什么需要勾选：用户拿这段配置是发给别人的，让对方照着填。如果只给地址，
+ * 对方还得自己问"配哪个模型"。把选好的模型清单一起给他，一句话就能说清。
+ *
+ * 选择永久记住（存在 ProxySettings.sharedModels）：这是用户的配置资产，
+ * 每次重新勾一遍太烦。第二次点按钮时若已有保存的清单，直接复制不再弹窗 ——
+ * 这正是用户要的"以后点一下就复制"。
+ *
+ * 想改选择时点旁边的「选择模型」小链接，或按住 Alt 点主按钮。
+ */
+function CopyAllProxyConfig({ baseUrl, lanUrl, models, saved, onSave, running }: {
+  baseUrl: string;
+  lanUrl: string | null;
+  models: ModelEntry[];
+  saved: string[];
+  onSave: (ids: string[]) => Promise<void>;
+  running: boolean;
+}) {
+  const [picking, setPicking] = useState(false);
   const [copying, setCopying] = useState(false);
-  const copy = async () => {
+
+  // 按平台分组，供弹窗折叠展示
+  const groups = platforms
+    .map((platform) => ({
+      id: platform.id,
+      name: platform.name,
+      entries: models.filter(({ account }) => account.platform === platform.id),
+    }))
+    .filter((group) => group.entries.length);
+
+  const build = async (selected: string[]) => {
+    const key = await creditsApi.proxyKey();
+    const chosen = models.filter(({ model }) => selected.includes(modelKey(model)));
+    // 按平台归组，方便对方逐个平台配
+    const byPlatform = new Map<string, string[]>();
+    for (const { account, model } of chosen) {
+      const name = platformName(account.platform);
+      byPlatform.set(name, [...(byPlatform.get(name) ?? []), model.id]);
+    }
+    const modelLines = byPlatform.size
+      ? [...byPlatform.entries()].flatMap(([name, ids]) => [`  ${name}：`, ...ids.map((id) => `    - ${id}`)])
+      : ["  （未选择模型）"];
+    const lines = [
+      `提供商名称：Quoly AI`,
+      `Base URL：${baseUrl}`,
+      lanUrl ? `局域网地址：${lanUrl}` : `局域网地址：未开启（代理仅监听本机）`,
+      `协议：OpenAI Chat Completions（/v1/chat/completions）`,
+      `　　　Anthropic Messages（/v1/messages）`,
+      `API Key：${key}`,
+      ``,
+      `需要配置的模型（共 ${chosen.length} 个）：`,
+      ...modelLines,
+      ``,
+      `（两种协议共用同一 Base URL，在客户端选择对应协议即可）`,
+    ];
+    await copyValue(lines.join("\n"), `代理连接参数（含 ${chosen.length} 个模型）`);
+  };
+
+  const copyNow = async (selected: string[]) => {
     setCopying(true);
     try {
-      const key = await creditsApi.proxyKey();
-      const lines = [
-        `提供商名称：Quoly AI`,
-        `Base URL：${baseUrl}`,
-        lanUrl ? `局域网地址：${lanUrl}` : `局域网地址：未开启（代理仅监听本机）`,
-        `协议：OpenAI Chat Completions（/v1/chat/completions）`,
-        `　　　Anthropic Messages（/v1/messages）`,
-        `API Key：${key}`,
-        ``,
-        `（两种协议共用同一 Base URL，在客户端选择对应协议即可）`,
-      ];
-      await copyValue(lines.join("\n"), "代理连接参数");
+      await build(selected);
     } catch (error) {
       toast.error(errorMessage(error));
     } finally {
       setCopying(false);
     }
   };
-  return <Pressable type="button" className="glass-primary-button text-xs" disabled={copying} onClick={() => void copy()}>
-    {copying ? <Loader2 size={13} className="animate-spin" /> : <Copy size={13} />}
-    一键复制连接参数
-  </Pressable>;
+
+  // 已经选过 → 直接复制；没选过 → 弹窗选
+  const primary = async () => {
+    if (!running) {
+      toast.error("代理还没开启，先点「一键开启代理」");
+      return;
+    }
+    if (!saved.length) {
+      setPicking(true);
+      return;
+    }
+    await copyNow(saved);
+  };
+
+  return <>
+    <Pressable type="button" className="glass-primary-button text-xs" disabled={copying} onClick={() => void primary()}>
+      {copying ? <Loader2 size={13} className="animate-spin" /> : <Copy size={13} />}
+      一键复制连接参数
+    </Pressable>
+    <Pressable type="button" className="glass-secondary-button text-xs" disabled={copying} onClick={() => setPicking(true)}>
+      <SlidersHorizontal size={13} />
+      {saved.length ? `已选 ${saved.length} 个模型` : "选择模型"}
+    </Pressable>
+    {picking ? <ModelPickerModal
+      groups={groups}
+      initial={saved}
+      onCancel={() => setPicking(false)}
+      onConfirm={async (ids) => {
+        setPicking(false);
+        await onSave(ids);
+        await copyNow(ids);
+      }}
+    /> : null}
+  </>;
+}
+
+/** 复制内容里的模型唯一键。跨平台同名模型必须区分，否则勾选会串。 */
+function modelKey(model: CreditModel) {
+  return model.id;
+}
+
+/**
+ * 模型勾选弹窗。四个平台默认折叠，展开后逐个勾选。
+ *
+ * 折叠而不是全展开：四个平台加起来 86 个模型，全摊开要滚半屏，
+ * 用户找某个平台的模型很累。
+ */
+function ModelPickerModal({ groups, initial, onCancel, onConfirm }: {
+  groups: Array<{ id: CreditPlatform; name: string; entries: ModelEntry[] }>;
+  initial: string[];
+  onCancel: () => void;
+  onConfirm: (ids: string[]) => Promise<void>;
+}) {
+  const [selected, setSelected] = useState<Set<string>>(new Set(initial));
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const toggleModel = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const toggleGroup = (id: string) => {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  // 整组勾选/取消：展开后一次点掉一个平台的全部模型
+  const toggleAll = (entries: ModelEntry[], on: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const { model } of entries) {
+        if (on) next.add(modelKey(model)); else next.delete(modelKey(model));
+      }
+      return next;
+    });
+  };
+  return <Modal open onClose={onCancel} size="xl">
+    <div className="flex items-center justify-between gap-3 border-b border-slate-500/10 px-6 py-4">
+      <div><h2 className="text-base font-semibold">选择要分享的模型</h2><p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">勾选的清单会随连接参数一起复制，并永久记住。</p></div>
+      <Pressable type="button" className="glass-icon-button" onClick={onCancel} aria-label="关闭模型选择"><X size={18} /></Pressable>
+    </div>
+    <div className="max-h-[62vh] space-y-3 overflow-y-auto p-6">
+      {groups.length ? groups.map((group) => {
+        const expanded = open.has(group.id);
+        const all = group.entries.map(({ model }) => modelKey(model));
+        const picked = all.filter((id) => selected.has(id)).length;
+        return <section key={group.id} className="rounded-xl border border-slate-500/10">
+          <div className="flex items-center gap-2 px-3 py-2.5">
+            <Pressable type="button" noScale className="flex min-w-0 flex-1 items-center gap-2 text-left" onClick={() => toggleGroup(group.id)} aria-expanded={expanded}>
+              <ChevronRight size={14} className={`shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
+              <AgentIcon id={group.id} name={group.name} className="h-5 w-5" />
+              <span className="text-sm font-medium">{group.name}</span>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">{picked}/{all.length} 已选</span>
+            </Pressable>
+            <Pressable type="button" className="glass-secondary-button min-h-6 shrink-0 px-2 py-0.5 text-[11px]" onClick={() => toggleAll(group.entries, picked !== all.length)}>
+              {picked === all.length ? "全不选" : "全选"}
+            </Pressable>
+          </div>
+          {expanded ? <div className="border-t border-slate-500/10 p-2">
+            {group.entries.map(({ account, model }) => {
+              const id = modelKey(model);
+              const checked = selected.has(id);
+              return <label key={`${account.id}-${model.id}`} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs hover:bg-slate-500/5">
+                <input type="checkbox" className="h-3.5 w-3.5 accent-blue-500" checked={checked} onChange={() => toggleModel(id)} />
+                <code className="min-w-0 flex-1 break-all">{model.id}</code>
+              </label>;
+            })}
+          </div> : null}
+        </section>;
+      }) : <p className="text-xs text-slate-500 dark:text-slate-400">还没有可用模型，先连接平台账户并刷新。</p>}
+    </div>
+    <div className="flex items-center justify-between gap-3 border-t border-slate-500/10 px-6 py-4">
+      <span className="text-xs text-slate-500 dark:text-slate-400">已选 {selected.size} 个模型</span>
+      <div className="flex gap-2">
+        <Pressable type="button" className="glass-secondary-button text-xs" onClick={onCancel}>取消</Pressable>
+        <Pressable type="button" className="glass-primary-button text-xs" disabled={!selected.size} onClick={() => void onConfirm([...selected])}>
+          <Copy size={13} />确定并复制
+        </Pressable>
+      </div>
+    </div>
+  </Modal>;
 }
 
 export default function CreditsPanel() {

@@ -2,6 +2,203 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
+
+/// Windows 上把全部 secret 打包成一个 DPAPI 加密文件。
+///
+/// 背景：Windows 凭据库每用户上限实测约 347KB，单个账号要 3.3KB（两段 JWT
+/// 各 1.6KB 且不能裁剪），一百个号就撞墙——`CredWriteW` 返回
+/// `ERROR_NOT_ENOUGH_MEMORY(8)`，新账号全部注入失败。改用文件后容量只受磁盘
+/// 限制，DPAPI 仍保证只有当前 Windows 用户能解密。
+#[cfg(target_os = "windows")]
+mod vault_file {
+    use std::ffi::c_void;
+    use std::path::PathBuf;
+
+    #[repr(C)]
+    struct Blob {
+        cb: u32,
+        pb: *mut u8,
+    }
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CryptProtectData(
+            data_in: *const Blob,
+            description: *const u16,
+            entropy: *const Blob,
+            reserved: *mut c_void,
+            prompt: *mut c_void,
+            flags: u32,
+            data_out: *mut Blob,
+        ) -> i32;
+        fn CryptUnprotectData(
+            data_in: *const Blob,
+            description: *mut *mut u16,
+            entropy: *const Blob,
+            reserved: *mut c_void,
+            prompt: *mut c_void,
+            flags: u32,
+            data_out: *mut Blob,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    /// 禁止 DPAPI 弹窗（后台刷新时不能阻塞用户）。
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+
+    pub fn path() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".ai-toolkit")
+            .join("credentials.vault")
+    }
+
+    pub fn read() -> Result<Option<Vec<u8>>, String> {
+        read_from(&path())
+    }
+
+    pub fn read_from(file: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
+        let sealed = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("无法读取本地凭据文件，请检查文件权限".into()),
+        };
+        if sealed.is_empty() {
+            return Ok(Some(b"{}".to_vec()));
+        }
+        unsafe {
+            let mut input = Blob {
+                cb: sealed.len() as u32,
+                pb: sealed.as_ptr() as *mut u8,
+            };
+            let mut output = Blob {
+                cb: 0,
+                pb: std::ptr::null_mut(),
+            };
+            let ok = CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            );
+            if ok == 0 {
+                return Err("本地凭据文件解密失败，可能由其他 Windows 用户创建".into());
+            }
+            let plain = std::slice::from_raw_parts(output.pb, output.cb as usize).to_vec();
+            LocalFree(output.pb as *mut c_void);
+            Ok(Some(plain))
+        }
+    }
+
+    pub fn write(plain: &[u8]) -> Result<(), String> {
+        write_to(&path(), plain)
+    }
+
+    pub fn write_to(file: &std::path::Path, plain: &[u8]) -> Result<(), String> {
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir).map_err(|_| "无法创建本地凭据目录".to_string())?;
+        }
+        unsafe {
+            let mut input = Blob {
+                cb: plain.len() as u32,
+                pb: plain.as_ptr() as *mut u8,
+            };
+            let mut output = Blob {
+                cb: 0,
+                pb: std::ptr::null_mut(),
+            };
+            let ok = CryptProtectData(
+                &input,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            );
+            if ok == 0 {
+                return Err("本地凭据加密失败".into());
+            }
+            let sealed = std::slice::from_raw_parts(output.pb, output.cb as usize);
+            // 先写临时文件再替换，避免写到一半崩溃留下半截凭据。
+            let temp = file.with_extension("vault.tmp");
+            let result = std::fs::write(&temp, sealed).and_then(|_| std::fs::rename(&temp, &file));
+            LocalFree(output.pb as *mut c_void);
+            result.map_err(|_| "无法写入本地凭据文件".to_string())
+        }
+    }
+
+    pub fn remove() -> Result<(), String> {
+        remove_at(&path())
+    }
+
+    pub fn remove_at(file: &std::path::Path) -> Result<(), String> {
+        match std::fs::remove_file(file) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("无法删除本地凭据文件".into()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn real_vault_file_parses() {
+            let file = path();
+            if !file.exists() {
+                return; // 没有迁移文件时不校验
+            }
+            let bytes = read_from(&file).expect("解密失败").expect("文件为空");
+            let text = std::str::from_utf8(&bytes).expect("不是 UTF-8");
+            let map: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(text).expect("整包 JSON 解析失败");
+            assert!(map.len() > 100, "账号数异常：{}", map.len());
+            let mut parsed = 0;
+            for (id, value) in &map {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
+                    assert!(json.get("accessToken").is_some(), "{id} 缺 accessToken");
+                    parsed += 1;
+                }
+            }
+            assert!(parsed > 100, "标准凭据只有 {} 条", parsed);
+            println!("真实 vault 文件：{} 个键，{} 条标准凭据，{} 字节", map.len(), parsed, bytes.len());
+        }
+
+        #[test]
+        fn dpapi_roundtrip_isolated() {
+            let dir = std::env::temp_dir().join(format!("ait-vault-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("credentials.vault");
+
+            assert!(read_from(&file).unwrap().is_none(), "文件不存在时应返回 None");
+
+            let payload = br#"{"acc-1":"{\"accessToken\":\"a.b.c\"}","acc-2":"x"}"#.to_vec();
+            write_to(&file, &payload).unwrap();
+            assert_eq!(read_from(&file).unwrap().unwrap(), payload, "加解密必须无损");
+
+            let sealed = std::fs::read(&file).unwrap();
+            assert_ne!(sealed, payload, "落盘内容必须是密文");
+            assert!(sealed.len() > payload.len(), "密文应带 DPAPI 头部");
+
+            let second = b"{}".to_vec();
+            write_to(&file, &second).unwrap();
+            assert_eq!(read_from(&file).unwrap().unwrap(), second, "覆盖写应生效");
+
+            remove_at(&file).unwrap();
+            assert!(read_from(&file).unwrap().is_none(), "删除后应回到 None");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+}
 const CHUNK_SIZE: usize = 2000;
 const PREFIX: &str = "ait-secret-v1:";
 const MAX_CHUNKS: usize = 128;
@@ -43,7 +240,9 @@ impl SecretStore {
         Self {
             gate: Mutex::new(Cache::default()),
             blocked: Mutex::new(None),
-            layout: if cfg!(target_os = "macos") {
+            // Windows 也走 Vault（整包）布局：凭据库每用户上限约 347KB，按号分片
+            // 存到一百个号就写不进去了，改成整包落 DPAPI 文件后只受磁盘限制。
+            layout: if cfg!(any(target_os = "macos", target_os = "windows")) {
                 Layout::Vault
             } else {
                 Layout::Chunked
@@ -68,6 +267,17 @@ impl SecretStore {
             layout,
             memory: Some(Mutex::new(MemoryBackend::default())),
         }
+    }
+    /// 丢弃内存缓存并重新从存储加载。
+    /// 外部进程（批量注号脚本）直接改写 vault 文件后，本进程的内存副本不会自动
+    /// 感知，表现为 dashboard 报「账号凭据不存在」。调用本方法即可无重启同步。
+    pub fn reload_cache(&self) -> Result<usize, String> {
+        let mut cache = self.gate.lock();
+        cache.values.clear();
+        cache.legacy_errors.clear();
+        cache.vault = None;
+        let map = self.vault_map(&mut cache)?;
+        Ok(map.len())
     }
     pub fn get(&self, id: &str) -> Result<Option<String>, String> {
         let mut cache = self.gate.lock();
@@ -169,10 +379,9 @@ impl SecretStore {
                 let mut cache = self.gate.lock();
                 self.access_ready()?;
                 let mut map = self.vault_map(&mut cache)?.clone();
-                if map.remove(id).is_some() {
-                    self.vault_write(&map)?;
-                    cache.vault = Some(map);
-                }
+                map.remove(id);
+                let merged = self.vault_write(&map, Some(id))?;
+                cache.vault = Some(merged);
                 cache.values.remove(id);
                 Ok(())
             }
@@ -207,9 +416,33 @@ impl SecretStore {
         serde_json::from_str(raw.strip_prefix(VAULT_PREFIX).unwrap_or(raw))
             .map_err(|_| "系统凭据编码无效".into())
     }
-    fn vault_write(&self, map: &BTreeMap<String, String>) -> Result<(), String> {
-        let raw = serde_json::to_string(map).map_err(|_| "系统凭据编码无效".to_string())?;
-        self.native_result(self.write(VAULT_ACCOUNT, raw.as_bytes()))
+    /// 合并写：先读盘上最新内容，保留「本进程启动后由外部写入」的账号，
+    /// 再用本次进程掌管的键覆盖。否则进程内缓存会把外部新增项整份冲掉。
+    /// （实测：脚本注入的新号会在客户端下一次刷新 token 时被静默抹除）
+    fn vault_write(
+        &self,
+        map: &BTreeMap<String, String>,
+        removed: Option<&str>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let mut merged = match self.read_with_ui(VAULT_ACCOUNT, false) {
+            Ok(Some(raw)) => {
+                let text = String::from_utf8_lossy(&raw);
+                let text = text.strip_prefix(VAULT_PREFIX).unwrap_or(&text);
+                serde_json::from_str::<BTreeMap<String, String>>(text).unwrap_or_default()
+            }
+            _ => BTreeMap::new(),
+        };
+        for (key, value) in map {
+            merged.insert(key.clone(), value.clone());
+        }
+        // 合并写只做「覆盖/新增」，删除必须显式从这里扣掉，
+        // 否则盘上那条会被读回来重新写进去（删号变成静默无效）。
+        if let Some(id) = removed {
+            merged.remove(id);
+        }
+        let raw = serde_json::to_string(&merged).map_err(|_| "系统凭据编码无效".to_string())?;
+        self.native_result(self.write(VAULT_ACCOUNT, raw.as_bytes()))?;
+        Ok(merged)
     }
     fn vault_map<'a>(&self, cache: &'a mut Cache) -> Result<&'a BTreeMap<String, String>, String> {
         if cache.vault.is_none() {
@@ -234,8 +467,8 @@ impl SecretStore {
         if let Some(raw) = legacy {
             let mut map = self.vault_map(cache)?.clone();
             map.insert(id.into(), raw.clone());
-            self.vault_write(&map)?;
-            cache.vault = Some(map);
+            let merged = self.vault_write(&map, None)?;
+            cache.vault = Some(merged);
             self.delete_legacy(id)?;
             return Ok(Some(raw));
         }
@@ -244,18 +477,18 @@ impl SecretStore {
     fn vault_set(&self, id: &str, secret: &str, cache: &mut Cache) -> Result<(), String> {
         let mut map = self.vault_map(cache)?.clone();
         map.insert(id.into(), secret.into());
-        self.vault_write(&map)?;
-        cache.vault = Some(map);
+        let merged = self.vault_write(&map, None)?;
+        cache.vault = Some(merged);
         Ok(())
     }
     fn vault_delete(&self, id: &str, cache: &mut Cache) -> Result<(), String> {
         let mut map = self.vault_map(cache)?.clone();
         // Metadata-only discovery avoids reading a protected manifest to delete it.
         self.delete_legacy(id)?;
-        if map.remove(id).is_some() {
-            self.vault_write(&map)?;
-            cache.vault = Some(map);
-        }
+        // 不判 map 里有没有：盘上可能存在一份内存不知道的条目，一律显式删。
+        map.remove(id);
+        let merged = self.vault_write(&map, Some(id))?;
+        cache.vault = Some(merged);
         Ok(())
     }
 
@@ -384,11 +617,20 @@ impl SecretStore {
         #[cfg(target_os = "macos")]
         return macos::read(id, _allow_ui);
         #[cfg(not(target_os = "macos"))]
-        entry(id).and_then(|credential| match credential.get_secret() {
-            Ok(s) => Ok(Some(s)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err("无法读取系统凭据库，请检查钥匙串权限".into()),
-        })
+        {
+            // 整包只落一个文件；其余 id 仍是旧版按号分片，迁移时逐条读出来。
+            #[cfg(target_os = "windows")]
+            {
+                if id == VAULT_ACCOUNT {
+                    return vault_file::read();
+                }
+            }
+            entry(id).and_then(|credential| match credential.get_secret() {
+                Ok(s) => Ok(Some(s)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(_) => Err("无法读取系统凭据库，请检查钥匙串权限".into()),
+            })
+        }
     }
     fn write(&self, id: &str, secret: &[u8]) -> Result<(), String> {
         self.access_ready()?;
@@ -408,11 +650,19 @@ impl SecretStore {
         #[cfg(target_os = "macos")]
         return macos::write(id, secret, _allow_ui);
         #[cfg(not(target_os = "macos"))]
-        entry(id).and_then(|credential| {
-            credential
-                .set_secret(secret)
-                .map_err(|_| "无法保存到系统凭据库，请检查凭据库权限".into())
-        })
+        {
+            #[cfg(target_os = "windows")]
+            {
+                if id == VAULT_ACCOUNT {
+                    return vault_file::write(secret);
+                }
+            }
+            entry(id).and_then(|credential| {
+                credential
+                    .set_secret(secret)
+                    .map_err(|_| "无法保存到系统凭据库，请检查凭据库权限".into())
+            })
+        }
     }
     fn remove(&self, id: &str) -> Result<(), String> {
         self.access_ready()?;
@@ -429,10 +679,18 @@ impl SecretStore {
         #[cfg(target_os = "macos")]
         return macos::remove(id);
         #[cfg(not(target_os = "macos"))]
-        entry(id).and_then(|credential| match credential.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(_) => Err("无法删除系统凭据库中的凭据".into()),
-        })
+        {
+            #[cfg(target_os = "windows")]
+            {
+                if id == VAULT_ACCOUNT {
+                    return vault_file::remove();
+                }
+            }
+            entry(id).and_then(|credential| match credential.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(_) => Err("无法删除系统凭据库中的凭据".into()),
+            })
+        }
     }
 }
 #[cfg(not(target_os = "macos"))]

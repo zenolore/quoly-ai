@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/平台-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
 [![Built with](https://img.shields.io/badge/built%20with-Tauri%202-orange)](https://tauri.app/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.3.0-brightgreen)](https://github.com/zenolore/quoly-ai/releases)
+[![Version](https://img.shields.io/badge/version-2.4.0-brightgreen)](https://github.com/zenolore/quoly-ai/releases)
 [![Stars](https://img.shields.io/github/stars/zenolore/quoly-ai?style=social)](https://github.com/zenolore/quoly-ai/stargazers)
 
 **简体中文** · [English](README_EN.md)
@@ -85,7 +85,7 @@ API Key:   在「积分与代理」页一键复制
 
 从 [Releases](https://github.com/zenolore/quoly-ai/releases) 取最新安装包：
 
-- **Windows**：`Quoly AI_2.3.0_x64-setup.exe`（10.2 MB）
+- **Windows**：`Quoly AI_2.4.0_x64-setup.exe`（10.2 MB）
 - **macOS**：`.dmg`（Apple Silicon / Intel）
 - **Linux**：`.AppImage` / `.deb`
 

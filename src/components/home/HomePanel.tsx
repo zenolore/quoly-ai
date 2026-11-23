@@ -168,14 +168,45 @@ export default function HomePanel() {
     // window, while the local `rewards` list only holds the newest 100 rows.
     const todayCredits = usage ? Number(usage.todayClaimedCredits) : 0;
     // 今天平台实际发出的资源包总额，不管是谁领的。用户装了第二个签到工具时
-    // 这个数会明显大于 todayCredits，差额就是那个工具领的——见数值下面的注脚。
+    // 这个数可能大于 todayCredits；差额只能说明来自其他途径，不能据此认定
+    // 是某一个客户端或平台官方自动签到。
     const todayNewPacks = usage ? Number(usage.todayNewPackCredits) : 0;
-    const otherClients = Math.max(0, todayNewPacks - todayCredits);
+    // 平台口径的今日到账。WorkBuddy 这类平台会在账号当天首次被访问时就把
+    // 签到记上，我们再去 claim 只拿到"没有可领"，于是 todayCredits 只算得到
+    // 一部分。2026-11-14 用户看到"10/56 个账号领到 · 共 1000 分"就问为什么
+    // 只有 1000——平台侧其实 56 个号各到账 100，合计 5600。这里把两个口径
+    // 都摆出来：本程序领到的，和平台确认已到账的。
+    const creditedTotal = (data?.usage?.claims ?? [])
+      .filter((p) => !p.gateway)
+      .reduce((sum, p) => sum + (p.credited ?? p.credits), 0);
+    const otherClients = creditedTotal > todayCredits
+      ? creditedTotal - todayCredits
+      : Math.max(0, todayNewPacks - todayCredits);
     const todayClaimed = usage ? Number(usage.todayClaimingAccounts) : 0;
     const todayPending = usage ? Number(usage.todayPendingClaims) : 0;
 
-    const totalBalance = accounts.reduce((sum, a) => sum + (a.snapshot?.balance ?? 0), 0);
-    const withBalance = accounts.filter((a) => a.snapshot?.balance != null).length;
+    // 总额口径（2026-11-19 修正）：
+    //
+    // 原来严格只算 enabled && status === 'ready'。问题：上游抖动两分钟，
+    // 119 个账号被误标成 error，总额就从 17 万塌到 1386，看起来像资产蒸发。
+    //
+    // 改成「排除法」——只排除确定取不出钱的账号，其余一律计入：
+    //   expired（凭证过期）、banned（封禁）、retired（连续3天不可用已停用）
+    // error / ready / signable 都计入，因为它们账上的余额是真实存在的。
+    // status 只说明「最近一次探测成功与否」，不能用来否定资产。
+    const UNUSABLE = new Set(['expired', 'banned', 'retired']);
+    // 豆包的 balance 是网关内可用账号数，不是积分，不能与各平台余额相加。
+    const creditAccounts = accounts.filter((a) => a.platform !== 'doubao');
+    const usableAccounts = creditAccounts.filter(
+      (a) => a.enabled && !UNUSABLE.has(a.status) && a.snapshot?.balance != null,
+    );
+    const totalBalance = usableAccounts.reduce((sum, a) => sum + (a.snapshot?.balance ?? 0), 0);
+    const withBalance = usableAccounts.length;
+    // 被排除在总额之外的账号数，界面上要说明「另有 N 个账号不计入」，
+    // 否则用户会以为余额凭空少了。
+    const excludedFromTotal = creditAccounts.filter(
+      (a) => a.snapshot?.balance != null && !(a.enabled && !UNUSABLE.has(a.status)),
+    ).length;
     const claimableAccounts = accounts.filter((a) =>
       (a.snapshot?.rewards ?? []).some((r) => r.status === 'claimable'),
     ).length;
@@ -205,10 +236,12 @@ export default function HomePanel() {
       avgLatency,
       todayCredits,
       todayNewPacks,
+      creditedTotal,
       otherClients,
       todayClaimed,
       todayPending,
       totalBalance,
+      excludedFromTotal,
       withBalance,
       claimableAccounts,
       // 这批数字的生成时间，用来在页面标「用量截至 HH:MM:SS」。
@@ -234,11 +267,14 @@ export default function HomePanel() {
   const claimSummary = useMemo(() => {
     const claims = data?.usage?.claims ?? [];
     if (claims.length === 0) return '今日暂无领取记录';
-    const accounts = claims.reduce((sum, p) => sum + p.accounts, 0);
-    const claimed = claims.reduce((sum, p) => sum + p.claimed, 0);
-    const already = claims.reduce((sum, p) => sum + p.alreadyClaimed, 0);
-    const pending = claims.reduce((sum, p) => sum + p.pending, 0);
-    const credits = claims.reduce((sum, p) => sum + p.credits, 0);
+    // 网关型平台（豆包）不算：它没有领取动作，算进来会让「N 个账号」虚高
+    // 而「X 分」不动，看的人会以为有一批号领了 0 分。
+    const counted = claims.filter((p) => !p.gateway);
+    const accounts = counted.reduce((sum, p) => sum + p.accounts, 0);
+    const claimed = counted.reduce((sum, p) => sum + p.claimed, 0);
+    const already = counted.reduce((sum, p) => sum + p.alreadyClaimed, 0);
+    const pending = counted.reduce((sum, p) => sum + p.pending, 0);
+    const credits = counted.reduce((sum, p) => sum + p.credits, 0);
     const parts = [
       `${accounts} 个账号`,
       `${claimed} 个今日新领`,
@@ -366,16 +402,20 @@ export default function HomePanel() {
             icon={<Coins size={12} />}
             label="积分总余额"
             value={formatInt(stats.totalBalance)}
-            note={`${stats.withBalance} 个账号有余额`}
+            note={
+              stats.excludedFromTotal > 0
+                ? `${stats.withBalance} 个可用账号 · 另有 ${stats.excludedFromTotal} 个不可用账号不计入`
+                : `${stats.withBalance} 个账号有余额`
+            }
             tone="blue"
           />
           <StatCard
             icon={<Sparkles size={12} />}
-            label="今日已领积分"
+            label="本程序今日新领"
             value={formatInt(stats.todayCredits)}
             note={
               stats.otherClients > 0
-                ? `另有 ${formatInt(stats.otherClients)} 分由其他客户端领到（平台今日共发出 ${formatInt(stats.todayNewPacks)} 分）`
+                ? `此前已由其他途径到账 ${formatInt(stats.otherClients)} 分，来源未记录（今日到账合计 ${formatInt(stats.creditedTotal)} 分）`
                 : stats.todayPending > 0
                   ? `${stats.todayClaimed} 个账号已领 · ${stats.todayPending} 待补领`
                   : `${stats.todayClaimed} 个账号已领 · 明细见下方`

@@ -69,6 +69,22 @@ impl Database {
     }
 
     fn get_db_path() -> Result<PathBuf, AppError> {
+        // QUOLY_DATA_DIR 允许把整个数据目录指到别处 —— 沙箱验证用。
+        //
+        // 为什么需要：这个程序是本机 API 网关，用户的多个程序（视频号引擎、
+        // 知客、各类脚本）都在调它的端口。改代码后如果在生产实例上直接试，
+        // 一旦出问题就是全线中断。有了这个开关，就能用独立数据目录 +
+        // 独立端口起一个完全隔离的实例，真实跑完整流程后再碰生产。
+        //
+        // 例：QUOLY_DATA_DIR=D:\sandbox\data QUOLY_PORT=18899 QuolyAI.exe
+        if let Ok(dir) = std::env::var("QUOLY_DATA_DIR") {
+            let dir = dir.trim();
+            if !dir.is_empty() {
+                let p = PathBuf::from(dir);
+                std::fs::create_dir_all(&p).ok();
+                return Ok(p.join("ai-toolkit.db"));
+            }
+        }
         let config_dir = dirs::home_dir()
             .ok_or_else(|| AppError::Database("Could not find home directory".to_string()))?
             .join(".ai-toolkit");

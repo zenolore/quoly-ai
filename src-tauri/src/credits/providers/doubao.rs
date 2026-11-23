@@ -235,8 +235,24 @@ pub(super) async fn inspect(
                             .and_then(Value::as_str)
                             .unwrap_or("unknown")
                             .to_string(),
-                        seconds_left: item.get("seconds_left").and_then(Value::as_i64),
-                        calls: item.get("calls").and_then(Value::as_u64).unwrap_or(0),
+                        // 网关给的 `seconds_left` 是**秒**，结构体约定的是毫秒
+                        // （界面按毫秒换算"X 天后过期"）。这里换算一次，否则
+                        // 28 天的凭据会被算成 "0 天后过期"。
+                        seconds_left: item
+                            .get("seconds_left")
+                            .and_then(Value::as_i64)
+                            .map(|seconds| seconds.saturating_mul(1000)),
+                        // 调用次数在 `stats.calls` 里，不在第一层。之前读错层级，
+                        // 界面上每个号都显示 0 次。
+                        calls: item
+                            .get("calls")
+                            .and_then(Value::as_u64)
+                            .or_else(|| {
+                                item.get("stats")
+                                    .and_then(|stats| stats.get("calls"))
+                                    .and_then(Value::as_u64)
+                            })
+                            .unwrap_or(0),
                     })
                 })
                 .collect()

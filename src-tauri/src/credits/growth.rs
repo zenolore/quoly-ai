@@ -35,6 +35,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 use super::providers::{ProviderClient, ProviderError};
 use super::types::{Credentials, CreditRegion};
@@ -52,6 +53,9 @@ pub struct GrowthOutcome {
     pub checkin_credits: i64,
     pub checkin_status: String,
     pub travel_claimed: i64,
+    /// 连登档位兑换拿到的积分。之前只记档位名、不记分，导致"今日获得"
+    /// 少算（14d 档一次 50 分），而账上其实到账了。
+    pub streak_credits: i64,
     pub travel_dispatched: bool,
     pub travel_state: String,
     pub tasks_accepted: usize,
@@ -67,7 +71,7 @@ pub struct GrowthOutcome {
 
 impl GrowthOutcome {
     pub fn total_credits(&self) -> i64 {
-        self.checkin_credits + self.travel_claimed + self.task_credits
+        self.checkin_credits + self.travel_claimed + self.task_credits + self.streak_credits
     }
 
     fn step(&mut self, text: impl Into<String>) {
@@ -184,6 +188,69 @@ fn num(v: &Value, key: &str) -> i64 {
 
 fn text(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// 平台把业务失败也包在 HTTP 200 里，`code` 才是真正结果。
+///
+/// 实测（2026-11-14，对已领取任务重复领取）：
+/// `{"code":0,"msg":"OK","data":{"already_claimed":true,"credit":0}}`
+/// 而任务没做完时同样可能是 200 + 非 0 的 code。只看 HTTP 状态会把失败记成
+/// 成功 —— 这正是 accept 接口踩过的坑，claim 接口原本也有同一个毛病。
+fn envelope_error(v: &Value) -> Option<String> {
+    match v.get("code") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) if n.as_i64() == Some(0) => None,
+        Some(Value::String(s)) if s.is_empty() || s == "0" => None,
+        Some(other) => {
+            let msg = text(v, "msg");
+            Some(if msg.is_empty() {
+                format!("code={other}")
+            } else {
+                format!("{msg}（code={other}）")
+            })
+        }
+    }
+}
+
+/// 平台对「本来就不需要接取的任务」的回答 —— 不是失败，不该刷屏。
+///
+/// 实测 first_buddy 永远返回 `task does not require acceptance`，
+/// 而 Library_read / skill_share / 关注公众号 都以它为前置。
+fn is_benign_accept_answer(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("does not require acceptance")
+        || lower.contains("already accepted")
+        || reason.contains("无需接取")
+}
+
+/// 一次领取请求到底发生了什么。
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimResult {
+    /// 平台确认到账，附带真实发放的积分（以平台返回值准，不信任务标称值）。
+    Granted(i64),
+    /// 之前已经领过，本次没有新增积分 —— 不算失败，也不能重复计数。
+    AlreadyClaimed,
+    /// 平台明确拒绝，带原因。
+    Failed(String),
+}
+
+fn parse_claim_response(v: &Value) -> ClaimResult {
+    if let Some(reason) = envelope_error(v) {
+        return ClaimResult::Failed(reason);
+    }
+    let d = data(v);
+    if d.get("already_claimed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return ClaimResult::AlreadyClaimed;
+    }
+    let granted = num(d, "credit");
+    if granted > 0 {
+        return ClaimResult::Granted(granted);
+    }
+    // code=0 但没给积分：不能记成"领取成功"，否则日志上多一笔、账上没有钱。
+    ClaimResult::Failed("平台未返回积分（credit=0）".to_string())
 }
 
 pub(super) async fn snapshot(
@@ -446,16 +513,33 @@ async fn claim_task_rewards(client: &ProviderClient, c: &Credentials, out: &mut 
             Some((code, num(t, "reward_credit")))
         })
         .collect();
-    for (code, credit) in done {
+    for (code, advertised) in done {
         let path = format!("{GROWTH}/tasks/{code}/claim");
-        match call(client, c, "POST", &path, Some(json!({}))).await {
-            Ok(_) => {
+        let resp = match call(client, c, "POST", &path, Some(json!({}))).await {
+            Ok(v) => v,
+            Err(e) => {
+                out.step(format!("任务：领取「{code}」失败（HTTP {}）", e.status));
+                continue;
+            }
+        };
+        // 2026-11-14 修：原代码 `Ok(_) => claimed += 1; credits += 任务标称奖励`
+        // 只要 HTTP 200 就记成功。但领取接口和 accept 一样，失败也回 200，
+        // 真实结果在 body 的 code / data.already_claimed / data.credit 里。
+        // 结果就是：一个任务都没领到，日志却写着"领取 100 积分"。
+        // 现在只认平台给的 credit，标称值只用来提示。
+        match parse_claim_response(&resp) {
+            ClaimResult::Granted(credit) => {
                 out.tasks_claimed += 1;
                 out.task_credits += credit;
                 out.step(format!("任务：领取「{code}」{credit} 积分"));
             }
-            Err(e) if e.status == 403 => {}
-            Err(_) => {}
+            // 已经领过：静默跳过，避免刷屏（一个号每次会有好几条）。
+            ClaimResult::AlreadyClaimed => {}
+            ClaimResult::Failed(reason) => {
+                out.step(format!(
+                    "任务：领取「{code}」失败（{reason}，标称 {advertised} 积分）"
+                ));
+            }
         }
     }
 }
@@ -494,8 +578,10 @@ async fn accept_tasks(client: &ProviderClient, c: &Credentials, out: &mut Growth
     let mut ordered = codes.clone();
     ordered.sort_by_key(|code| if code == "first_buddy" { 0 } else { 1 });
 
-    let mut accepted = Vec::new();
-    let mut blocked: Vec<(String, String)> = Vec::new();
+    // 每个 task_code 平台的逐条判定： (是否号称接上, 原因)
+    let mut said: HashMap<String, (bool, String)> = HashMap::new();
+    // 平台明说"不需要接取"的（如 first_buddy）：既不成功也不失败，不再报。
+    let mut benign: HashSet<String> = HashSet::new();
     for pass in 0..2 {
         if ordered.is_empty() {
             break;
@@ -504,9 +590,15 @@ async fn accept_tasks(client: &ProviderClient, c: &Credentials, out: &mut Growth
         let mut retry: Vec<String> = Vec::new();
         for chunk in ordered.chunks(20) {
             let body = json!({ "task_codes": chunk });
-            let Ok(resp) = call(client, c, "POST", &format!("{GROWTH}/tasks/accept"), Some(body)).await
-            else {
-                continue;
+            let resp = match call(client, c, "POST", &format!("{GROWTH}/tasks/accept"), Some(body)).await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    for code in chunk {
+                        said.insert(code.clone(), (false, format!("HTTP {}", e.status)));
+                    }
+                    continue;
+                }
             };
             // 逐个看 results，不能只看 HTTP 状态。
             //
@@ -517,41 +609,107 @@ async fn accept_tasks(client: &ProviderClient, c: &Credentials, out: &mut Growth
             // 原逻辑只看 is_ok()，于是把"全失败"记成"接取 N 个新任务"，
             // 日志看起来一切正常，实际一个都没接上 —— 这是任务积分长期为 0 的
             // 第三个原因，也是最难查的一个。
+            //
+            // 2026-11-14 再修两处：
+            //   * results 缺失时不再假定"整批成功"。实测就是这条推断造出了
+            //     "接取 18 个新任务"的假日志 —— 那批请求平台没给 results，
+            //     复查发现只接上了 1 个。现在改成全部复查后再记账。
+            //   * first_buddy 返回 "task does not require acceptance"：它本来
+            //     就不用接，不该记成失败刷屏。
+            if let Some(reason) = envelope_error(&resp) {
+                for code in chunk {
+                    said.insert(code.clone(), (false, reason.clone()));
+                }
+                continue;
+            }
             let results = data(&resp)
                 .get("results")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             if results.is_empty() {
-                // 老版本接口可能直接返回成功，没有 results 字段；按整批成功处理
-                accepted.extend(chunk.iter().cloned());
+                // 平台没给逐条结论：不猜，留空。下面的复查会给出真相。
                 continue;
             }
             for item in results {
                 let code = text(&item, "task_code");
                 let status = text(&item, "status");
+                let reason = text(&item, "message");
                 if matches!(status.as_str(), "ok" | "success" | "accepted" | "already_accepted") {
-                    accepted.push(code);
-                } else {
+                    said.insert(code, (true, String::new()));
+                } else if is_benign_accept_answer(&reason) {
+                    // 不需要接取的任务：既不算成功也不算失败，静默跳过。
+                    benign.insert(code);
+                } else if pass == 0 && reason.contains("prerequisite") {
                     // 前置依赖类的失败值得再试一轮（依赖的任务刚被接上）
-                    let reason = text(&item, "message");
-                    if pass == 0 && reason.contains("prerequisite") {
-                        retry.push(code);
-                    } else {
-                        blocked.push((code, reason));
-                    }
+                    retry.push(code);
+                } else {
+                    said.insert(code, (false, reason));
                 }
             }
         }
         ordered = retry;
     }
 
-    out.tasks_accepted += accepted.len();
-    if !accepted.is_empty() {
-        out.step(format!("任务：接取 {} 个新任务", accepted.len()));
+    // 复查：以平台重新返回的状态为准。
+    //
+    // 请求返回的 status 只代表"平台收到了"，accept_status 才代表"平台记上了"。
+    // 两者不一致的情况真实存在，所以最终记账只看复查结果。
+    let confirmed = match call(client, c, "GET", &format!("{GROWTH}/tasks"), None).await {
+        Ok(v) => data(&v)
+            .get("tasks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    let mut accepted = 0usize;
+    let mut blocked: Vec<(String, String)> = Vec::new();
+    for code in &codes {
+        if benign.contains(code) {
+            continue;
+        }
+        let now = confirmed
+            .iter()
+            .find(|t| text(t, "task_code") == *code)
+            .map(|t| text(t, "accept_status"))
+            .unwrap_or_default();
+        match now.as_str() {
+            "accepted" | "claimed" => accepted += 1,
+            _ => {
+                let reason = said
+                    .get(code)
+                    .map(|(_, r)| r.clone())
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| {
+                        if confirmed.is_empty() {
+                            "复查失败，无法确认".to_string()
+                        } else {
+                            "平台未记录该接取".to_string()
+                        }
+                    });
+                if !is_benign_accept_answer(&reason) {
+                    blocked.push((code.clone(), reason));
+                }
+            }
+        }
     }
-    for (code, reason) in blocked {
-        out.step(format!("任务：{code} 无法接取（{reason}）"));
+
+    out.tasks_accepted += accepted;
+    if accepted > 0 {
+        out.step(format!("任务：接取 {accepted} 个新任务"));
+    }
+    // 只报真正被拒的，且同一原因合并成一条，避免 50 个号刷出几百行。
+    let mut by_reason: Vec<(String, usize)> = Vec::new();
+    for (_, reason) in &blocked {
+        match by_reason.iter_mut().find(|(r, _)| r == reason) {
+            Some((_, n)) => *n += 1,
+            None => by_reason.push((reason.clone(), 1)),
+        }
+    }
+    for (reason, n) in by_reason {
+        out.step(format!("任务：{n} 个接不上（{reason}）"));
     }
 }
 
@@ -642,12 +800,26 @@ async fn redeem_streak(client: &ProviderClient, c: &Credentials, out: &mut Growt
             continue;
         }
         let body = json!({"tier": label, "client_token": token("u")});
-        if call(client, c, "POST", &format!("{GROWTH}/redeem"), Some(body))
-            .await
-            .is_ok()
-        {
-            out.streak_tiers.push(label.clone());
-            out.step(format!("连登：兑换 {label} 档"));
+        match call(client, c, "POST", &format!("{GROWTH}/redeem"), Some(body)).await {
+            Ok(resp) => {
+                // 和 claim 一样，2xx 不代表真到账：信封里的 code 才是结论。
+                if let Some(reason) = envelope_error(&resp) {
+                    out.step(format!("连登：兑换 {label} 档失败（{reason}）"));
+                    continue;
+                }
+                let got = num(data(&resp), "credit")
+                    .max(num(data(&resp), "reward_credit"))
+                    .max(num(data(&resp), "amount"));
+                out.streak_credits += got;
+                out.streak_tiers.push(label.clone());
+                if got > 0 {
+                    out.step(format!("连登：兑换 {label} 档，+{got} 积分"));
+                } else {
+                    // 平台没回积分字段时只说兑换成功，不编数字。
+                    out.step(format!("连登：兑换 {label} 档"));
+                }
+            }
+            Err(e) => out.step(format!("连登：兑换 {label} 档失败（HTTP {}）", e.status)),
         }
     }
 }
@@ -903,5 +1075,70 @@ mod tests {
             !task_claimable(&misleading),
             "button_text=已完成 但进度 0/1，不该判为可领"
         );
+    }
+
+    /// 领取结果必须按平台返回的 credit 记账，不能按任务标称奖励。
+    ///
+    /// 实测响应（2026-11-14，重复领取已领任务）：
+    ///   {"code":0,"msg":"OK","data":{"already_claimed":true,"credit":0,"energy":0}}
+    /// 原代码只要 HTTP 200 就 `claimed += 1; credits += 任务标称值`，
+    /// 于是"一个都没领到"被记成"领取 100 积分"。
+    #[test]
+    fn already_claimed_is_not_counted_as_new_credit() {
+        let resp = json!({
+            "code": 0,
+            "msg": "OK",
+            "data": { "already_claimed": true, "credit": 0, "energy": 0 }
+        });
+        assert_eq!(parse_claim_response(&resp), ClaimResult::AlreadyClaimed);
+    }
+
+    #[test]
+    fn granted_credit_comes_from_the_response_not_the_task() {
+        let resp = json!({ "code": 0, "msg": "OK", "data": { "credit": 100, "energy": 8 } });
+        assert_eq!(parse_claim_response(&resp), ClaimResult::Granted(100));
+
+        // 平台给的比标称少（活动打折），也要按平台给的记。
+        let resp = json!({ "code": 0, "msg": "OK", "data": { "credit": 30 } });
+        assert_eq!(parse_claim_response(&resp), ClaimResult::Granted(30));
+    }
+
+    /// HTTP 200 + 非 0 code 必须当失败，不能静默算成功。
+    #[test]
+    fn business_error_inside_http_200_is_a_failure() {
+        let resp = json!({ "code": 400, "msg": "task not completed", "data": {} });
+        match parse_claim_response(&resp) {
+            ClaimResult::Failed(reason) => assert!(reason.contains("task not completed")),
+            other => panic!("应判为失败，实际 {other:?}"),
+        }
+    }
+
+    /// code=0 但补发 0 积分（既不是已领、也没报错）同样不能记成功。
+    #[test]
+    fn zero_credit_without_already_claimed_is_a_failure() {
+        let resp = json!({ "code": 0, "msg": "OK", "data": { "credit": 0 } });
+        assert!(matches!(parse_claim_response(&resp), ClaimResult::Failed(_)));
+    }
+
+    /// 没有 code 字段的旧响应按成功处理，不能因为缺字段就判失败。
+    #[test]
+    fn missing_envelope_code_is_treated_as_success() {
+        assert!(envelope_error(&json!({ "data": { "credit": 50 } })).is_none());
+        assert!(envelope_error(&json!({ "code": "0", "data": {} })).is_none());
+        assert!(envelope_error(&json!({ "code": 1001, "msg": "限流" })).is_some());
+    }
+
+    /// first_buddy 会说「不需要接取」，这是正常回答，不能当失败刷屏。
+    ///
+    /// 实测（2026-11-14，新号 07b3480e）：
+    ///   {"task_code":"first_buddy","status":"error",
+    ///    "message":"task does not require acceptance"}
+    /// 而 Library_read / 关注公众号 / skill_share 全部以它为前置，
+    /// 于是每轮都会刷 3 条 "prerequisite not met: first_buddy"。
+    #[test]
+    fn acceptance_that_is_not_required_is_benign() {
+        assert!(is_benign_accept_answer("task does not require acceptance"));
+        assert!(!is_benign_accept_answer("prerequisite not met: first_buddy"));
+        assert!(!is_benign_accept_answer(""));
     }
 }

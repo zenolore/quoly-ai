@@ -75,9 +75,43 @@ pub async fn credits_import_local(
     account
 }
 
+/// 主界面的全量看板。
+///
+/// **必须是 `async`**（2026-11-18 性能分析）：同步的 `#[tauri::command]`
+/// 跑在 Tauri 主线程上，实测这个函数要 70ms（读 158 份快照 + 序列化
+/// 2.42MB），期间窗口消息泵停摆 —— 拖拽、点击、重绘全部排队。
+/// 这正是"悬浮窗第一次拖不动"的根因之一。改成 async 后它会派到
+/// tokio 线程池，主线程不再被阻塞。
 #[tauri::command]
-pub fn credits_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
+pub async fn credits_dashboard(state: State<'_, AppState>) -> Result<Dashboard, String> {
     state.credits.dashboard()
+}
+
+/// 悬浮窗专用的轻量统计：**只返回 4 个数字 + 代理状态**，不到 1KB。
+///
+/// 为什么需要这个（2026-11-18 性能分析）：
+///
+/// 悬浮窗原先走 `credits_dashboard` —— 那是给主界面用的全量接口，
+/// 每次返回 **2.42 MB**（158 个账号 × 15.7KB 快照 + 奖励 + 请求记录）。
+/// 但悬浮窗只显示「今日请求 / 消耗积分 / 今日已领 / Token」四个数，
+/// 其余 99.96% 的数据传过去就被丢掉。
+///
+/// 代价是实打实的：每个账号刷新完成都会触发一次 dashboard 重拉，
+/// 实测间隔中位数 **211ms**。而 `credits_dashboard` 是同步命令，
+/// 70ms 的处理期间 Tauri 主线程消息泵停摆 —— 用户按下鼠标拖不动窗口，
+/// 就是这么来的（第一次 pointerdown 被堵在队列里，等处理完手指已经抬了）。
+///
+/// 换成这个接口后，悬浮窗的数据量从 2.42MB 降到不到 1KB，
+/// 主线程再也不会被它拖住。
+#[tauri::command]
+pub fn credits_float_stats(state: State<'_, AppState>) -> Result<FloatStats, String> {
+    state.credits.float_stats()
+}
+
+/// 重新从磁盘加载凭据（外部脚本注入新号后调用，避免"账号凭据不存在"）。
+#[tauri::command]
+pub fn credits_reload_credentials(state: State<'_, AppState>) -> Result<usize, String> {
+    state.credits.reload_credentials()
 }
 
 #[tauri::command]

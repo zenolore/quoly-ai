@@ -127,7 +127,15 @@ impl CreditStore {
 
     pub fn accounts(&self) -> Result<Vec<Account>, String> {
         let conn = self.conn.lock();
-        let mut query = conn.prepare("SELECT a.metadata,s.snapshot FROM credit_accounts a LEFT JOIN credit_snapshots s ON s.account_id=a.id ORDER BY a.platform,a.region,a.user_id").map_err(db_error)?;
+        // 固定排序规则（用户要求，始终不变）：
+        //   1) 全部按 metadata.createdAt 倒序 —— 最新加入的账号永远排最前面
+        //   2) 无 createdAt 的历史账号（理论不该有）放最后，用 id 保证结果稳定
+        //   3) 同时间戳时按 platform/id 兜底，避免每次刷新顺序抖动
+        let mut query = conn.prepare(
+            "SELECT a.metadata,s.snapshot FROM credit_accounts a \
+             LEFT JOIN credit_snapshots s ON s.account_id=a.id \
+             ORDER BY COALESCE(json_extract(a.metadata,'$.createdAt'),0) DESC, \
+                      a.platform, a.id").map_err(db_error)?;
         let rows = query
             .query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
@@ -143,6 +151,8 @@ impl CreditStore {
                 .map_err(json_error)?;
             accounts.push(account);
         }
+        // SQL 已排好序，这里不再二次排序：停用/封禁的账号也按加入时间留在原位，
+        // 只在界面上标红提示，避免它们因为"沉底"而被误以为不存在。
         Ok(accounts)
     }
 
@@ -156,9 +166,38 @@ impl CreditStore {
     pub fn save_account(&self, account: &Account) -> Result<(), String> {
         let mut meta = account.clone();
         meta.snapshot = None;
-        let metadata = serde_json::to_string(&meta).map_err(json_error)?;
+        let mut metadata = serde_json::to_string(&meta).map_err(json_error)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(db_error)?;
+        // createdAt 决定客户端列表顺序（最新在最前）。
+        //   - 已存在的账号：保留原值，否则每次保存都会把它顶到列表最前面
+        //   - 新账号：取"当前时间"与"库内最大 createdAt + 1ms"的较大者，
+        //     保证后加入的号一定比先加入的晚，即使同一秒内连续添加也不会并列
+        let existing: Option<String> = tx
+            .query_row("SELECT metadata FROM credit_accounts WHERE id=?1", [&account.id],
+                       |r| r.get(0))
+            .ok();
+        let keep: Option<i64> = existing
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| v.get("createdAt").and_then(|x| x.as_i64()));
+        let created_at = match keep {
+            Some(value) => value,
+            None => {
+                let max_existing: i64 = tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(CAST(json_extract(metadata,'$.createdAt') AS INTEGER)),0) \
+                         FROM credit_accounts", [], |r| r.get(0))
+                    .unwrap_or(0);
+                crate::credits::types::now_ms().max(max_existing + 1)
+            }
+        };
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&metadata) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("createdAt".into(), serde_json::json!(created_at));
+                metadata = serde_json::to_string(&value).map_err(json_error)?;
+            }
+        }
         tx.execute("INSERT INTO credit_accounts(id,platform,region,user_id,metadata) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata WHERE credit_accounts.platform=excluded.platform AND credit_accounts.region=excluded.region AND credit_accounts.user_id=excluded.user_id", params![account.id, account.platform.key(), account.region.key(), account.user_id, metadata]).map_err(db_error)?;
         if tx.changes() != 1 { return Err("不能更改已保存账号的身份或区域".into()); }
         if let Some(snapshot) = &account.snapshot {

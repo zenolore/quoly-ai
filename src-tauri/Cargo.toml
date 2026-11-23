@@ -1,10 +1,12 @@
 [package]
-name = "AiToolkit"
-version = "2.3.0"
-description = "Universal MCP Server & Skills Manager for AI CLI Tools"
+name = "QuolyAI"
+version = "2.4.0"
+description = "Quoly AI — AI 账号与积分统一管理"
 authors = ["you"]
 edition = "2021"
 
+# crate 名保持 ai_toolkit_lib 不变：main.rs 里有 `ai_toolkit_lib::run()` 引用，
+# 改名会牵动所有内部 use 路径，收益为零、风险不小。
 [lib]
 name = "ai_toolkit_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -31,7 +33,7 @@ serde_json = "1"
 json5 = "0.4"
 serde_yaml = "0.9"
 toml = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 indexmap = { version = "2", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "1"

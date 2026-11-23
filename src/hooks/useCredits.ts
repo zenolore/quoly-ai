@@ -5,8 +5,30 @@ import { toast } from "sonner";
 import { creditsApi } from "@/lib/api/credits";
 
 export const creditsQueryKey = ["credits", "dashboard"] as const;
+export const floatStatsQueryKey = ["credits", "floatStats"] as const;
 export const usageDailyQueryKey = (days: number) =>
   ["credits", "usageDaily", days] as const;
+
+/**
+ * 悬浮窗专用：只取 4 个数字。
+ *
+ * 不要改回 `useCreditsDashboard` —— 那个接口每次返 2.42MB（158 个账号的
+ * 完整快照），而悬浮窗只用得到 4 个数字。更麻烦的是它是同步命令，
+ * 70ms 占着 Tauri 主线程，期间悬浮窗拖不动（第一次 pointerdown 被堵住）。
+ *
+ * 这里刻意 **不订阅** `credits-updated` 事件：那个事件在账号刷新时高频触发
+ * （实测间隔中位数 211ms），悬浮窗跟着刷毫无意义 —— 它显示的是日累计数字，
+ * 秒级变化肉眼看不出来。用 3 秒轮询足够，且不会和主界面抢主线程。
+ */
+export function useFloatStats() {
+  return useQuery({
+    queryKey: floatStatsQueryKey,
+    queryFn: creditsApi.floatStats,
+    staleTime: 2_000,
+    refetchInterval: 3_000,
+    refetchOnWindowFocus: false,
+  });
+}
 
 export function useCreditsRuntime(panelActive: boolean) {
   const queryClient = useQueryClient();

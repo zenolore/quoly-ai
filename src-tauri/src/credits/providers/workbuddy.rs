@@ -192,12 +192,30 @@ async fn packs(client: &ProviderClient, c: &Credentials) -> Result<Vec<CreditPac
             .as_array()
             .ok_or_else(|| ProviderError::new(502, "WorkBuddy 积分资源包缺失"))?;
         for (i, p) in rows.iter().enumerate() {
+            // 当前可用额度以 **CycleCapacityRemain** 为准。
+            //
+            // 2026-11-20 实测纠正了 11-18 的误判：
+            // 「CodeBuddy个人体验版」的 CapacityRemain=500 不是可花余额，
+            // 而是资源包总容量；CycleCapacityRemain=0 才表示本周期已耗尽。
+            // 两者取 max 会让每个已用完的体验包虚增 500 分。直连该账号请求
+            // 推理接口返回 14018「额度已用尽」，而汇总接口 TotalCredits=0，
+            // 证明 max 的 500 是假余额。
+            //
+            // 有周期剩余字段时只认周期剩余；仅旧响应完全缺该字段时，
+            // 才回退 CapacityRemain。
+            let cycle_remain = num(p, &["CycleCapacityRemain"]).filter(|n| n.is_finite());
+            let total_remain = num(p, &["CapacityRemain"]).filter(|n| n.is_finite());
+            let remaining = match (cycle_remain, total_remain) {
+                (Some(a), _) => Some(a.max(0.0)),
+                (None, Some(b)) => Some(b.max(0.0)),
+                (None, None) => None,
+            };
             out.push(CreditPack {
                 id: text(p, &["AccountId", "PackageId", "ResourceId"])
                     .unwrap_or(format!("{page}-{i}")),
                 name: text(p, &["PackageName"]).unwrap_or("积分包".into()),
                 unit: "credits".into(),
-                remaining: num(p, &["CycleCapacityRemain", "CapacityRemain"]).map(|n| n.max(0.0)),
+                remaining,
                 expires_at: p
                     .get("CycleEndTime")
                     .or_else(|| p.get("PackageEndTime"))
@@ -814,6 +832,13 @@ pub(super) async fn claim(
     let rs = rewards(client, c).await?;
     let r = &rs[0];
     if r.status != "claimable" {
+        // already_claimed 也要带上金额。
+        //
+        // 2026-11-14 查"为什么今天只领到 1000 分"时发现的：WorkBuddy 在账号
+        // 当天首次被访问时就把签到记上了（快照里 today_checked_in=true、
+        // today_credit=100、checkin_dates 含今天），我们再提交 claim 只会
+        // 得到"当前没有可领取的签到积分"。分确实到账了，是平台先发、我们
+        // 后到。原来这里写 None，明细里就显示 0 分，看起来像白跑一趟。
         return Ok(vec![outcome(
             a,
             r,
@@ -822,8 +847,12 @@ pub(super) async fn claim(
             } else {
                 "unavailable"
             },
-            "当前没有可领取的签到积分",
-            None,
+            if r.status == "claimed" {
+                "平台今日已发放（本程序无需再领）"
+            } else {
+                "当前没有可领取的签到积分"
+            },
+            (r.status == "claimed").then_some(r.amount).flatten(),
         )]);
     }
     let submitted = client
@@ -953,6 +982,36 @@ pub(super) async fn chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 周期剩余是当前可花额度；CapacityRemain=500 只是体验包总容量。
+    /// 直连实测该状态返回 14018「额度已用尽」，不能再虚增 500 分。
+    #[test]
+    fn 周期用尽时不能把体验包总容量记成可用余额() {
+        let p = serde_json::json!({
+            "CycleCapacityRemain": 0,
+            "CapacityRemain": 500,
+            "PackageName": "CodeBuddy个人体验版",
+        });
+        let cycle_remain = num(&p, &["CycleCapacityRemain"]).filter(|n| n.is_finite());
+        let total_remain = num(&p, &["CapacityRemain"]).filter(|n| n.is_finite());
+        let remaining = match (cycle_remain, total_remain) {
+            (Some(a), _) => Some(a.max(0.0)),
+            (None, Some(b)) => Some(b.max(0.0)),
+            (None, None) => None,
+        };
+        assert_eq!(remaining, Some(0.0), "周期已用尽时可用额度必须为 0");
+
+        // 旧响应完全没有周期字段时仍兼容总量字段。
+        let legacy = serde_json::json!({"CapacityRemain": 120});
+        let cycle_remain = num(&legacy, &["CycleCapacityRemain"]).filter(|n| n.is_finite());
+        let total_remain = num(&legacy, &["CapacityRemain"]).filter(|n| n.is_finite());
+        let remaining = match (cycle_remain, total_remain) {
+            (Some(a), _) => Some(a.max(0.0)),
+            (None, Some(b)) => Some(b.max(0.0)),
+            (None, None) => None,
+        };
+        assert_eq!(remaining, Some(120.0));
+    }
     #[tokio::test]
     #[ignore = "requires explicitly selected saved international account; read-only"]
     async fn international_saved_account_read_only_smoke() {

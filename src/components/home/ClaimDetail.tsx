@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, CircleSlash, Clock, CheckCircle2, MinusCircle } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, CircleSlash, Clock, CheckCircle2, MinusCircle, Server } from "lucide-react";
 import type { ClaimAccountRow, PlatformClaims } from "@/lib/api/credits";
 
 /**
@@ -49,6 +49,13 @@ const statusMeta: Record<string, { label: string; text: string; bg: string }> = 
     text: "text-slate-400 dark:text-slate-500",
     bg: "bg-slate-300",
   },
+  // 转发型平台（豆包）网关内部的号：签到由网关自己的调度器跑，
+  // 这里只做展示，不参与"领到/没领到"的统计。
+  managed: {
+    label: "网关维护",
+    text: "text-violet-600 dark:text-violet-400",
+    bg: "bg-violet-400",
+  },
 };
 
 const statusIcon = (status: string) => {
@@ -63,6 +70,8 @@ const statusIcon = (status: string) => {
       return <CircleSlash size={12} className="text-slate-400" />;
     case "failed":
       return <AlertTriangle size={12} className="text-rose-600 dark:text-rose-400" />;
+    case "managed":
+      return <Server size={12} className="text-violet-600 dark:text-violet-400" />;
     default:
       return <MinusCircle size={12} className="text-slate-300 dark:text-slate-600" />;
   }
@@ -104,7 +113,14 @@ function PlatformBlock({ data }: { data: PlatformClaims }) {
           {pct(data.successRate)}
         </span>
         <span className="text-[11px] text-slate-500 dark:text-slate-400">
-          {data.claimed}/{data.accounts} 个账号领到 · 共 {Math.round(data.credits)} 分
+          {/* 转发型平台（豆包）没有"领取"这个动作：一个 Quoly AI 账号其实
+              是一个本地网关，网关里养着好几个号，签到由网关自己跑。这里
+              只把那几个号列出来，别拿它去比成功率。 */}
+          {data.gateway
+            ? <>{data.rows.length} 个号 · 签到由网关自己跑，不在这里领</>
+            : data.credited > data.credits + 0.5
+              ? <>{data.claimed}/{data.accounts} 个账号 · 本程序新领 {Math.round(data.credits)} 分 · 平台确认到账 {Math.round(data.credited)} 分（含此前其他途径）</>
+              : <>{data.claimed}/{data.accounts} 个账号领到 · 共 {Math.round(data.credits)} 分</>}
         </span>
         <span className="ml-auto flex items-center gap-1.5">
           {segments.map((s) => (
@@ -164,9 +180,12 @@ export function ClaimDetail({ claims }: { claims?: PlatformClaims[] }) {
     );
   }
 
-  const totalAccounts = claims.reduce((sum, p) => sum + p.accounts, 0);
-  const totalClaimed = claims.reduce((sum, p) => sum + p.claimed, 0);
-  const totalCredits = claims.reduce((sum, p) => sum + p.credits, 0);
+  // 网关型平台不进合计：它的"账号"是一个网关，不是可领取账号，算进
+  // 「共 N 个账号」和「合计 X 分」只会让两个总数对不上明细。
+  const counted = claims.filter((p) => !p.gateway);
+  const totalAccounts = counted.reduce((sum, p) => sum + p.accounts, 0);
+  const totalClaimed = counted.reduce((sum, p) => sum + p.claimed, 0);
+  const totalCredits = counted.reduce((sum, p) => sum + p.credits, 0);
 
   return (
     <div className="mt-2 space-y-1.5">

@@ -3,8 +3,8 @@
 version = 4
 
 [[package]]
-name = "AiToolkit"
-version = "2.3.0"
+name = "QuolyAI"
+version = "2.4.0"
 dependencies = [
  "aes",
  "anyhow",

@@ -94,6 +94,7 @@ async fn campaign_json(request: RequestBuilder) -> Result<Value, ProviderError> 
         "RISK_DEPENDENCY_UNAVAILABLE" => "Qoder 设备校验服务暂不可用，请稍后重试",
         "CAMPAIGN_NOT_ACTIVE" => "Qoder 活动已结束或尚未开始",
         "CAMPAIGN_NOT_FOUND" => "Qoder 活动不存在，请刷新领取资格",
+        "AUDIENCE_NOT_ELIGIBLE" => "Qoder 确认当前账号不符合本轮活动资格，积分未发放",
         "GRANT_RESULT_UNKNOWN" => "Qoder 积分发放结果待确认",
         _ => "Qoder 活动请求被拒绝",
     };
@@ -101,7 +102,7 @@ async fn campaign_json(request: RequestBuilder) -> Result<Value, ProviderError> 
     // A device rejection is not an expired OAuth token.
     if matches!(
         code.as_str(),
-        "RISK_BLOCKED" | "RISK_DEPENDENCY_UNAVAILABLE"
+        "RISK_BLOCKED" | "RISK_DEPENDENCY_UNAVAILABLE" | "AUDIENCE_NOT_ELIGIBLE"
     ) {
         error.rejected = false;
     }
@@ -550,6 +551,10 @@ async fn claim_at(
 ) -> Result<Vec<RewardOutcome>, ProviderError> {
     let rs = rewards_at(client, c, api).await?;
     let mut out = vec![];
+    // 必须在 `for r in rs` 之前算好：那个循环会按值消费 rs。
+    let has_ineligible = rs
+        .iter()
+        .any(|r| r.kind == "credits" && r.status == "unavailable");
     let proof = if rs
         .iter()
         .any(|r| r.status == "claimable" && r.kind == "credits")
@@ -619,7 +624,7 @@ async fn claim_at(
                     if result.status != "claimed" {
                         if let Err(error) = &submitted {
                             result.message = format!("{}；{}", error.message, result.message);
-                            if matches!(error.status, 400 | 403 | 404 | 410) {
+                            if matches!(error.status, 400 | 403 | 404 | 409 | 410) {
                                 result.status = "failed".into();
                             }
                         }
@@ -637,14 +642,17 @@ async fn claim_at(
             status: "unavailable".into(),
             amount: None,
             kind: "credits".into(),
-            message: "当前账号暂无已明确可领取的积分活动".into(),
+            message: if has_ineligible {
+                "活动列表未提供可领积分；账号可能不符合本轮活动资格，未重复提交领取".into()
+            } else {
+                "当前账号暂无已明确可领取的积分活动".into()
+            },
             created_at: now_ms(),
         });
     }
     Ok(out)
 }
-fn credits_confirmed(v: &Value) -> bool {
-    text(v, &["status"]).as_deref() == Some("CLAIMED")
+fn credits_confirmed(v: &Value) -> bool {    text(v, &["status"]).as_deref() == Some("CLAIMED")
         // The submitted ID already comes from a CREDITS campaign. Official
         // responses may only return the grant status, without repeating benefit.
         && text(&v["benefit"], &["kind"]).is_none_or(|kind| kind == "CREDITS")
@@ -1265,9 +1273,28 @@ mod tests {
         assert!(results[0].message.contains("RISK_BLOCKED"));
     }
     #[tokio::test]
+    async fn audience_rejection_is_explicit_and_does_not_expire_the_token() {
+        let results = claim_fixture(vec![
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+            ("POST", CLAIM, 409, json!({"errorCode": "AUDIENCE_NOT_ELIGIBLE"})),
+            (
+                "GET",
+                REWARD,
+                404,
+                json!({"errorCode": "CAMPAIGN_NOT_FOUND"}),
+            ),
+            ("GET", LIST, 200, daily_campaign("CLAIMABLE")),
+        ])
+        .await;
+        assert_eq!(results[0].status, "failed");
+        assert!(results[0].message.contains("不符合本轮活动资格"));
+        assert!(results[0].message.contains("AUDIENCE_NOT_ELIGIBLE"));
+    }
+    #[tokio::test]
     async fn an_unavailable_campaign_is_not_submitted() {
         let results = claim_fixture(vec![("GET", LIST, 200, daily_campaign("INELIGIBLE"))]).await;
         assert_eq!(results[0].status, "unavailable");
+        assert!(results[0].message.contains("不符合本轮活动资格"));
     }
     #[test]
     fn explicit_non_credit_grant_is_not_counted_as_credits() {

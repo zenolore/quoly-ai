@@ -285,10 +285,9 @@ fn checkin_device_candidates(c: &Credentials) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     // 先试「按 uid 派生的专属设备号」。
     //
-    // 这是「一设备只能签一个号」的真正解法：TRAE 只在登录时把设备号注册到
-    // 服务器上，而登录流程用的就是 `trae_account_device_id(uid)` 派生的那个
-    // 值。所以凡是走过本程序登录的账号，派生号在服务器上**是已注册**的，
-    // 可以直接拿来签到。
+    // 状态预检使用 `trae_device::derive(uid)` 的 15 位号及配套三元组；
+    // 正式领取也必须使用同一身份，不能换成 OAuth 登录链的另一套 16 位号。
+    // 服务端仍以领取响应和账号级 checked_in 回查为最终依据。
     //
     // 之前只试「凭据里带的 deviceId」和「本机 storage.json 里的 deviceId」，
     // 那两个在有多个账号时是同一台机器的公共号：前者是卖家那台机器注册的、
@@ -303,7 +302,10 @@ fn checkin_device_candidates(c: &Credentials) -> Vec<String> {
         .map(str::trim)
         .filter(|uid| !uid.is_empty())
     {
-        let derived = super::oauth::trae_account_device_id(uid);
+        // 与状态预检、设备三元组使用同一个 15 位派生号。
+        // 此前这里使用 OAuth 登录的另一套 16 位号，导致预检和正式领取
+        // 对上游呈现为不同设备；AI Work 的领取链使用这套 15 位号。
+        let derived = super::trae_device::derive(uid).device_id;
         if is_plausible_device_id(&derived) && !out.contains(&derived) {
             out.push(derived);
         }
@@ -315,7 +317,7 @@ fn checkin_device_candidates(c: &Credentials) -> Vec<String> {
     // 一旦那台设备被别的号占用，本机账号反而签不上（服务端按设备计名额）。
     // 所以真实设备号只在「它就是这号自己的」时才排前面：由
     // `owns_local_device` 判断。
-    if owns_local_device(c) {
+    if owns_local_device(c) || signed_in_on_local_client(c) {
         for id in registered_device_ids(c) {
             if !out.iter().any(|x| x == &id) {
                 out.push(id);
@@ -337,8 +339,52 @@ fn checkin_device_candidates(c: &Credentials) -> Vec<String> {
     out
 }
 
-/// 本机客户端注册的那个账号，凭据里带着同一台设备的痕迹吗？
+/// 这个账号是否**在本机 TRAE 客户端真正登录过**（登录会把本机设备号注册到服务端）。
 ///
+/// 判据：本机客户端的 `state.vscdb` 里存在以该 uid 开头的会话键。客户端登录后
+/// 会写入大量 `<uid>:AI.agent.*` / `<uid>:chat.*` 记录，这是最可靠的本地痕迹。
+///
+/// 为什么需要它：`owns_local_device` 只看凭据里的 `credentialSource`，而账号
+/// 若是从卖家那份凭据导入的（缺这个字段），即使你在本机客户端重新登录过，
+/// 也判不出来，于是签到仍拿卖家的公共设备号 → 一律 9074 / 名额被占。
+/// 实测 2026-11-18：卢传俊在本机客户端登录（storage.json 12:28 被改写、
+/// state.vscdb 内 30+ 条 709639048006476 记录），但凭据仍是卖家设备号，
+/// 当天 7 次签到全部失败。
+fn signed_in_on_local_client(c: &Credentials) -> bool {
+    let Some(uid) = c
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
+    else {
+        return false;
+    };
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        for name in ["Trae CN", "TRAE SOLO CN", "Trae", "TRAE CN", "TRAE"] {
+            roots.push(std::path::Path::new(&appdata).join(name));
+        }
+    }
+    let prefix = format!("{uid}:");
+    for root in roots {
+        let db = root.join("User").join("globalStorage").join("state.vscdb");
+        if !db.exists() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&db) else { continue };
+        // 只做字节级包含判断：state.vscdb 是 SQLite，明文里能直接搜到键名，
+        // 不必开库（避免锁文件、也避免依赖 sqlite 依赖）。
+        if raw
+            .windows(prefix.len())
+            .any(|w| w == prefix.as_bytes())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 本机客户端注册的那个账号，凭据里带着同一台设备的痕迹吗？
 /// 判据：`storage.json` 里有 `iCubeAuthInfo://icube-dc:<id>` 这个键，且这个
 /// 账号的 uid 与键无关（键只有设备号），所以退一步用「本机只有一台客户端」
 /// 这个事实：如果只有一个注册设备号，且凭据的 `extra.credentialSource` 是
@@ -397,6 +443,25 @@ pub(super) fn ai_api_base(c: &Credentials) -> String {
         .into()
     })
 }
+/// 取该凭据对应的 TRAE uid：优先 `user_id` 字段，缺失时从 JWT 的 `data.id` 解析。
+///
+/// 为什么不能只用 `user_id`：status/claim 请求会在 `authenticate` 之前发出，
+/// 那时 `user_id` 还是 `None`，但设备三元组已经必须齐备——否则服务端把这些
+/// 请求归入"设备身份不完整"的池子，表现为每日几乎没有可用名额。
+fn trae_uid(c: &Credentials) -> Option<String> {
+    if let Some(uid) = c.user_id.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        return Some(uid.to_string());
+    }
+    let claims = crate::credits::providers::jwt_claims(&c.access_token);
+    claims
+        .get("data")
+        .and_then(|d| d.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 pub(super) fn headers(r: RequestBuilder, c: &Credentials, chat: bool) -> RequestBuilder {
     let mut r = r
         .header("Authorization", format!("Cloud-IDE-JWT {}", c.access_token))
@@ -416,7 +481,15 @@ pub(super) fn headers(r: RequestBuilder, c: &Credentials, chat: bool) -> Request
     let device = if chat {
         c.device_id.clone().unwrap_or_default()
     } else {
-        checkin_device_id(c)
+        // 签到用「由 uid 派生的设备号」，保证每个账号是独立设备。
+        // 优先用调用方指定的（claim 会轮换候选号），否则用派生值。
+        let derived = c
+            .user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(|uid| crate::credits::providers::trae_device::derive(&uid).device_id);
+        derived.unwrap_or_else(|| checkin_device_id(c))
     };
     if !device.is_empty() {
         r = r.header(
@@ -443,7 +516,11 @@ pub(super) fn headers(r: RequestBuilder, c: &Credentials, chat: bool) -> Request
         && (c.region == CreditRegion::Intl
             || text(&c.extra, &["credentialSource"]).as_deref() == Some("desktop"))
     {
-        return r.header(
+        // 注意：这条分支是「桌面端登录态」的提前返回路径，会跳过下面整套
+        // 桌面端请求头。签到必须补齐设备三元组，否则服务端把账号归入
+        // "设备身份不完整"池子 → 该设备每日只放极少名额。
+        // 本机实测：桌面端来源的账号（credentialSource=desktop）全部签不上。
+        let mut r = r.header(
             "X-User-Region",
             if c.region == CreditRegion::Cn {
                 "CN"
@@ -451,6 +528,15 @@ pub(super) fn headers(r: RequestBuilder, c: &Credentials, chat: bool) -> Request
                 upstream_region(c)
             },
         );
+        if !chat {
+            if let Some(uid) = trae_uid(c) {
+                let id = crate::credits::providers::trae_device::derive(&uid);
+                r = r
+                    .header("x-market-user-id", id.market_user_id)
+                    .header("vscode-sessionid", id.session_id);
+            }
+        }
+        return r;
     }
     if chat {
         r = r
@@ -496,6 +582,16 @@ pub(super) fn headers(r: RequestBuilder, c: &Credentials, chat: bool) -> Request
             .header("Sec-Fetch-Dest", "empty")
             .header("Sec-Fetch-Mode", "no-cors")
             .header("Sec-Fetch-Site", "none");
+        // 设备身份三元组：x-market-user-id + vscode-sessionid 必须与 x-device-id
+        // 同源配套。缺这两个头时服务端把账号归入"设备身份不完整"的池子，表现为
+        // 该设备每日只放极少名额（本机实测 21 个账号仅签出 5 个）。
+        // 由 uid 确定性派生，见 providers::trae_device。
+        if let Some(uid) = trae_uid(c) {
+            let id = crate::credits::providers::trae_device::derive(&uid);
+            r = r
+                .header("x-market-user-id", id.market_user_id)
+                .header("vscode-sessionid", id.session_id);
+        }
     }
     r
 }
@@ -503,16 +599,31 @@ pub(super) fn headers(r: RequestBuilder, c: &Credentials, chat: bool) -> Request
 ///
 /// `headers` picks the device id itself; the claim path needs to walk several
 /// candidates, so it builds the request with each one in turn.
+///
+/// 设备三元组必须同源：调用方给的 `device` 若不是由 uid 派生出来的，
+/// 就用它派生配套的 market_user_id / session_id，避免"设备号换了但市场身份没换"
+/// 被服务端判为不一致。
 fn headers_with_device(r: RequestBuilder, c: &Credentials, device: &str) -> RequestBuilder {
     let mut base = c.clone();
     // Force `headers` to emit exactly this value instead of its own preference.
     base.device_id = Some(device.to_string());
     let r = headers(r, &base, false);
     if device.is_empty() {
-        r
-    } else {
-        r.header("X-Device-Id", device)
+        return r;
     }
+    // 若 device 不是该 uid 的派生值（例如轮换号），配套三元组一并替换。
+    let uid = trae_uid(c);
+    if let Some(uid) = uid {
+        let own = crate::credits::providers::trae_device::derive(&uid);
+        if own.device_id != device {
+            let alt = crate::credits::providers::trae_device::derive(&format!("{uid}#{device}"));
+            return r
+                .header("x-device-id", device)
+                .header("x-market-user-id", alt.market_user_id)
+                .header("vscode-sessionid", alt.session_id);
+        }
+    }
+    r.header("x-device-id", device)
 }
 // The TRAE Work CLI stores its login in the system keychain (service
 // "trae_cli", account "auth_info") as `go-keyring-base64:<base64 json>` with
@@ -1004,14 +1115,14 @@ fn reward(v: &Value, c: &Credentials) -> Reward {
     let d = data(v);
     // did_checked_in is a device limit, not confirmation for this account.
     let claimed = flag(d, &["checked_in"]) == Some(true);
+    // 设备号不再依赖凭据里是否有值：签到一律用 uid 派生的设备号
+    // （见 providers::trae_device）。所以「缺设备号」不再阻断签到。
     Reward {
         id: "daily-checkin".into(),
         name: "每日签到".into(),
         kind: "credits".into(),
         status: if claimed {
             "claimed"
-        } else if c.device_id.is_none() {
-            "device_required"
         } else if flag(d, &["enable"]) == Some(false) || flag(d, &["did_checked_in"]) == Some(true)
         {
             "unavailable"
@@ -1093,16 +1204,19 @@ pub(super) async fn claim(
         return Ok(vec![]);
     }
     let r = &rs[0];
-    if r.status != "claimable" {
+    // Only a confirmed account-level check-in may short-circuit the claim.
+    // `did_checked_in` is deliberately mapped to `unavailable` by `reward()`:
+    // it says the currently probed device has used its daily slot, not that
+    // this account has claimed. Returning here used to prevent the per-account
+    // device candidates from ever being tried. AI Work only skips when
+    // `checked_in == true`; keep the same account-level gate and let the claim
+    // response plus the follow-up status check decide the final result.
+    if r.status == "claimed" {
         return Ok(vec![outcome(
             a,
             r,
-            if r.status == "claimed" {
-                "already_claimed"
-            } else {
-                "unavailable"
-            },
-            "当前账号或绑定设备没有可领取权益",
+            "already_claimed",
+            "本轮积分已领取，无需重复领取",
             None,
         )]);
     }
@@ -1160,12 +1274,12 @@ pub(super) async fn claim(
     //
     // 每次换号之间隔 3 秒：太快连发容易让服务端把这一串当成刷接口。
     if best.as_ref().is_some_and(|(r, _)| *r == 0) {
-        if let Some(uid) = c.user_id.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        if let Some(uid) = trae_uid(c) {
             for round in 0..4u64 {
                 if round > 0 {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
-                let rotated = rotate_device_id(uid, now_secs() + round);
+                let rotated = rotate_device_id(&uid, now_secs() + round);
                 let attempt = client
                     .json(
                         headers_with_device(
@@ -1594,16 +1708,33 @@ mod tests {
                 let claims = status_claims.clone();
                 async move {
                     assert_eq!(headers["authorization"], "Cloud-IDE-JWT session-test");
-                    assert_eq!(headers["x-device-id"], "9850555401923937");
+                    // 签到/状态请求现在一律使用由 uid 派生的设备号（uid=test-user
+                    // → 926492889466296），不再用凭据里的 9850555401923937。
+                    // 这是本次集成的核心改动：每个账号必须是独立设备。
+                    assert_eq!(headers["x-device-id"], "926492889466296");
+                    // 设备三元组必须齐备，否则服务端会把账号归入
+                    // "设备身份不完整"池子，每日只放极少名额。
+                    assert!(
+                        headers.contains_key("x-market-user-id"),
+                        "缺 x-market-user-id 会导致设备身份不完整；实际头: {:?}",
+                        headers.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        headers.contains_key("vscode-sessionid"),
+                        "缺 vscode-sessionid 会导致设备身份不完整"
+                    );
                     assert_eq!(body["req_source"], 2);
-                    Json(json!({"enable":true,"checked_in":claims.load(Ordering::SeqCst) > 0,"credits":100,"extra_credits":100}))
+                    Json(json!({"enable":true,"checked_in":claims.load(Ordering::SeqCst) > 0,"did_checked_in":true,"credits":100,"extra_credits":100}))
                 }
             }))
             .route("/trae/api/v2/ug/checkin_credits/claim", post(move |headers: HeaderMap, Json(body): Json<Value>| {
                 let claims = submitted_claims.clone();
                 async move {
                     assert_eq!(headers["authorization"], "Cloud-IDE-JWT session-test");
-                    assert_eq!(headers["x-device-id"], "9850555401923937");
+                    // 同 status：claim 也必须用派生设备号，且三元组齐备。
+                    assert_eq!(headers["x-device-id"], "926492889466296");
+                    assert!(headers.contains_key("x-market-user-id"));
+                    assert!(headers.contains_key("vscode-sessionid"));
                     assert_eq!(body["req_source"], 1);
                     claims.fetch_add(1, Ordering::SeqCst);
                     Json(json!({"code":0}))
@@ -1642,6 +1773,9 @@ mod tests {
         });
         let mut c = empty_credentials();
         c.access_token = "session-test".into();
+        // 真实场景里 `user_id` 由登录/导入流程写入；这里补上，让测试覆盖
+        // "设备三元组按 uid 派生" 这条新路径（token 是假的，解析不出 JWT 里的 id）。
+        c.user_id = Some("test-user".into());
         // Must pass `is_plausible_device_id` (12-20 digits) or
         // checkin_device_candidates skips it and the test would silently read
         // THIS machine's Trae storage.json — which exists on dev boxes with
@@ -1662,8 +1796,14 @@ mod tests {
         assert_eq!(snapshot.balance, Some(1300.0));
         assert_eq!(snapshot.packs[0].remaining, None);
         assert_eq!(snapshot.models.len(), 1);
-        assert!(snapshot.diagnostic.is_none());
-        assert_eq!(snapshot.rewards[0].status, "claimable");
+        assert!(
+            snapshot.diagnostic.is_none(),
+            "diagnostic 应无错误，实际: {:?}",
+            snapshot.diagnostic
+        );
+        // A device-level `did_checked_in` must not block the account's own
+        // derived device candidate. The claim below still has to succeed.
+        assert_eq!(snapshot.rewards[0].status, "unavailable");
         assert_eq!(snapshot.rewards[0].amount, Some(100.0));
         let account = Account {
             id: "test-trae".into(),

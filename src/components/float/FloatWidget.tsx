@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { useCreditsDashboard } from '@/hooks/useCredits';
+import { useFloatStats } from '@/hooks/useCredits';
 import { shellApi } from '@/lib/api/shell';
 
 /**
@@ -36,26 +36,25 @@ function formatCredit(n: number | null | undefined) {
 }
 
 export function FloatWidget() {
-  const { data, isLoading } = useCreditsDashboard();
-  const [dragging, setDragging] = useState(false);
+  // 用轻量接口（<1KB），不是全量 dashboard（2.42MB）。
+  // 详见 useFloatStats 的注释：后者是同步命令、占主线程 70ms，
+  // 正是悬浮窗"第一次拖不动"的根因。
+  const { data, isLoading } = useFloatStats();
   const [hovered, setHovered] = useState(false);
   const [pulse, setPulse] = useState(false);
   const pulseTimer = useRef<number | null>(null);
 
   const stats = useMemo(() => {
-    const usage = data?.usage;
-    const requests = data?.requests ?? [];
+    // 数据形状由 credits_float_stats 直接给出，不需要再从 dashboard 里推算。
     return {
-      running: data?.gateway.running ?? false,
-      requests: usage ? Number(usage.todayRequests) : requests.length,
-      failed: usage ? Number(usage.todayFailed) : 0,
-      spent: usage ? Number(usage.todaySpentCredits ?? 0) : 0,
-      claimed: usage ? Number(usage.todayClaimedCredits) : 0,
-      claiming: usage ? Number(usage.todayClaimingAccounts) : 0,
-      tokens: usage
-        ? Number(usage.todayBillablePromptTokens) + Number(usage.todayCompletionTokens)
-        : 0,
-      sampledAt: usage ? Number(usage.sampledAt ?? 0) : 0,
+      running: data?.running ?? false,
+      requests: data?.todayRequests ?? 0,
+      failed: data?.todayFailed ?? 0,
+      spent: data?.todaySpentCredits ?? 0,
+      claimed: data?.todayClaimedCredits ?? 0,
+      claiming: data?.todayClaimingAccounts ?? 0,
+      tokens: data?.todayTokens ?? 0,
+      sampledAt: data?.sampledAt ?? 0,
     };
   }, [data]);
 
@@ -74,7 +73,25 @@ export function FloatWidget() {
     if (event.button !== 0) return;
     // 按在 × 上时不启动拖动，否则一按就跟着走、根本点不中
     if ((event.target as HTMLElement).closest('[data-no-drag]')) return;
-    setDragging(true);
+    // 阻止默认行为，避免浏览器把这次按下当成"选中文字/图片拖拽"，
+    // 导致 pointerdown 之后的原生拖拽抢占（表现就是第一次拖不动）。
+    event.preventDefault();
+
+    // ★ 关键：**不要**在 startDragging 之前改 React 状态（2026-11-18）。
+    //
+    // 原来这里是先 `setDragging(true)` 再 await startDragging()。看起来无害，
+    // 实际上这是"第一次拖会卡一下"的直接原因：
+    //
+    //   setDragging(true)
+    //     → React 重渲染整个悬浮窗
+    //     → className 变化（cursor-grabbing / opacity-95）
+    //     → 这是**透明 + 置顶**窗口，改 opacity 会让整窗重新合成
+    //     → 合成期间主线程和 WebView2 的合成线程都忙着
+    //     → startDragging() 的 IPC 排在后面
+    //     → 手已经动了，窗口才开始跟
+    //
+    // 现在顺序改成：先发起拖动（一次性 IPC，立刻跟手），
+    // 拖动结束后再改状态。拖动过程中不碰任何样式。
     try {
       await getCurrentWindow().startDragging();
       // Promise 在拖动结束后 resolve，这时坐标才是最终的；
@@ -82,8 +99,6 @@ export function FloatWidget() {
       await shellApi.rememberFloatPosition();
     } catch {
       // 拖动失败不影响读数
-    } finally {
-      setDragging(false);
     }
   };
 
@@ -100,11 +115,18 @@ export function FloatWidget() {
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
-      <div
-        onPointerDown={startDrag}
-        className={`relative flex h-full w-full cursor-grab flex-col items-center overflow-hidden rounded-[26px] border px-[10px] pb-[14px] pt-[14px] transition-[box-shadow,border-color,transform] duration-300 ${
-          dragging ? 'scale-[0.985] cursor-grabbing' : ''
-        } ${
+    <div
+      onPointerDown={startDrag}
+      // 注意：这里**不能**把 transform 放进 transition（2026-11-18 实测）。
+      //
+      // 原来写的是 `transition-[box-shadow,border-color,transform] duration-300`
+      // 配 `dragging ? 'scale-[0.985]'`。按下去的瞬间就开始播 300ms 缩放动画，
+      // 而缩放会让这个「透明 + 置顶 + backdrop-filter」窗口每帧重新合成，
+      // 表现为：按下去先卡 300ms 才开始跟手，甚至第一次干脆没反应。
+      //
+      // 现在只保留 box-shadow/border-color 的过渡（视觉反馈够用），
+      // transform 完全不做动画，按下即跟手。
+      className={`relative flex h-full w-full cursor-grab flex-col items-center overflow-hidden rounded-[26px] border px-[10px] pb-[14px] pt-[14px] transition-[box-shadow,border-color] duration-200 ${
           pulse
             ? 'border-sky-300/90 shadow-[0_14px_34px_-14px_rgba(14,165,233,0.45),inset_0_1px_0_rgba(255,255,255,0.95)]'
             : 'border-white/90 shadow-[0_14px_34px_-16px_rgba(15,23,42,0.30),inset_0_1px_0_rgba(255,255,255,0.95)]'
@@ -112,8 +134,14 @@ export function FloatWidget() {
         style={{
           background:
             'linear-gradient(178deg, rgba(255,255,255,0.90) 0%, rgba(250,253,255,0.86) 52%, rgba(242,248,255,0.84) 100%)',
-          backdropFilter: 'blur(26px) saturate(180%)',
-          WebkitBackdropFilter: 'blur(26px) saturate(180%)',
+          // 模糊半径从 26px 降到 10px（2026-11-18 性能优化）。
+          //
+          // 这是透明 + 置顶窗口，backdrop-filter 每一帧都要对背后内容做高斯
+          // 模糊——半径越大采样开销近似平方增长。26px 在拖动时掉帧明显，
+          // 而视觉上 10px 和 26px 在这么小的圆角条上几乎看不出差别
+          // （背景本来就是桌面，几乎纯色）。
+          backdropFilter: 'blur(10px) saturate(160%)',
+          WebkitBackdropFilter: 'blur(10px) saturate(160%)',
         }}
       >
         {/* 顶部一层极淡高光，让圆角有厚度，不至于像一块贴纸 */}

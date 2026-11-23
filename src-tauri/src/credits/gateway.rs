@@ -1381,6 +1381,21 @@ impl Drop for RequestGuard {
         drop(routing);
         if self.attempted {
             context.manager.mark_stale(&self.account.id);
+            // 推理失败要回写账号状态（2026-11-18 补的关键缺口）。
+            //
+            // 之前只调 mark_stale 标记余额过期、再记一条日志，从不改账号状态。
+            // 结果：签到正常但推理被封 11140 的账号永远停在 ready，
+            // 永远被选进路由池，每 4 次请求就失败 1 次。
+            //
+            // 这里把明确的账号级拒绝（11140）写回状态，
+            // 让它转为「仅可签到」——继续领积分，但不再参与路由。
+            if let Some(diagnostic) = &self.diagnostic {
+                if let Some(code) = diagnostic.upstream_code.as_deref() {
+                    context
+                        .manager
+                        .note_inference_rejection(&self.account.id, code);
+                }
+            }
             let _ = context.manager.record_request(RequestSummary {
                 id: self.id.clone(),
                 account_id: self.account.id.clone(),

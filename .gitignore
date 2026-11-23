@@ -22,3 +22,15 @@ Thumbs.db
 
 # 日志
 *.log
+
+# 本地备份（改代码前留的 .bak，含真实数据，绝不入库）
+*.bak
+*.bak-*
+*.disabled
+*.running-old
+
+# 凭据与本地数据
+*.vault
+credentials.vault
+token*.json
+deleted-accounts-*.json

@@ -99,6 +99,25 @@ export interface CreditSnapshot {
   };
 }
 
+/**
+ * 悬浮窗专用的极小载荷（< 1KB）。
+ *
+ * 悬浮窗只显示 4 个数字，原先却走 `credits_dashboard` 拉 2.42MB
+ * （158 个账号 × 15.7KB 快照）。实测快照刷新间隔中位数只有 211ms，
+ * 而那个命令是同步的、占 Tauri 主线程 70ms —— 用户按下鼠标拖不动
+ * 悬浮窗，就是这么来的。换这个接口后数据量降到不到 1KB。
+ */
+export interface FloatStats {
+  running: boolean;
+  todayRequests: number;
+  todayFailed: number;
+  todaySpentCredits: number;
+  todayClaimedCredits: number;
+  todayClaimingAccounts: number;
+  todayTokens: number;
+  sampledAt: number;
+}
+
 export interface CreditAccount {
   id: string;
   platform: CreditPlatform;
@@ -221,6 +240,13 @@ export interface ProxySettings {
   autoRefresh: boolean;
   /** Run the WorkBuddy growth-center pass alongside the daily claim check. */
   autoGrowth: boolean;
+  /**
+   * 上次「一键复制连接参数」时勾选的模型 ID。
+   *
+   * 存在设置里而不是前端状态：用户拿这个清单去让同事配客户端，
+   * 是他的资产，重装后重建一遍很烦。空数组表示还没选过。
+   */
+  sharedModels: string[];
 }
 
 /** Result of one growth-center pass for one account. */
@@ -327,6 +353,8 @@ export interface ClaimAccountRow {
 
 export interface PlatformClaims {
   platform: string;
+  /** 转发型平台（豆包）：这是一个本地网关，里面养着多个号，不参与领取统计。 */
+  gateway: boolean;
   accounts: number;
   recorded: number;
   claimed: number;
@@ -335,6 +363,8 @@ export interface PlatformClaims {
   pending: number;
   missing: number;
   credits: number;
+  /** 平台确认今日到账的分（含账号被平台自动签到、不由本程序领取的部分）。 */
+  credited: number;
   successRate: number | null;
   rows: ClaimAccountRow[];
 }
@@ -410,6 +440,8 @@ export type OAuthResult =
 
 export const creditsApi = {
   dashboard: () => invoke<CreditDashboard>("credits_dashboard"),
+  /** 悬浮窗专用：只取 4 个数字，不到 1KB，不阻塞主线程。 */
+  floatStats: () => invoke<FloatStats>("credits_float_stats"),
   setViewActive: (active: boolean) => invoke<void>("credits_set_view_active", { active }),
   networkRestored: () => invoke<void>("credits_network_restored"),
   importLocal: (platform: CreditPlatform, region: CreditRegion = "cn") =>

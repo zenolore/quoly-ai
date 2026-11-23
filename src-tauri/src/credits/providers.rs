@@ -8,6 +8,8 @@ mod minimax_chat;
 mod qoder_identity;
 mod stream;
 mod trae_desktop;
+mod trae_device;
+mod trae_error;
 mod traework;
 mod workbuddy;
 
@@ -59,8 +61,28 @@ impl ProviderError {
             stage: "response",
         }
     }
-    fn transport(_: reqwest::Error) -> Self {
-        let mut error = Self::new(502, "平台连接失败或请求超时");
+    /// 把 reqwest 的传输层错误翻译成可区分的诊断。
+    ///
+    /// 为什么不能一句"连接失败或请求超时"包打天下（2026-11-19 教训）：
+    ///
+    ///   refresh.rs 原来把「非 401/403」的错误一律标成账号状态 error，
+    ///   而这里把所有网络问题都变成 502。结果是上游抖两分钟，
+    ///   **64 个账号一起被标 error 并被踢出路由池**，用户看到"模型全挂了"。
+    ///   实测那 64 个里 11/12 直连推理是 200，完全是好的。
+    ///
+    ///   现在分开写：超时、连接失败、其他，便于事后判断到底是哪一类，
+    ///   也方便 refresh.rs 决定要不要动账号状态（它只看 status 码）。
+    fn transport(error: reqwest::Error) -> Self {
+        let (message, status) = if error.is_timeout() {
+            ("平台响应超时，稍后会自动重试", 504u16)
+        } else if error.is_connect() {
+            ("平台连接失败，稍后会自动重试", 502u16)
+        } else if error.is_decode() {
+            ("平台返回内容无法解析", 502u16)
+        } else {
+            ("平台请求异常，稍后会自动重试", 502u16)
+        };
+        let mut error = Self::new(status, message);
         error.stage = "request";
         error
     }
@@ -792,12 +814,20 @@ pub(super) fn reconcile_claim(
         return outcome(a, r, "claimed", "回查上游确认权益已领取", r.amount);
     }
     match submitted {
-        // The call itself went through (the business code was 0, 9004 or 9095 —
-        // `check_business` rejects everything else). A follow-up read that has
-        // not caught up yet is not evidence of failure, so record the claim
-        // rather than a "pending" that never settles. Otherwise an account that
-        // did get paid keeps looking unpaid and stays in the retry queue.
-        Ok(_) => outcome(a, r, "claimed", "签到请求已受理", r.amount),
+        // Request accepted but the body does not prove the grant. Recording
+        // "claimed" here would report points that were never confirmed, so it
+        // stays pending with no amount. The claim is not resubmitted by this
+        // call; a later read decides the outcome.
+        Ok(v) if text(data(v), &["status"]).is_some_and(|s| s.eq_ignore_ascii_case("PENDING")) => {
+            outcome(
+                a,
+                r,
+                "pending",
+                "上游已受理领取，发放状态待确认；不会重复提交",
+                None,
+            )
+        }
+        Ok(_) => outcome(a, r, "pending", "领取请求已提交，结果待回查确认", None),
         Err(e) if e.rejected => outcome(a, r, "failed", e.message.clone(), None),
         _ => outcome(
             a,
